@@ -1,20 +1,19 @@
 '''
 core/url_frontier.py
 '''
-
-
+#--------------------------------------------------------
 '''
 add_url() - adds url to the frontier
 get_next_url() - gets the next url to crawl
 mark_visited() - marks a url as visited
 domain_rate_check()  - will be update in future
 '''
-
+#--------------------------------------------------------  
 import time
 import heapq
 from collections import defaultdict, deque
 from urllib.parse import urlparse
-
+from loguru import logger
 
 class URLFrontier:
 
@@ -31,9 +30,12 @@ class URLFrontier:
             return
 
         domain = urlparse(url).netloc
+
         self.domain_queues[domain].append(url)
 
         heapq.heappush(self.priority_queue, (priority, domain))
+
+        logger.debug(f"Added to frontier: {url}")
 
     def get_next_url(self):
 
