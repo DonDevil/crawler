@@ -13,7 +13,7 @@ async def main():
 
     parser = HTMLLinkExtractor()
 
-    seed_url = "https://saec.ac.in"
+    seed_url = "https://moviesda17.com/"
 
     frontier.add_url(seed_url)
 
