@@ -1,0 +1,13 @@
+crawler:
+  concurrency: 25
+  timeout: 15
+  max_pages: 200
+  rate_limit: 1.0
+  user_agent: "AntiPiracyBot/1.0"
+  seed_files:
+    - "seeds/piracy_sites.txt"
+    - "seeds/torrent_sites.txt"
+    - "seeds/streaming_sites.txt"
+    - "seeds/darkweb_seeds.txt"
+  storage:
+    sqlite_path: "storage/crawl_state.db"

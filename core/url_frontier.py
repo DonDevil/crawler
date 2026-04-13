@@ -12,30 +12,71 @@ domain_rate_check()  - will be update in future
 import time
 import heapq
 from collections import defaultdict, deque
+from typing import Optional
 from urllib.parse import urlparse
+
 from loguru import logger
+
+from utils.url_utils import URLUtils
+
 
 class URLFrontier:
 
-    def __init__(self, rate_limit=1.0):
-        self.visited = set()
-        self.domain_queues = defaultdict(deque)
-        self.domain_next_time = {}
-        self.priority_queue = []
+    def __init__(self, rate_limit: float = 1.0):
+        self.visited: set[str] = set()
+        self._queued: set[str] = set()
+        self.domain_queues: dict[str, deque[str]] = defaultdict(deque)
+        self.domain_next_time: dict[str, float] = {}
+        self.priority_queue: list[tuple[int, str]] = []
         self.rate_limit = rate_limit
 
-    def add_url(self, url, priority=10):
+    def add_url(self, url: str, priority: int = 10) -> None:
+        """Add a URL to the frontier if it has not been seen before."""
 
-        if url in self.visited:
+        cleaned = URLUtils.clean_url(url)
+        if not cleaned:
             return
 
-        domain = urlparse(url).netloc
+        if cleaned in self.visited or cleaned in self._queued:
+            return
 
-        self.domain_queues[domain].append(url)
+        domain = urlparse(cleaned).netloc
 
+        self.domain_queues[domain].append(cleaned)
+        self._queued.add(cleaned)
         heapq.heappush(self.priority_queue, (priority, domain))
 
-        logger.debug(f"Added to frontier: {url}")
+        logger.debug(f"Added to frontier: {cleaned}")
+
+    def get_next_url(self) -> Optional[str]:
+
+        while self.priority_queue:
+            priority, domain = heapq.heappop(self.priority_queue)
+            next_time = self.domain_next_time.get(domain, 0)
+
+            if time.time() < next_time:
+                heapq.heappush(self.priority_queue, (priority, domain))
+                continue
+
+            if self.domain_queues[domain]:
+                url = self.domain_queues[domain].popleft()
+                self.domain_next_time[domain] = time.time() + self.rate_limit
+                return url
+
+        return None
+
+    def mark_visited(self, url: str) -> None:
+        """Mark a URL as visited so it is not crawled again."""
+        cleaned = URLUtils.clean_url(url)
+        if not cleaned:
+            return
+
+        self.visited.add(cleaned)
+        self._queued.discard(cleaned)
+
+    def has_pending(self) -> bool:
+        """Return True if there are pending URLs in the frontier."""
+        return bool(self.priority_queue)
 
     def get_next_url(self):
 

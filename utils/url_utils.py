@@ -61,27 +61,28 @@ class URLUtils:
     def normalize_url(url):
 
         try:
-
             url, _ = urldefrag(url)
 
             parsed = urlparse(url)
 
+            # Handle missing scheme/netloc (e.g. "example.com/path" or "www.example.com").
+            if not parsed.scheme or not parsed.netloc:
+                if parsed.path:
+                    url = "http://" + url.lstrip("/")
+                    parsed = urlparse(url)
+
             scheme = parsed.scheme.lower()
             netloc = parsed.netloc.lower()
-
             path = parsed.path or "/"
 
             query_params = parse_qsl(parsed.query)
-
             filtered_query = []
 
             for key, value in query_params:
-
                 if key not in TRACKING_PARAMETERS:
                     filtered_query.append((key, value))
 
             query = urlencode(filtered_query)
-
             normalized = urlunparse((scheme, netloc, path, "", query, ""))
 
             return normalized

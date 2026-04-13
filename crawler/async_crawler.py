@@ -1,6 +1,12 @@
 import asyncio
+from typing import Optional
+
 import aiohttp
 from loguru import logger
+
+from storage.url_database import URLDatabase
+from utils.request_headers import get_default_headers
+from utils.url_utils import URLUtils
 
 
 class AsyncCrawler:
@@ -12,6 +18,9 @@ class AsyncCrawler:
         concurrency=50,
         timeout=15,
         max_retries=3,
+        max_pages: Optional[int] = None,
+        user_agent: Optional[str] = None,
+        url_database: Optional[URLDatabase] = None,
     ):
 
         self.frontier = frontier
@@ -19,17 +28,25 @@ class AsyncCrawler:
         self.concurrency = concurrency
         self.timeout = timeout
         self.max_retries = max_retries
+        self.max_pages = max_pages
+        self.user_agent = user_agent
+        self.url_database = url_database
 
         self.queue = asyncio.Queue()
+        self._stop_event = asyncio.Event()
+        self._pages_crawled = 0
 
-    async def fetch(self, session, url):
+    async def fetch(self, session: aiohttp.ClientSession, url: str) -> Optional[str]:
+        """Fetch a URL and return the response body (text).
 
-        for attempt in range(self.max_retries):
+        This method retries a few times and returns None on permanent failure.
+        """
 
+        headers = get_default_headers(self.user_agent)
+
+        for attempt in range(1, self.max_retries + 1):
             try:
-
-                async with session.get(url, timeout=self.timeout) as response:
-
+                async with session.get(url, timeout=self.timeout, headers=headers) as response:
                     if response.status != 200:
                         logger.warning(f"{url} returned {response.status}")
                         return None
@@ -38,64 +55,82 @@ class AsyncCrawler:
                     return html
 
             except Exception as e:
-
-                logger.warning(f"Fetch failed ({attempt+1}) {url} : {e}")
-
+                logger.warning(f"Fetch failed ({attempt}/{self.max_retries}) {url} : {e}")
                 await asyncio.sleep(1)
 
         logger.error(f"Giving up on {url}")
         return None
 
-    async def worker(self, session):
+    async def worker(self, session: aiohttp.ClientSession):
+        """Worker that consumes URLs from the queue and crawls them."""
 
-        while True:
-
+        while not self._stop_event.is_set():
             url = await self.queue.get()
 
             try:
+                if not url:
+                    continue
+
+                if self.url_database:
+                    self.url_database.add_url(url, status="pending")
 
                 html = await self.fetch(session, url)
 
                 if html and self.parser:
+                    links = self.parser.extract_links(html, url)
+                    logger.info(f"{len(links)} links extracted from {url}")
 
-                    new_links = self.parser.extract_links(html, url)
-
-                    logger.info(f"{len(new_links)} links extracted from {url}")
-
-                    for link in new_links:
-
+                    for link in links:
                         self.frontier.add_url(link)
 
                 self.frontier.mark_visited(url)
+                if self.url_database:
+                    self.url_database.update_status(url, "visited")
 
-                logger.info(f"Crawled: {url}")
+                self._pages_crawled += 1
+                logger.info(f"Crawled ({self._pages_crawled}): {url}")
+
+                if self.max_pages and self._pages_crawled >= self.max_pages:
+                    logger.info("Reached max pages limit, stopping crawler")
+                    self._stop_event.set()
 
             except Exception as e:
-
                 logger.error(f"Worker error for {url}: {e}")
 
             finally:
-
                 self.queue.task_done()
 
     async def scheduler(self):
+        """Scheduler task that feeds URLs from the frontier into the work queue."""
 
-        while True:
+        idle_loops = 0
 
+        while not self._stop_event.is_set():
             url = self.frontier.get_next_url()
 
             if url:
+                idle_loops = 0
                 await self.queue.put(url)
+                continue
 
+            # If the queue is empty and there are no pending URLs, stop after a short idling period.
+            if self.queue.empty():
+                idle_loops += 1
+                if idle_loops >= 10:  # ~5 seconds of idle
+                    logger.info("No more URLs to crawl, stopping crawler")
+                    self._stop_event.set()
+                    break
             else:
-                await asyncio.sleep(1)
+                idle_loops = 0
+
+            await asyncio.sleep(0.5)
 
     async def run(self):
+        """Run the crawler until stopped or until the stop condition is met."""
 
         connector = aiohttp.TCPConnector(limit=self.concurrency)
 
         async with aiohttp.ClientSession(connector=connector) as session:
-
             workers = [
                 asyncio.create_task(self.worker(session))
                 for _ in range(self.concurrency)
@@ -103,4 +138,12 @@ class AsyncCrawler:
 
             scheduler_task = asyncio.create_task(self.scheduler())
 
-            await asyncio.gather(scheduler_task, *workers)
+            # Wait for stop event and/or worker completion
+            await self._stop_event.wait()
+
+            # Cancel running tasks to exit cleanly
+            scheduler_task.cancel()
+            for task in workers:
+                task.cancel()
+
+            await asyncio.gather(scheduler_task, *workers, return_exceptions=True)
