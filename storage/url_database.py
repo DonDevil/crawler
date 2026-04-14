@@ -33,8 +33,14 @@ class URLDatabase:
     def add_url(self, url: str, status: str = "pending") -> None:
         now = datetime.utcnow().isoformat()
         self._conn.execute(
-            """INSERT OR IGNORE INTO urls (url, first_seen, last_seen, status)
-                VALUES (?, ?, ?, ?)""",
+            """INSERT INTO urls (url, first_seen, last_seen, status)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(url) DO UPDATE SET
+                    last_seen = excluded.last_seen,
+                    status = CASE
+                        WHEN urls.status = 'visited' THEN urls.status
+                        ELSE excluded.status
+                    END""",
             (url, now, now, status),
         )
         self._conn.commit()
@@ -54,6 +60,10 @@ class URLDatabase:
     def get_all_urls(self) -> Iterable[str]:
         cur = self._conn.execute("SELECT url FROM urls")
         return [row[0] for row in cur.fetchall()]
+
+    def get_status_counts(self) -> dict[str, int]:
+        cur = self._conn.execute("SELECT status, COUNT(*) FROM urls GROUP BY status")
+        return {status: count for status, count in cur.fetchall()}
 
     def close(self) -> None:
         self._conn.close()

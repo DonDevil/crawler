@@ -1,50 +1,32 @@
-"""DuckDuckGo search engine scraping.
-
-This module provides a lightweight way to search DuckDuckGo and extract result URLs.
-"""
+"""DuckDuckGo search engine scraping."""
 
 from __future__ import annotations
 
-import re
-from typing import List
+from urllib.parse import parse_qs, urlparse
 
-import httpx
+from search_engines.base import BaseSearchEngine
+from utils.url_utils import URLUtils
 
 
-class DuckDuckGoSearch:
-    """Simple DuckDuckGo search scraper."""
+class DuckDuckGoSearch(BaseSearchEngine):
+    """DuckDuckGo HTML search scraper."""
 
+    name = "duckduckgo"
     BASE_URL = "https://html.duckduckgo.com/html/"
 
-    def search(self, query: str, max_results: int = 20) -> List[str]:
-        """Perform a search query and return a list of result URLs."""
+    def clean_result_url(self, url: str) -> str | None:
+        parsed = urlparse(url)
+        if parsed.path.startswith("/l/"):
+            redirect_url = parse_qs(parsed.query).get("uddg", [None])[0]
+            if redirect_url:
+                return URLUtils.clean_url(redirect_url)
+        return URLUtils.clean_url(url)
 
-        params = {"q": query}
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; AntiPiracyBot/1.0; +https://example.com/bot)",
-        }
-
-        try:
-            resp = httpx.get(self.BASE_URL, params=params, headers=headers, timeout=15)
-            resp.raise_for_status()
-        except Exception:
-            return []
-
-        # DuckDuckGo HTML search renders results in <a class="result__a" ...>
-        # But in the HTML endpoint, links are in <a rel="nofollow" class="result__a" ...>
-
-        urls: List[str] = []
-        for match in re.finditer(r'<a[^>]+href="([^"]+)"[^>]*class="result__a"', resp.text):
-            url = match.group(1)
-            if url.startswith("/l/?kh="):
-                # DuckDuckGo redirect URLs; try to extract actual URL
-                m = re.search(r"uddg=([^&]+)", url)
-                if m:
-                    from urllib.parse import unquote
-
-                    url = unquote(m.group(1))
-            urls.append(url)
-            if len(urls) >= max_results:
-                break
-
-        return urls
+    def search(self, query: str, max_results: int = 20) -> list[str]:
+        soup, final_url = self._make_soup(self.BASE_URL, params={"q": query})
+        return self._collect_urls(
+            soup,
+            selectors=("a.result__a[href]",),
+            max_results=max_results,
+            base_url=final_url,
+        )

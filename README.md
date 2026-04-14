@@ -189,6 +189,8 @@ The system will:
 4. Crawl pages asynchronously
 5. Extract links for further discovery
 
+Search discovery is configurable through `config.yaml`. The crawler now supports DuckDuckGo, Bing, Brave, Yandex, Ahmia, and Torch search adapters, but some engines may still return no results at runtime when they require captcha verification, JavaScript-only flows, or a reachable Tor proxy.
+
 ---
 
 ## Core Components

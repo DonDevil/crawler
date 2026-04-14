@@ -11,3 +11,13 @@ crawler:
     - "seeds/darkweb_seeds.txt"
   storage:
     sqlite_path: "storage/crawl_state.db"
+search:
+  enabled_engines:
+    - "duckduckgo"
+    - "bing"
+    - "brave"
+    - "yandex"
+    - "ahmia"
+    - "torch"
+  max_results_per_engine: 20
+  timeout: 15

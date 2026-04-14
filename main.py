@@ -20,7 +20,7 @@ def main() -> None:
         "--query",
         dest="queries",
         action="append",
-        help="Search query string to discover URLs (uses DuckDuckGo).",
+        help="Search query string to discover URLs using the configured search engines.",
     )
     parser.add_argument(
         "--max-pages",

@@ -1,0 +1,76 @@
+Project intent vs current reality
+
+The repository is designed as a modular anti-piracy crawler platform, but the currently working implementation is a focused async HTTP crawler pipeline, not the full multi-engine/Tor/browser system described in docs.
+
+What is actually running today
+
+Entry and orchestration
+Startup is through main.py, which parses CLI flags for extra seed files, search queries, max-pages, and debug.
+It creates core/crawler_manager.py, which wires together config, frontier, URL DB, HTML parser, and async crawler.
+Runtime config is loaded from config.yaml through core/config.py.
+Discovery sources
+Seed URLs come from text files via discovery/piracy_site_seeds.py, using paths listed in config.yaml.
+Query-based discovery is implemented through discovery/search_engine_discovery.py.
+Only DuckDuckGo is functional: search_engines/duckduckgo_search.py.
+Bing/Brave/Yandex/Ahmia/Torch are placeholders returning empty lists: search_engines/bing_search.py, search_engines/brave_search.py, search_engines/yandex_search.py, search_engines/ahmia_search.py, search_engines/torch_search.py.
+Crawl execution loop
+Main engine is crawler/async_crawler.py.
+It runs:
+One scheduler coroutine that pulls URLs from frontier and puts them on an asyncio queue.
+N worker coroutines (from config concurrency) that fetch pages with aiohttp.
+Parse extracted links and push them back to frontier.
+Mark visited and update SQLite status.
+Stop conditions:
+Max pages reached.
+
+Frontier + queue idle for a short period.
+
+Parsing and URL hygiene
+
+HTML links are extracted in parsers/html_link_extractor.py.
+It also tries to extract plain URLs from script text via JS extractor.
+URL normalization/filtering is centralized in utils/url_utils.py: removes fragments/tracking params, blocks media extensions, filters simple crawler traps.
+Persistence and outputs
+URL crawl state is persisted in SQLite via storage/url_database.py.
+Domain metadata DB exists in storage/domain_database.py, but it is not part of the main runtime loop.
+Crawl state key-value store exists in storage/crawl_state_db.py, also not central in current loop.
+Export utilities exist in storage/result_exporter.py, but not integrated into manager run flow.
+Important implementation detail (current behavior bug/risk)
+
+There is a critical code-quality issue in core/url_frontier.py:
+
+The file defines get_next_url twice.
+The file defines mark_visited twice.
+In Python, later definitions override earlier ones, so the active mark_visited is the simpler one that does not clean URL or clear queued-tracking state.
+Result: deduplication semantics can drift from intended logic, and frontier bookkeeping may become inconsistent over time.
+What is partially implemented vs planned
+
+Implemented and used
+
+Async HTTP crawling
+Seed + DuckDuckGo discovery
+HTML/JS text link extraction
+Basic URL filtering/normalization
+SQLite URL persistence
+Basic tests for crawler/parser/discovery
+Implemented but mostly unused in runtime
+
+Generic scheduler/worker pool modules: core/scheduler.py, core/worker_pool.py
+Global rate limiter wrapper: core/rate_limiter.py
+Domain reputation/classifier stack: intelligence/domain_reputation.py, intelligence/piracy_domain_classifier.py
+Present as stubs/placeholders
+
+HTTP/Tor/Playwright/Selenium crawler modules besides async: crawler/http_crawler.py, crawler/tor_crawler.py, crawler/playwright_crawler.py, crawler/selenium_crawler.py
+Most search engines except DuckDuckGo
+Tor helper modules exist but are not integrated into main crawl path: tor/tor_manager.py, tor/proxy_config.py, tor/onion_router.py
+How to think about the project today
+
+Current architecture in practice is:
+
+Load config and seeds
+Optionally discover URLs from DuckDuckGo query
+Feed URLs into in-memory frontier
+Async fetch pages
+Extract links and re-enqueue
+Persist visited status in SQLite
+Stop on max-pages or idle exhaustion

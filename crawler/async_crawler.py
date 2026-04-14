@@ -35,31 +35,48 @@ class AsyncCrawler:
         self.queue = asyncio.Queue()
         self._stop_event = asyncio.Event()
         self._pages_crawled = 0
+        self._pages_failed = 0
 
-    async def fetch(self, session: aiohttp.ClientSession, url: str) -> Optional[str]:
-        """Fetch a URL and return the response body (text).
+    async def fetch(self, session: aiohttp.ClientSession, url: str) -> tuple[Optional[str], Optional[str]]:
+        """Fetch a URL and return a response body and optional failure reason.
 
         This method retries a few times and returns None on permanent failure.
         """
 
         headers = get_default_headers(self.user_agent)
+        last_error: Optional[str] = None
 
         for attempt in range(1, self.max_retries + 1):
             try:
                 async with session.get(url, timeout=self.timeout, headers=headers) as response:
                     if response.status != 200:
-                        logger.warning(f"{url} returned {response.status}")
-                        return None
+                        last_error = f"HTTP {response.status}"
+                        logger.warning(f"Fetch failed for {url}: {last_error}")
+
+                        if response.status >= 500 and attempt < self.max_retries:
+                            await asyncio.sleep(1)
+                            continue
+
+                        return None, last_error
+
+                    content_type = response.headers.get("Content-Type", "")
+                    if content_type and "html" not in content_type.lower() and "xml" not in content_type.lower():
+                        last_error = f"Unsupported content type: {content_type}"
+                        logger.debug(f"Skipping non-HTML response for {url}: {content_type}")
+                        return None, last_error
 
                     html = await response.text()
-                    return html
+                    return html, None
 
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                logger.warning(f"Fetch failed ({attempt}/{self.max_retries}) {url} : {e}")
+                last_error = str(e)
+                logger.warning(f"Fetch failed ({attempt}/{self.max_retries}) {url}: {e}")
                 await asyncio.sleep(1)
 
         logger.error(f"Giving up on {url}")
-        return None
+        return None, last_error or "unknown fetch error"
 
     async def worker(self, session: aiohttp.ClientSession):
         """Worker that consumes URLs from the queue and crawls them."""
@@ -74,7 +91,8 @@ class AsyncCrawler:
                 if self.url_database:
                     self.url_database.add_url(url, status="pending")
 
-                html = await self.fetch(session, url)
+                html, failure_reason = await self.fetch(session, url)
+                status = "visited"
 
                 if html and self.parser:
                     links = self.parser.extract_links(html, url)
@@ -82,18 +100,24 @@ class AsyncCrawler:
 
                     for link in links:
                         self.frontier.add_url(link)
+                elif failure_reason:
+                    status = "failed"
+                    self._pages_failed += 1
+                    logger.warning(f"Failed to crawl {url}: {failure_reason}")
 
                 self.frontier.mark_visited(url)
                 if self.url_database:
-                    self.url_database.update_status(url, "visited")
+                    self.url_database.update_status(url, status)
 
                 self._pages_crawled += 1
-                logger.info(f"Crawled ({self._pages_crawled}): {url}")
+                logger.info(f"Processed ({self._pages_crawled}): {url} [{status}]")
 
                 if self.max_pages and self._pages_crawled >= self.max_pages:
                     logger.info("Reached max pages limit, stopping crawler")
                     self._stop_event.set()
 
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Worker error for {url}: {e}")
 
@@ -138,12 +162,18 @@ class AsyncCrawler:
 
             scheduler_task = asyncio.create_task(self.scheduler())
 
-            # Wait for stop event and/or worker completion
-            await self._stop_event.wait()
+            try:
+                await self._stop_event.wait()
+            finally:
+                scheduler_task.cancel()
+                for task in workers:
+                    task.cancel()
 
-            # Cancel running tasks to exit cleanly
-            scheduler_task.cancel()
-            for task in workers:
-                task.cancel()
+                await asyncio.gather(scheduler_task, *workers, return_exceptions=True)
 
-            await asyncio.gather(scheduler_task, *workers, return_exceptions=True)
+                logger.info(
+                    "Crawler finished: processed={} failed={} pending_frontier={}",
+                    self._pages_crawled,
+                    self._pages_failed,
+                    self.frontier.pending_count(),
+                )

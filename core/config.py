@@ -17,6 +17,19 @@ class StorageConfig(BaseModel):
     sqlite_path: str = "storage/crawl_state.db"
 
 
+class SearchConfig(BaseModel):
+    enabled_engines: List[str] = Field(default_factory=lambda: [
+        "duckduckgo",
+        "bing",
+        "brave",
+        "yandex",
+        "ahmia",
+        "torch",
+    ])
+    max_results_per_engine: int = 20
+    timeout: int = 15
+
+
 class CrawlerConfig(BaseModel):
     concurrency: int = 25
     timeout: int = 15
@@ -34,6 +47,7 @@ class CrawlerConfig(BaseModel):
 
 class Config(BaseModel):
     crawler: CrawlerConfig = CrawlerConfig()
+    search: SearchConfig = SearchConfig()
 
 
 def load_config(path: str = "config.yaml") -> Config:

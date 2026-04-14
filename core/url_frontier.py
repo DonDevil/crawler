@@ -1,18 +1,10 @@
-'''
-core/url_frontier.py
-'''
-#--------------------------------------------------------
-'''
-add_url() - adds url to the frontier
-get_next_url() - gets the next url to crawl
-mark_visited() - marks a url as visited
-domain_rate_check()  - will be update in future
-'''
-#--------------------------------------------------------  
-import time
+"""Priority URL frontier with per-domain politeness controls."""
+
+from __future__ import annotations
+
 import heapq
+import time
 from collections import defaultdict, deque
-from typing import Optional
 from urllib.parse import urlparse
 
 from loguru import logger
@@ -21,17 +13,20 @@ from utils.url_utils import URLUtils
 
 
 class URLFrontier:
+    """Manage pending crawl URLs with deduplication and host rate limiting."""
 
     def __init__(self, rate_limit: float = 1.0):
         self.visited: set[str] = set()
         self._queued: set[str] = set()
-        self.domain_queues: dict[str, deque[str]] = defaultdict(deque)
+        self._scheduled_domains: set[str] = set()
+        self._sequence = 0
+        self.domain_queues: dict[str, deque[tuple[int, int, str]]] = defaultdict(deque)
         self.domain_next_time: dict[str, float] = {}
-        self.priority_queue: list[tuple[int, str]] = []
+        self.priority_queue: list[tuple[int, int, str]] = []
         self.rate_limit = rate_limit
 
     def add_url(self, url: str, priority: int = 10) -> None:
-        """Add a URL to the frontier if it has not been seen before."""
+        """Add a URL to the frontier if it has not already been seen."""
 
         cleaned = URLUtils.clean_url(url)
         if not cleaned:
@@ -41,32 +36,62 @@ class URLFrontier:
             return
 
         domain = urlparse(cleaned).netloc
-
-        self.domain_queues[domain].append(cleaned)
+        self._sequence += 1
+        self.domain_queues[domain].append((priority, self._sequence, cleaned))
         self._queued.add(cleaned)
-        heapq.heappush(self.priority_queue, (priority, domain))
+        self._schedule_domain(domain)
 
         logger.debug(f"Added to frontier: {cleaned}")
 
-    def get_next_url(self) -> Optional[str]:
+    def _schedule_domain(self, domain: str) -> None:
+        queue = self.domain_queues.get(domain)
+        if not queue or domain in self._scheduled_domains:
+            return
+
+        priority, sequence, _ = queue[0]
+        heapq.heappush(self.priority_queue, (priority, sequence, domain))
+        self._scheduled_domains.add(domain)
+
+    def get_next_url(self) -> str | None:
+        """Return the next crawlable URL, respecting per-domain rate limits."""
+
+        blocked_domains: list[str] = []
+        now = time.time()
 
         while self.priority_queue:
-            priority, domain = heapq.heappop(self.priority_queue)
-            next_time = self.domain_next_time.get(domain, 0)
+            _, _, domain = heapq.heappop(self.priority_queue)
+            self._scheduled_domains.discard(domain)
 
-            if time.time() < next_time:
-                heapq.heappush(self.priority_queue, (priority, domain))
+            queue = self.domain_queues.get(domain)
+            if not queue:
                 continue
 
-            if self.domain_queues[domain]:
-                url = self.domain_queues[domain].popleft()
-                self.domain_next_time[domain] = time.time() + self.rate_limit
-                return url
+            next_time = self.domain_next_time.get(domain, 0)
+            if now < next_time:
+                blocked_domains.append(domain)
+                continue
+
+            _, _, url = queue.popleft()
+            self.domain_next_time[domain] = now + self.rate_limit
+
+            if queue:
+                self._schedule_domain(domain)
+            else:
+                self.domain_queues.pop(domain, None)
+
+            for blocked_domain in blocked_domains:
+                self._schedule_domain(blocked_domain)
+
+            return url
+
+        for blocked_domain in blocked_domains:
+            self._schedule_domain(blocked_domain)
 
         return None
 
     def mark_visited(self, url: str) -> None:
         """Mark a URL as visited so it is not crawled again."""
+
         cleaned = URLUtils.clean_url(url)
         if not cleaned:
             return
@@ -75,67 +100,11 @@ class URLFrontier:
         self._queued.discard(cleaned)
 
     def has_pending(self) -> bool:
-        """Return True if there are pending URLs in the frontier."""
-        return bool(self.priority_queue)
+        """Return True when the frontier still has queued work."""
 
-    def get_next_url(self):
+        return bool(self.priority_queue or self.domain_queues)
 
-        while self.priority_queue:
+    def pending_count(self) -> int:
+        """Return the number of queued URLs that have not been visited yet."""
 
-            priority, domain = heapq.heappop(self.priority_queue)
-
-            next_time = self.domain_next_time.get(domain, 0)
-
-            if time.time() < next_time:
-                heapq.heappush(self.priority_queue, (priority, domain))
-                continue
-
-            if self.domain_queues[domain]:
-
-                url = self.domain_queues[domain].popleft()
-
-                self.domain_next_time[domain] = time.time() + self.rate_limit
-
-                return url
-
-        return None
-
-    def mark_visited(self, url):
-        self.visited.add(url)
-
-
-#Usage : 
-'''
-
-frontier = URLFrontier() # initialize frontier
-
-frontier.add_url("https://example.com") #add url to frontier queue
-frontier.add_url("https://piratebay.site") #add 2nd url to frontier queue
-
-url = frontier.get_next_url() # fetch the next best url to crawl
-print(url)
-url = frontier.get_next_url() # fetch the next best url to crawl
-print(url)
-'''
-
-
-'''
-Later Updates :
-
-The basic frontier will later evolve to include:
-
-Redis frontier (for distributed crawling)
-    millions of URLs
-    multiple crawler machines
-
-Bloom filters
-    Fast duplicate detection.
-
-Priority scoring
-    torrent pages → high priority
-    media files → very high
-    random blogs → low
-
-Host-based scheduling
-    Prevent crawling same domain too fast.
-'''
+        return sum(len(queue) for queue in self.domain_queues.values())

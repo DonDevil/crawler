@@ -1,17 +1,20 @@
-"""Bing search engine scraping.
-
-This is a placeholder implementation; it returns no results by default.
-"""
+"""Bing search engine scraping."""
 
 from __future__ import annotations
 
-from typing import List
+from search_engines.base import BaseSearchEngine
 
 
-class BingSearch:
-    def search(self, query: str, max_results: int = 20) -> List[str]:
-        """Return a list of search result URLs.
+class BingSearch(BaseSearchEngine):
+    """Scrape public Bing result pages."""
 
-        This placeholder implementation returns an empty list.
-        """
-        return []
+    name = "bing"
+    BASE_URL = "https://www.bing.com/search"
+
+    def search(self, query: str, max_results: int = 20) -> list[str]:
+        soup, _ = self._make_soup(self.BASE_URL, params={"q": query})
+        return self._collect_urls(
+            soup,
+            selectors=("li.b_algo h2 a[href]", "li.b_algo a[href]"),
+            max_results=max_results,
+        )
