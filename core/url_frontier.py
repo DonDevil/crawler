@@ -9,13 +9,14 @@ from urllib.parse import urlparse
 
 from loguru import logger
 
+from storage.url_database import URLDatabase
 from utils.url_utils import URLUtils
 
 
 class URLFrontier:
     """Manage pending crawl URLs with deduplication and host rate limiting."""
 
-    def __init__(self, rate_limit: float = 1.0):
+    def __init__(self, rate_limit: float = 1.0, url_database: URLDatabase | None = None):
         self.visited: set[str] = set()
         self._queued: set[str] = set()
         self._scheduled_domains: set[str] = set()
@@ -24,6 +25,7 @@ class URLFrontier:
         self.domain_next_time: dict[str, float] = {}
         self.priority_queue: list[tuple[int, int, str]] = []
         self.rate_limit = rate_limit
+        self.url_database = url_database
 
     def add_url(self, url: str, priority: int = 10) -> None:
         """Add a URL to the frontier if it has not already been seen."""
@@ -40,6 +42,9 @@ class URLFrontier:
         self.domain_queues[domain].append((priority, self._sequence, cleaned))
         self._queued.add(cleaned)
         self._schedule_domain(domain)
+
+        if self.url_database is not None:
+            self.url_database.add_url(cleaned, status="queued")
 
         logger.debug(f"Added to frontier: {cleaned}")
 

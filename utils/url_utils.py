@@ -1,29 +1,8 @@
-'''
-utils/url_utils.py
-'''
-#----------------------------------------------------------
-'''
-Use Case : 
-URL normalization
-URL validation
-duplicate reduction
-domain extraction
-query filtering
-crawler trap detection
+from __future__ import annotations
 
-Design Goals
-
-The module should:
-Normalize URLs
-Remove fragments
-Remove tracking parameters
-Validate schemes
-Extract domains
-Detect crawler traps
-Filter unwanted file types
-'''
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, urldefrag
+import ipaddress
 import re
+from urllib.parse import parse_qsl, urlencode, urldefrag, unquote, urlparse, urlunparse
 
 
 TRACKING_PARAMETERS = {
@@ -91,6 +70,43 @@ class URLUtils:
             return None
 
     @staticmethod
+    def has_valid_host(url):
+
+        try:
+            parsed = urlparse(url)
+            hostname = parsed.hostname
+            if not hostname:
+                return False
+
+            hostname = hostname.lower()
+
+            if hostname == "localhost":
+                return True
+
+            try:
+                ipaddress.ip_address(hostname)
+                return True
+            except ValueError:
+                pass
+
+            if "." not in hostname:
+                return False
+
+            return True
+
+        except Exception:
+            return False
+
+    @staticmethod
+    def is_onion_url(url):
+
+        try:
+            parsed = urlparse(url)
+            return bool(parsed.hostname and parsed.hostname.lower().endswith(".onion"))
+        except Exception:
+            return False
+
+    @staticmethod
     def is_valid_scheme(url):
 
         parsed = urlparse(url)
@@ -136,6 +152,10 @@ class URLUtils:
         if "sessionid=" in parsed.query:
             return True
 
+        decoded = unquote(url)
+        if any(token in decoded for token in ("<", ">", '"', "{", "}")):
+            return True
+
         return False
 
     @staticmethod
@@ -147,6 +167,9 @@ class URLUtils:
             return None
 
         if not URLUtils.is_valid_scheme(url):
+            return None
+
+        if not URLUtils.has_valid_host(url):
             return None
 
         if URLUtils.is_media_file(url):

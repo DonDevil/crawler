@@ -15,7 +15,9 @@ class YandexSearch(BaseSearchEngine):
         soup, final_url = self._make_soup(self.BASE_URL, params={"text": query})
 
         if "showcaptcha" in final_url.lower() or soup.title and "verification" in soup.title.get_text(strip=True).lower():
-            raise SearchEngineBlockedError("Yandex requires captcha verification for this request")
+            raise SearchEngineBlockedError(
+                "Yandex requires captcha verification for this IP/session; HTML scraping is blocked upstream"
+            )
 
         return self._collect_urls(
             soup,

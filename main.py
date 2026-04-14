@@ -32,12 +32,25 @@ def main() -> None:
         action="store_true",
         help="Enable debug logging.",
     )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--query-only",
+        action="store_true",
+        help="Use query discovery only and skip configured seed files.",
+    )
+    mode_group.add_argument(
+        "--unfinished",
+        action="store_true",
+        help="Resume queued and pending URLs from storage only.",
+    )
 
     args = parser.parse_args()
 
     manager = CrawlerManager(
         extra_seed_files=args.seed_files,
         queries=args.queries,
+        include_seed_files=not args.query_only and not args.unfinished,
+        resume_unfinished=args.unfinished,
     )
 
     if args.max_pages is not None:

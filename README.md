@@ -181,6 +181,14 @@ Run the main crawler:
 python main.py
 ```
 
+Useful startup modes:
+
+```bash
+python main.py --query "movie title"
+python main.py --query-only --query "movie title"
+python main.py --unfinished
+```
+
 The system will:
 
 1. Load seed URLs
@@ -190,6 +198,8 @@ The system will:
 5. Extract links for further discovery
 
 Search discovery is configurable through `config.yaml`. The crawler now supports DuckDuckGo, Bing, Brave, Yandex, Ahmia, and Torch search adapters, but some engines may still return no results at runtime when they require captcha verification, JavaScript-only flows, or a reachable Tor proxy.
+
+`--query-only` skips configured seed files and starts from search results only. `--unfinished` resumes `queued` and `pending` URLs from `storage/crawl_state.db` without loading seed files or running fresh discovery.
 
 ---
 

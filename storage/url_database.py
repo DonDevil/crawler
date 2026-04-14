@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Sequence
 
 
 class URLDatabase:
@@ -31,7 +31,7 @@ class URLDatabase:
         self._conn.commit()
 
     def add_url(self, url: str, status: str = "pending") -> None:
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         self._conn.execute(
             """INSERT INTO urls (url, first_seen, last_seen, status)
                 VALUES (?, ?, ?, ?)
@@ -46,10 +46,21 @@ class URLDatabase:
         self._conn.commit()
 
     def update_status(self, url: str, status: str) -> None:
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         self._conn.execute(
             """UPDATE urls SET status = ?, last_seen = ? WHERE url = ?""",
             (status, now, url),
+        )
+        self._conn.commit()
+
+    def update_many_status(self, urls: Sequence[str], status: str) -> None:
+        if not urls:
+            return
+
+        now = datetime.now(timezone.utc).isoformat()
+        self._conn.executemany(
+            """UPDATE urls SET status = ?, last_seen = ? WHERE url = ?""",
+            [(status, now, url) for url in urls],
         )
         self._conn.commit()
 
@@ -59,6 +70,17 @@ class URLDatabase:
 
     def get_all_urls(self) -> Iterable[str]:
         cur = self._conn.execute("SELECT url FROM urls")
+        return [row[0] for row in cur.fetchall()]
+
+    def get_urls_by_status(self, statuses: Sequence[str]) -> list[str]:
+        if not statuses:
+            return []
+
+        placeholders = ", ".join("?" for _ in statuses)
+        cur = self._conn.execute(
+            f"SELECT url FROM urls WHERE status IN ({placeholders}) ORDER BY last_seen ASC",
+            tuple(statuses),
+        )
         return [row[0] for row in cur.fetchall()]
 
     def get_status_counts(self) -> dict[str, int]:

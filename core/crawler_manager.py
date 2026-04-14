@@ -25,13 +25,18 @@ class CrawlerManager:
         config: Optional[Config] = None,
         extra_seed_files: Optional[list[str]] = None,
         queries: Optional[list[str]] = None,
+        include_seed_files: bool = True,
+        resume_unfinished: bool = False,
     ):
         self.config = config or load_config()
         configure_logging("INFO")
 
-        self.frontier = URLFrontier(rate_limit=self.config.crawler.rate_limit)
-
         self.url_database = URLDatabase(path=self.config.crawler.storage.sqlite_path)
+
+        self.frontier = URLFrontier(
+            rate_limit=self.config.crawler.rate_limit,
+            url_database=self.url_database,
+        )
 
         self.link_extractor = HTMLLinkExtractor()
 
@@ -48,6 +53,8 @@ class CrawlerManager:
 
         self.extra_seed_files = extra_seed_files or []
         self.queries = queries or []
+        self.include_seed_files = include_seed_files
+        self.resume_unfinished = resume_unfinished
 
     def load_seed_urls(self) -> None:
         """Load seed URLs from seed files and add them to the frontier."""
@@ -59,6 +66,27 @@ class CrawlerManager:
                 loaded += 1
 
         logger.info(f"Loaded {loaded} seed URLs from {len(files)} file(s)")
+
+    def load_unfinished_urls(self) -> None:
+        """Load queued and pending URLs from the database into the frontier."""
+
+        unfinished_urls = self.url_database.get_urls_by_status(["queued", "pending"])
+        for url in unfinished_urls:
+            self.frontier.add_url(url)
+
+        logger.info(f"Loaded {len(unfinished_urls)} unfinished URLs from storage")
+
+    def prepare_frontier(self) -> None:
+        """Populate the frontier according to the selected startup mode."""
+
+        if self.resume_unfinished:
+            self.load_unfinished_urls()
+            return
+
+        if self.include_seed_files:
+            self.load_seed_urls()
+
+        self.load_search_query_urls()
 
     def load_search_query_urls(self) -> None:
         """Use search queries to discover new seed URLs."""
@@ -89,8 +117,7 @@ class CrawlerManager:
 
     async def run(self):
         """Run the crawler until it completes or is stopped."""
-        self.load_seed_urls()
-        self.load_search_query_urls()
+        self.prepare_frontier()
 
         logger.info("Starting crawler")
         try:
