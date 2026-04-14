@@ -11,10 +11,11 @@ from core.config import Config, load_config
 from core.url_frontier import URLFrontier
 from crawler.async_crawler import AsyncCrawler
 from discovery.piracy_site_seeds import load_seeds
-from discovery.search_engine_discovery import discover_urls_from_queries_with_report
+from discovery.search_engine_discovery import discover_urls_from_queries_with_report, get_engine_names_for_scope
 from parsers.html_link_extractor import HTMLLinkExtractor
 from storage.url_database import URLDatabase
 from utils.logger import configure_logging
+from utils.url_utils import URLUtils
 
 
 class CrawlerManager:
@@ -27,6 +28,7 @@ class CrawlerManager:
         queries: Optional[list[str]] = None,
         include_seed_files: bool = True,
         resume_unfinished: bool = False,
+        query_scope: str | None = None,
     ):
         self.config = config or load_config()
         configure_logging("INFO")
@@ -55,6 +57,16 @@ class CrawlerManager:
         self.queries = queries or []
         self.include_seed_files = include_seed_files
         self.resume_unfinished = resume_unfinished
+        self.query_scope = query_scope
+
+    def _priority_for_seed_url(self, url: str) -> int:
+        return 8 if URLUtils.is_onion_url(url) else 12
+
+    def _priority_for_unfinished_url(self, url: str, status: str) -> int:
+        base_priority = 3 if status == "pending" else 6
+        if URLUtils.is_onion_url(url):
+            base_priority = max(0, base_priority - self.config.search.onion_priority_boost)
+        return base_priority
 
     def load_seed_urls(self) -> None:
         """Load seed URLs from seed files and add them to the frontier."""
@@ -62,7 +74,7 @@ class CrawlerManager:
         loaded = 0
         for seed_file in files:
             for url in load_seeds(seed_file):
-                self.frontier.add_url(url)
+                self.frontier.add_url(url, priority=self._priority_for_seed_url(url))
                 loaded += 1
 
         logger.info(f"Loaded {loaded} seed URLs from {len(files)} file(s)")
@@ -70,9 +82,9 @@ class CrawlerManager:
     def load_unfinished_urls(self) -> None:
         """Load queued and pending URLs from the database into the frontier."""
 
-        unfinished_urls = self.url_database.get_urls_by_status(["queued", "pending"])
-        for url in unfinished_urls:
-            self.frontier.add_url(url)
+        unfinished_urls = self.url_database.get_urls_and_statuses(["queued", "pending"])
+        for url, status in unfinished_urls:
+            self.frontier.add_url(url, priority=self._priority_for_unfinished_url(url, status))
 
         logger.info(f"Loaded {len(unfinished_urls)} unfinished URLs from storage")
 
@@ -93,25 +105,47 @@ class CrawlerManager:
         if not self.queries:
             return
 
+        engine_names = get_engine_names_for_scope(
+            self.query_scope,
+            self.config.search.enabled_engines,
+        )
+
+        logger.info(
+            "Running query discovery with scope={} engines={}",
+            self.query_scope or "all",
+            engine_names,
+        )
+
         report = discover_urls_from_queries_with_report(
             self.queries,
             max_results=self.config.search.max_results_per_engine,
-            engine_names=self.config.search.enabled_engines,
+            engine_names=engine_names,
             timeout=self.config.search.timeout,
             user_agent=self.config.crawler.user_agent,
+            engine_priorities=self.config.search.engine_priorities,
+            onion_priority_boost=self.config.search.onion_priority_boost,
+            blocked_engine_cooldown_queries=self.config.search.blocked_engine_cooldown_queries,
         )
 
         for query_report in report.query_reports:
             logger.info(
-                "Discovery for query {!r}: {} unique URLs, engine hits={}, engine errors={}",
+                "Discovery for query {!r}: {} unique URLs, engine hits={}, engine errors={}, skipped={}",
                 query_report.query,
                 len(query_report.urls),
                 query_report.engine_results,
                 query_report.engine_errors,
+                query_report.skipped_engines,
             )
 
-        for url in report.urls:
-            self.frontier.add_url(url)
+        discovered_items = report.discovered_items
+        if not discovered_items and report.urls:
+            discovered_items = [
+                type("DiscoveryFallback", (), {"url": url, "priority": self._priority_for_seed_url(url)})
+                for url in report.urls
+            ]
+
+        for item in discovered_items:
+            self.frontier.add_url(item.url, priority=item.priority)
 
         logger.info(f"Loaded {len(report.urls)} unique URLs from search discovery")
 

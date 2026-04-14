@@ -13,7 +13,12 @@ def _make_config(seed_file: str, sqlite_path: str) -> Config:
             storage=StorageConfig(sqlite_path=sqlite_path),
             max_pages=1,
         ),
-        search=SearchConfig(enabled_engines=["duckduckgo"], max_results_per_engine=5),
+        search=SearchConfig(
+            enabled_engines=["duckduckgo"],
+            max_results_per_engine=5,
+            engine_priorities={"duckduckgo": 6, "torch": 0},
+            onion_priority_boost=2,
+        ),
     )
 
 
@@ -70,3 +75,52 @@ def test_prepare_frontier_unfinished_loads_only_resume_urls(monkeypatch, tmp_pat
     resumed = {manager.frontier.get_next_url(), manager.frontier.get_next_url()}
     assert resumed == {"https://queued.example.com/", "https://pending.example.com/"}
     assert manager.frontier.get_next_url() is None
+
+
+def test_prepare_frontier_prioritizes_onion_resume_urls(monkeypatch, tmp_path):
+    seed_file = tmp_path / "seeds.txt"
+    seed_file.write_text("https://seed.example.com\n", encoding="utf-8")
+    sqlite_path = tmp_path / "crawl.db"
+
+    monkeypatch.setattr(
+        "core.crawler_manager.discover_urls_from_queries_with_report",
+        lambda *args, **kwargs: DiscoveryBatchReport(),
+    )
+
+    manager = CrawlerManager(
+        config=_make_config(str(seed_file), str(sqlite_path)),
+        resume_unfinished=True,
+    )
+    manager.url_database.add_url("https://surface.example.com", status="pending")
+    manager.url_database.add_url("http://resumehiddenresumehidden.onion", status="pending")
+
+    manager.prepare_frontier()
+
+    assert manager.frontier.get_next_url() == "http://resumehiddenresumehidden.onion/"
+
+
+def test_prepare_frontier_uses_surface_scope_for_queries(monkeypatch, tmp_path):
+    seed_file = tmp_path / "seeds.txt"
+    seed_file.write_text("https://seed.example.com\n", encoding="utf-8")
+    sqlite_path = tmp_path / "crawl.db"
+    captured = {}
+
+    def _fake_discovery(*args, **kwargs):
+        captured["engine_names"] = kwargs.get("engine_names")
+        return DiscoveryBatchReport()
+
+    monkeypatch.setattr(
+        "core.crawler_manager.discover_urls_from_queries_with_report",
+        _fake_discovery,
+    )
+
+    manager = CrawlerManager(
+        config=_make_config(str(seed_file), str(sqlite_path)),
+        queries=["movie"],
+        include_seed_files=False,
+        query_scope="surface-web",
+    )
+
+    manager.prepare_frontier()
+
+    assert captured["engine_names"] == ["duckduckgo"]

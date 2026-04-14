@@ -43,6 +43,17 @@ def main() -> None:
         action="store_true",
         help="Resume queued and pending URLs from storage only.",
     )
+    query_scope_group = parser.add_mutually_exclusive_group()
+    query_scope_group.add_argument(
+        "--surface-web",
+        action="store_true",
+        help="Use only surface-web search engines for query discovery.",
+    )
+    query_scope_group.add_argument(
+        "--dark-web",
+        action="store_true",
+        help="Use only dark-web search engines for query discovery.",
+    )
 
     args = parser.parse_args()
 
@@ -51,6 +62,7 @@ def main() -> None:
         queries=args.queries,
         include_seed_files=not args.query_only and not args.unfinished,
         resume_unfinished=args.unfinished,
+        query_scope="surface-web" if args.surface_web else "dark-web" if args.dark_web else None,
     )
 
     if args.max_pages is not None:

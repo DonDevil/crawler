@@ -83,6 +83,17 @@ class URLDatabase:
         )
         return [row[0] for row in cur.fetchall()]
 
+    def get_urls_and_statuses(self, statuses: Sequence[str]) -> list[tuple[str, str]]:
+        if not statuses:
+            return []
+
+        placeholders = ", ".join("?" for _ in statuses)
+        cur = self._conn.execute(
+            f"SELECT url, status FROM urls WHERE status IN ({placeholders}) ORDER BY last_seen ASC",
+            tuple(statuses),
+        )
+        return [(row[0], row[1]) for row in cur.fetchall()]
+
     def get_status_counts(self) -> dict[str, int]:
         cur = self._conn.execute("SELECT status, COUNT(*) FROM urls GROUP BY status")
         return {status: count for status, count in cur.fetchall()}

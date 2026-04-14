@@ -21,3 +21,12 @@ search:
     - "torch"
   max_results_per_engine: 20
   timeout: 15
+  engine_priorities:
+    torch: 0
+    ahmia: 2
+    brave: 4
+    bing: 5
+    duckduckgo: 6
+    yandex: 7
+  onion_priority_boost: 2
+  blocked_engine_cooldown_queries: 999

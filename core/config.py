@@ -28,6 +28,16 @@ class SearchConfig(BaseModel):
     ])
     max_results_per_engine: int = 20
     timeout: int = 15
+    engine_priorities: dict[str, int] = Field(default_factory=lambda: {
+        "torch": 0,
+        "ahmia": 2,
+        "brave": 4,
+        "bing": 5,
+        "duckduckgo": 6,
+        "yandex": 7,
+    })
+    onion_priority_boost: int = 2
+    blocked_engine_cooldown_queries: int = 999
 
 
 class CrawlerConfig(BaseModel):
