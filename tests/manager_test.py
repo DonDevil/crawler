@@ -4,6 +4,7 @@ from discovery.search_engine_discovery import DiscoveryBatchReport, QueryDiscove
 
 from core.config import Config, CrawlerConfig, SearchConfig, StorageConfig
 from core.crawler_manager import CrawlerManager
+from crawler.http_crawler import HTTPCrawler
 
 
 def _make_config(seed_file: str, sqlite_path: str) -> Config:
@@ -124,3 +125,21 @@ def test_prepare_frontier_uses_surface_scope_for_queries(monkeypatch, tmp_path):
     manager.prepare_frontier()
 
     assert captured["engine_names"] == ["duckduckgo"]
+
+
+def test_manager_uses_selected_crawler_engine(monkeypatch, tmp_path):
+    seed_file = tmp_path / "seeds.txt"
+    seed_file.write_text("https://seed.example.com\n", encoding="utf-8")
+    sqlite_path = tmp_path / "crawl.db"
+
+    monkeypatch.setattr(
+        "core.crawler_manager.discover_urls_from_queries_with_report",
+        lambda *args, **kwargs: DiscoveryBatchReport(),
+    )
+
+    manager = CrawlerManager(
+        config=_make_config(str(seed_file), str(sqlite_path)),
+        crawl_engine="http",
+    )
+
+    assert isinstance(manager._crawler, HTTPCrawler)

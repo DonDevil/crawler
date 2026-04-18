@@ -10,6 +10,10 @@ from loguru import logger
 from core.config import Config, load_config
 from core.url_frontier import URLFrontier
 from crawler.async_crawler import AsyncCrawler
+from crawler.http_crawler import HTTPCrawler
+from crawler.playwright_crawler import PlaywrightCrawler
+from crawler.selenium_crawler import SeleniumCrawler
+from crawler.tor_crawler import TorCrawler
 from discovery.piracy_site_seeds import load_seeds
 from discovery.search_engine_discovery import discover_urls_from_queries_with_report, get_engine_names_for_scope
 from parsers.html_link_extractor import HTMLLinkExtractor
@@ -29,6 +33,7 @@ class CrawlerManager:
         include_seed_files: bool = True,
         resume_unfinished: bool = False,
         query_scope: str | None = None,
+        crawl_engine: str | None = None,
     ):
         self.config = config or load_config()
         configure_logging("INFO")
@@ -42,22 +47,43 @@ class CrawlerManager:
 
         self.link_extractor = HTMLLinkExtractor()
 
-        self._crawler = AsyncCrawler(
-            frontier=self.frontier,
-            parser=self.link_extractor,
-            concurrency=self.config.crawler.concurrency,
-            timeout=self.config.crawler.timeout,
-            max_retries=3,
-            max_pages=self.config.crawler.max_pages,
-            user_agent=self.config.crawler.user_agent,
-            url_database=self.url_database,
-        )
+        selected_engine = (crawl_engine or self.config.crawler.engine or "async").lower()
+        crawler_args = {
+            "frontier": self.frontier,
+            "parser": self.link_extractor,
+            "concurrency": self.config.crawler.concurrency,
+            "timeout": self.config.crawler.timeout,
+            "max_retries": 3,
+            "max_pages": self.config.crawler.max_pages,
+            "user_agent": self.config.crawler.user_agent,
+            "url_database": self.url_database,
+        }
+
+        if selected_engine == "async":
+            self._crawler = AsyncCrawler(**crawler_args)
+        elif selected_engine == "http":
+            self._crawler = HTTPCrawler(**crawler_args)
+        elif selected_engine == "tor":
+            self._crawler = TorCrawler(**crawler_args)
+        elif selected_engine == "playwright":
+            self._crawler = PlaywrightCrawler(**crawler_args)
+        elif selected_engine == "selenium":
+            self._crawler = SeleniumCrawler(**crawler_args)
+        else:
+            raise ValueError(
+                f"Unsupported crawler engine: {selected_engine}. "
+                "Expected one of: async, http, tor, playwright, selenium"
+            )
+
+        self.crawl_engine = selected_engine
 
         self.extra_seed_files = extra_seed_files or []
         self.queries = queries or []
         self.include_seed_files = include_seed_files
         self.resume_unfinished = resume_unfinished
         self.query_scope = query_scope
+
+        logger.info(f"Using crawler engine: {self.crawl_engine}")
 
     def _priority_for_seed_url(self, url: str) -> int:
         return 8 if URLUtils.is_onion_url(url) else 12

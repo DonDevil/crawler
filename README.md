@@ -118,7 +118,7 @@ Recommended:
 
 ### Python
 
-```
+```text
 Python 3.12+
 ```
 
@@ -189,6 +189,10 @@ python main.py --query-only --query "movie title"
 python main.py --query-only --surface-web --query "movie title"
 python main.py --query-only --dark-web --query "movie title"
 python main.py --unfinished
+python main.py --crawler-engine http
+python main.py --crawler-engine tor
+python main.py --crawler-engine playwright
+python main.py --crawler-engine selenium
 ```
 
 The system will:
@@ -196,10 +200,12 @@ The system will:
 1. Load seed URLs
 2. Discover domains from search engines
 3. Add URLs to the frontier
-4. Crawl pages asynchronously
+4. Crawl pages using the selected crawler engine
 5. Extract links for further discovery
 
 Search discovery is configurable through `config.yaml`. The crawler now supports DuckDuckGo, Bing, Brave, Yandex, Ahmia, and Torch search adapters, but some engines may still return no results at runtime when they require captcha verification, JavaScript-only flows, or a reachable Tor proxy.
+
+Crawler implementation is also configurable through `config.yaml` using `crawler.engine` (`async`, `http`, `tor`, `playwright`, `selenium`) or with `--crawler-engine` from CLI.
 
 `--query-only` skips configured seed files and starts from search results only. `--unfinished` resumes `queued` and `pending` URLs from `storage/crawl_state.db` without loading seed files or running fresh discovery.
 

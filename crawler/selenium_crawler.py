@@ -1,0 +1,179 @@
+"""Browser-rendering crawler using Selenium WebDriver."""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Optional
+
+from loguru import logger
+
+from storage.url_database import URLDatabase
+
+try:
+	from selenium import webdriver
+	from selenium.common.exceptions import WebDriverException
+	from selenium.webdriver.chrome.options import Options
+except Exception:  # pragma: no cover
+	webdriver = None
+	Options = None
+	WebDriverException = Exception
+
+
+class SeleniumCrawler:
+	"""Queue-driven crawler for JS-heavy pages using Selenium."""
+
+	def __init__(
+		self,
+		frontier,
+		parser=None,
+		concurrency=2,
+		timeout=30,
+		max_retries=2,
+		max_pages: Optional[int] = None,
+		user_agent: Optional[str] = None,
+		url_database: Optional[URLDatabase] = None,
+	):
+		self.frontier = frontier
+		self.parser = parser
+		self.concurrency = max(1, min(concurrency, 4))
+		self.timeout = timeout
+		self.max_retries = max_retries
+		self.max_pages = max_pages
+		self.user_agent = user_agent
+		self.url_database = url_database
+
+		self.queue = asyncio.Queue()
+		self._stop_event = asyncio.Event()
+		self._pages_crawled = 0
+		self._pages_failed = 0
+
+	def _make_driver(self):
+		if webdriver is None or Options is None:
+			raise RuntimeError("selenium is not installed")
+
+		options = Options()
+		options.add_argument("--headless=new")
+		options.add_argument("--disable-gpu")
+		options.add_argument("--no-sandbox")
+		options.add_argument("--disable-dev-shm-usage")
+		if self.user_agent:
+			options.add_argument(f"--user-agent={self.user_agent}")
+
+		driver = webdriver.Chrome(options=options)
+		driver.set_page_load_timeout(self.timeout)
+		return driver
+
+	def _fetch_sync(self, url: str) -> tuple[Optional[str], Optional[str]]:
+		driver = None
+		try:
+			driver = self._make_driver()
+			driver.get(url)
+			html = driver.page_source
+			return html, None
+		except WebDriverException as exc:
+			return None, f"WebDriver error: {exc}"
+		except Exception as exc:
+			return None, str(exc)
+		finally:
+			if driver is not None:
+				try:
+					driver.quit()
+				except Exception:
+					pass
+
+	async def fetch(self, url: str) -> tuple[Optional[str], Optional[str]]:
+		last_error: Optional[str] = None
+
+		for attempt in range(1, self.max_retries + 1):
+			html, error = await asyncio.to_thread(self._fetch_sync, url)
+			if html:
+				return html, None
+
+			last_error = error or "unknown fetch error"
+			logger.warning(f"Selenium fetch failed ({attempt}/{self.max_retries}) {url}: {last_error}")
+			await asyncio.sleep(1)
+
+		return None, last_error
+
+	async def worker(self):
+		while not self._stop_event.is_set():
+			url = await self.queue.get()
+
+			try:
+				if not url:
+					continue
+
+				if self.url_database:
+					self.url_database.add_url(url, status="pending")
+
+				html, failure_reason = await self.fetch(url)
+				status = "visited"
+
+				if html and self.parser:
+					links = self.parser.extract_links(html, url)
+					for link in links:
+						self.frontier.add_url(link)
+				elif failure_reason:
+					status = "failed"
+					self._pages_failed += 1
+					logger.warning(f"Failed to crawl {url}: {failure_reason}")
+
+				self.frontier.mark_visited(url)
+				if self.url_database:
+					self.url_database.update_status(url, status)
+
+				self._pages_crawled += 1
+
+				if self.max_pages and self._pages_crawled >= self.max_pages:
+					logger.info("Reached max pages limit, stopping crawler")
+					self._stop_event.set()
+
+			except asyncio.CancelledError:
+				raise
+			except Exception as exc:
+				logger.error(f"Worker error for {url}: {exc}")
+			finally:
+				self.queue.task_done()
+
+	async def scheduler(self):
+		idle_loops = 0
+		while not self._stop_event.is_set():
+			url = self.frontier.get_next_url()
+			if url:
+				idle_loops = 0
+				await self.queue.put(url)
+				continue
+
+			if self.queue.empty():
+				idle_loops += 1
+				if idle_loops >= 10:
+					logger.info("No more URLs to crawl, stopping crawler")
+					self._stop_event.set()
+					break
+			else:
+				idle_loops = 0
+
+			await asyncio.sleep(0.5)
+
+	async def run(self):
+		workers = [
+			asyncio.create_task(self.worker())
+			for _ in range(self.concurrency)
+		]
+		scheduler_task = asyncio.create_task(self.scheduler())
+
+		try:
+			await self._stop_event.wait()
+		finally:
+			scheduler_task.cancel()
+			for task in workers:
+				task.cancel()
+
+			await asyncio.gather(scheduler_task, *workers, return_exceptions=True)
+
+			logger.info(
+				"Selenium crawler finished: processed={} failed={} pending_frontier={}",
+				self._pages_crawled,
+				self._pages_failed,
+				self.frontier.pending_count(),
+			)

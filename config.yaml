@@ -1,4 +1,5 @@
 crawler:
+  engine: "async"
   concurrency: 25
   timeout: 15
   max_pages: 200

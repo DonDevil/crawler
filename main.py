@@ -28,6 +28,11 @@ def main() -> None:
         help="Override max pages to crawl (default from config).",
     )
     parser.add_argument(
+        "--crawler-engine",
+        choices=["async", "http", "tor", "playwright", "selenium"],
+        help="Crawler implementation to use for page fetching.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging.",
@@ -63,6 +68,7 @@ def main() -> None:
         include_seed_files=not args.query_only and not args.unfinished,
         resume_unfinished=args.unfinished,
         query_scope="surface-web" if args.surface_web else "dark-web" if args.dark_web else None,
+        crawl_engine=args.crawler_engine,
     )
 
     if args.max_pages is not None:
