@@ -5,6 +5,7 @@ from discovery.search_engine_discovery import DiscoveryBatchReport, QueryDiscove
 from core.config import Config, CrawlerConfig, SearchConfig, StorageConfig
 from core.crawler_manager import CrawlerManager
 from crawler.http_crawler import HTTPCrawler
+from crawler.hybrid_crawler import HybridCrawler
 
 
 def _make_config(seed_file: str, sqlite_path: str) -> Config:
@@ -143,3 +144,21 @@ def test_manager_uses_selected_crawler_engine(monkeypatch, tmp_path):
     )
 
     assert isinstance(manager._crawler, HTTPCrawler)
+
+
+def test_manager_uses_hybrid_crawler_for_auto_mode(monkeypatch, tmp_path):
+    seed_file = tmp_path / "seeds.txt"
+    seed_file.write_text("https://seed.example.com\n", encoding="utf-8")
+    sqlite_path = tmp_path / "crawl.db"
+
+    monkeypatch.setattr(
+        "core.crawler_manager.discover_urls_from_queries_with_report",
+        lambda *args, **kwargs: DiscoveryBatchReport(),
+    )
+
+    manager = CrawlerManager(
+        config=_make_config(str(seed_file), str(sqlite_path)),
+        crawl_engine="auto",
+    )
+
+    assert isinstance(manager._crawler, HybridCrawler)

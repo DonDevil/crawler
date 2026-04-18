@@ -205,7 +205,7 @@ The system will:
 
 Search discovery is configurable through `config.yaml`. The crawler now supports DuckDuckGo, Bing, Brave, Yandex, Ahmia, and Torch search adapters, but some engines may still return no results at runtime when they require captcha verification, JavaScript-only flows, or a reachable Tor proxy.
 
-Crawler implementation is also configurable through `config.yaml` using `crawler.engine` (`async`, `http`, `tor`, `playwright`, `selenium`) or with `--crawler-engine` from CLI.
+Crawler implementation is also configurable through `config.yaml` using `crawler.engine` (`auto`, `async`, `http`, `tor`, `playwright`, `selenium`) or with `--crawler-engine` from CLI. The default `auto` mode keeps one shared frontier and routes each URL to the most suitable crawler strategy instead of forcing a single engine for the entire run.
 
 `--query-only` skips configured seed files and starts from search results only. `--unfinished` resumes `queued` and `pending` URLs from `storage/crawl_state.db` without loading seed files or running fresh discovery.
 

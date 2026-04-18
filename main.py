@@ -29,7 +29,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--crawler-engine",
-        choices=["async", "http", "tor", "playwright", "selenium"],
+        choices=["auto", "async", "http", "tor", "playwright", "selenium"],
         help="Crawler implementation to use for page fetching.",
     )
     parser.add_argument(

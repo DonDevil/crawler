@@ -41,7 +41,7 @@ class SearchConfig(BaseModel):
 
 
 class CrawlerConfig(BaseModel):
-    engine: str = "async"
+    engine: str = "auto"
     concurrency: int = 25
     timeout: int = 15
     max_pages: Optional[int] = 500

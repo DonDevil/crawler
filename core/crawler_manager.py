@@ -11,6 +11,7 @@ from core.config import Config, load_config
 from core.url_frontier import URLFrontier
 from crawler.async_crawler import AsyncCrawler
 from crawler.http_crawler import HTTPCrawler
+from crawler.hybrid_crawler import HybridCrawler
 from crawler.playwright_crawler import PlaywrightCrawler
 from crawler.selenium_crawler import SeleniumCrawler
 from crawler.tor_crawler import TorCrawler
@@ -59,7 +60,9 @@ class CrawlerManager:
             "url_database": self.url_database,
         }
 
-        if selected_engine == "async":
+        if selected_engine == "auto":
+            self._crawler = HybridCrawler(**crawler_args)
+        elif selected_engine == "async":
             self._crawler = AsyncCrawler(**crawler_args)
         elif selected_engine == "http":
             self._crawler = HTTPCrawler(**crawler_args)
@@ -72,7 +75,7 @@ class CrawlerManager:
         else:
             raise ValueError(
                 f"Unsupported crawler engine: {selected_engine}. "
-                "Expected one of: async, http, tor, playwright, selenium"
+                "Expected one of: auto, async, http, tor, playwright, selenium"
             )
 
         self.crawl_engine = selected_engine
