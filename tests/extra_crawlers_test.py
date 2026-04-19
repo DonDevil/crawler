@@ -142,3 +142,26 @@ async def test_selenium_crawler_processes_page_when_available():
         assert base_url in frontier.visited
     finally:
         await runner.cleanup()
+
+
+def test_selenium_driver_uses_hardened_headless_flags(monkeypatch):
+    captured = {}
+
+    class DummyDriver:
+        def set_page_load_timeout(self, timeout):
+            captured["timeout"] = timeout
+
+    def fake_chrome(*, options):
+        captured["arguments"] = set(options.arguments)
+        captured["binary_location"] = getattr(options, "binary_location", None)
+        return DummyDriver()
+
+    monkeypatch.setattr("crawler.selenium_crawler.webdriver.Chrome", fake_chrome)
+
+    crawler = SeleniumCrawler(frontier=URLFrontier(), timeout=7)
+    crawler._make_driver()
+
+    assert "--no-sandbox" in captured["arguments"]
+    assert "--disable-dev-shm-usage" in captured["arguments"]
+    assert "--remote-debugging-port=9222" in captured["arguments"]
+    assert captured["timeout"] == 7

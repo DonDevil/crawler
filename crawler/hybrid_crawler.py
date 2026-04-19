@@ -50,6 +50,7 @@ class HybridCrawler:
         self._stop_event = asyncio.Event()
         self._pages_crawled = 0
         self._pages_failed = 0
+        self._active_workers = 0
         self._engine_counts: Counter[str] = Counter()
 
         self._direct_session: aiohttp.ClientSession | None = None
@@ -144,6 +145,7 @@ class HybridCrawler:
     async def worker(self):
         while not self._stop_event.is_set():
             url = await self.queue.get()
+            self._active_workers += 1
 
             try:
                 if not url:
@@ -219,6 +221,7 @@ class HybridCrawler:
             except Exception as exc:
                 logger.error(f"Worker error for {url}: {exc}")
             finally:
+                self._active_workers = max(0, self._active_workers - 1)
                 self.queue.task_done()
 
     async def scheduler(self):
@@ -232,7 +235,7 @@ class HybridCrawler:
                 await self.queue.put(url)
                 continue
 
-            if self.queue.empty():
+            if self.queue.empty() and self._active_workers == 0 and not self.frontier.has_pending():
                 idle_loops += 1
                 if idle_loops >= 10:
                     logger.info("No more URLs to crawl, stopping crawler")

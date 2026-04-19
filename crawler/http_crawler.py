@@ -40,6 +40,7 @@ class HTTPCrawler:
 		self._stop_event = asyncio.Event()
 		self._pages_crawled = 0
 		self._pages_failed = 0
+		self._active_workers = 0
 
 	async def fetch(self, client: httpx.AsyncClient, url: str) -> tuple[Optional[str], Optional[str]]:
 		"""Fetch a URL and return body/error tuple."""
@@ -81,6 +82,7 @@ class HTTPCrawler:
 	async def worker(self, client: httpx.AsyncClient):
 		while not self._stop_event.is_set():
 			url = await self.queue.get()
+			self._active_workers += 1
 
 			try:
 				if not url:
@@ -116,6 +118,7 @@ class HTTPCrawler:
 			except Exception as exc:
 				logger.error(f"Worker error for {url}: {exc}")
 			finally:
+				self._active_workers = max(0, self._active_workers - 1)
 				self.queue.task_done()
 
 	async def scheduler(self):
@@ -128,7 +131,7 @@ class HTTPCrawler:
 				await self.queue.put(url)
 				continue
 
-			if self.queue.empty():
+			if self.queue.empty() and self._active_workers == 0 and not self.frontier.has_pending():
 				idle_loops += 1
 				if idle_loops >= 10:
 					logger.info("No more URLs to crawl, stopping crawler")

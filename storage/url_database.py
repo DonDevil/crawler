@@ -98,5 +98,11 @@ class URLDatabase:
         cur = self._conn.execute("SELECT status, COUNT(*) FROM urls GROUP BY status")
         return {status: count for status, count in cur.fetchall()}
 
+    def clear(self) -> None:
+        """Remove all stored URL crawl state from the database."""
+
+        self._conn.execute("DELETE FROM urls")
+        self._conn.commit()
+
     def close(self) -> None:
         self._conn.close()

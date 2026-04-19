@@ -40,6 +40,7 @@ class AsyncCrawler:
         self._stop_event = asyncio.Event()
         self._pages_crawled = 0
         self._pages_failed = 0
+        self._active_workers = 0
 
     async def fetch(
         self,
@@ -102,6 +103,7 @@ class AsyncCrawler:
 
         while not self._stop_event.is_set():
             url = await self.queue.get()
+            self._active_workers += 1
 
             try:
                 if not url:
@@ -141,6 +143,7 @@ class AsyncCrawler:
                 logger.error(f"Worker error for {url}: {e}")
 
             finally:
+                self._active_workers = max(0, self._active_workers - 1)
                 self.queue.task_done()
 
     async def scheduler(self):
@@ -156,8 +159,8 @@ class AsyncCrawler:
                 await self.queue.put(url)
                 continue
 
-            # If the queue is empty and there are no pending URLs, stop after a short idling period.
-            if self.queue.empty():
+            # Only stop after the queue, active workers, and frontier are all idle.
+            if self.queue.empty() and self._active_workers == 0 and not self.frontier.has_pending():
                 idle_loops += 1
                 if idle_loops >= 10:  # ~5 seconds of idle
                     logger.info("No more URLs to crawl, stopping crawler")

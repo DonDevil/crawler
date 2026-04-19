@@ -37,6 +37,11 @@ class URLFrontier:
         if cleaned in self.visited or cleaned in self._queued:
             return
 
+        if self.url_database is not None and self.url_database.is_visited(cleaned):
+            self.visited.add(cleaned)
+            logger.debug(f"Skipping already-visited URL from storage: {cleaned}")
+            return
+
         domain = urlparse(cleaned).netloc
         self._sequence += 1
         self.domain_queues[domain].append((priority, self._sequence, cleaned))

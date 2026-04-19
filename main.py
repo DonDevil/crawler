@@ -37,6 +37,11 @@ def main() -> None:
         action="store_true",
         help="Enable debug logging.",
     )
+    parser.add_argument(
+        "--clear-db",
+        action="store_true",
+        help="Clear the stored SQLite crawl state before starting.",
+    )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--query-only",
@@ -71,8 +76,11 @@ def main() -> None:
         crawl_engine=args.crawler_engine,
     )
 
+    if args.clear_db:
+        manager.clear_storage()
+
     if args.max_pages is not None:
-        manager._crawler.max_pages = args.max_pages
+        manager.set_max_pages(args.max_pages)
 
     if args.debug:
         # This is a quick way to bump logging level.

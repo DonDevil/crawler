@@ -44,6 +44,7 @@ class PlaywrightCrawler:
 		self._stop_event = asyncio.Event()
 		self._pages_crawled = 0
 		self._pages_failed = 0
+		self._active_workers = 0
 
 		self._playwright = None
 		self._browser = None
@@ -53,7 +54,15 @@ class PlaywrightCrawler:
 			raise RuntimeError("playwright is not installed")
 
 		self._playwright = await async_playwright().start()
-		self._browser = await self._playwright.chromium.launch(headless=True)
+		self._browser = await self._playwright.chromium.launch(
+			headless=True,
+			args=[
+				"--no-sandbox",
+				"--disable-setuid-sandbox",
+				"--disable-dev-shm-usage",
+				"--disable-gpu",
+			],
+		)
 
 	async def _stop_browser(self) -> None:
 		if self._browser is not None:
@@ -107,6 +116,7 @@ class PlaywrightCrawler:
 	async def worker(self):
 		while not self._stop_event.is_set():
 			url = await self.queue.get()
+			self._active_workers += 1
 
 			try:
 				if not url:
@@ -142,6 +152,7 @@ class PlaywrightCrawler:
 			except Exception as exc:
 				logger.error(f"Worker error for {url}: {exc}")
 			finally:
+				self._active_workers = max(0, self._active_workers - 1)
 				self.queue.task_done()
 
 	async def scheduler(self):
@@ -153,7 +164,7 @@ class PlaywrightCrawler:
 				await self.queue.put(url)
 				continue
 
-			if self.queue.empty():
+			if self.queue.empty() and self._active_workers == 0 and not self.frontier.has_pending():
 				idle_loops += 1
 				if idle_loops >= 10:
 					logger.info("No more URLs to crawl, stopping crawler")

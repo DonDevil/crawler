@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 from typing import Optional
 
 from loguru import logger
@@ -46,16 +47,36 @@ class SeleniumCrawler:
 		self._stop_event = asyncio.Event()
 		self._pages_crawled = 0
 		self._pages_failed = 0
+		self._active_workers = 0
 
 	def _make_driver(self):
 		if webdriver is None or Options is None:
 			raise RuntimeError("selenium is not installed")
 
 		options = Options()
-		options.add_argument("--headless=new")
-		options.add_argument("--disable-gpu")
-		options.add_argument("--no-sandbox")
-		options.add_argument("--disable-dev-shm-usage")
+		chrome_binary = (
+			shutil.which("google-chrome")
+			or shutil.which("chromium")
+			or shutil.which("chromium-browser")
+		)
+		if chrome_binary:
+			options.binary_location = chrome_binary
+
+		for arg in (
+			"--headless=new",
+			"--disable-gpu",
+			"--no-sandbox",
+			"--disable-setuid-sandbox",
+			"--disable-dev-shm-usage",
+			"--disable-software-rasterizer",
+			"--disable-extensions",
+			"--no-first-run",
+			"--no-default-browser-check",
+			"--remote-debugging-port=9222",
+			"--remote-debugging-address=127.0.0.1",
+			"--window-size=1280,720",
+		):
+			options.add_argument(arg)
 		if self.user_agent:
 			options.add_argument(f"--user-agent={self.user_agent}")
 
@@ -98,6 +119,7 @@ class SeleniumCrawler:
 	async def worker(self):
 		while not self._stop_event.is_set():
 			url = await self.queue.get()
+			self._active_workers += 1
 
 			try:
 				if not url:
@@ -133,6 +155,7 @@ class SeleniumCrawler:
 			except Exception as exc:
 				logger.error(f"Worker error for {url}: {exc}")
 			finally:
+				self._active_workers = max(0, self._active_workers - 1)
 				self.queue.task_done()
 
 	async def scheduler(self):
@@ -144,7 +167,7 @@ class SeleniumCrawler:
 				await self.queue.put(url)
 				continue
 
-			if self.queue.empty():
+			if self.queue.empty() and self._active_workers == 0 and not self.frontier.has_pending():
 				idle_loops += 1
 				if idle_loops >= 10:
 					logger.info("No more URLs to crawl, stopping crawler")

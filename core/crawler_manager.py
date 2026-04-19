@@ -88,6 +88,18 @@ class CrawlerManager:
 
         logger.info(f"Using crawler engine: {self.crawl_engine}")
 
+    def clear_storage(self) -> None:
+        """Clear all persisted URL crawl state from the SQLite storage."""
+
+        counts_before = self.url_database.get_status_counts()
+        self.url_database.clear()
+        logger.info(f"Cleared crawl storage. Previous counts: {counts_before}")
+
+    def set_max_pages(self, max_pages: int) -> None:
+        """Override the active crawler page limit."""
+
+        self._crawler.max_pages = max_pages
+
     def _priority_for_seed_url(self, url: str) -> int:
         return 8 if URLUtils.is_onion_url(url) else 12
 
