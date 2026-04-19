@@ -127,8 +127,8 @@ class CrawlerManager:
             self.media_database.clear()
         logger.info(f"Cleared crawl storage. Previous counts: {counts_before}")
 
-    def set_max_pages(self, max_pages: int) -> None:
-        """Override the active crawler page limit."""
+    def set_max_pages(self, max_pages: int | None) -> None:
+        """Override the active crawler page limit, or clear it for autonomous runs."""
 
         self._crawler.max_pages = max_pages
 

@@ -31,6 +31,12 @@ def main() -> None:
         help="Override max pages to crawl (default from config).",
     )
     parser.add_argument(
+        "--indefinite-run",
+        dest="indefinite_run",
+        action="store_true",
+        help="Disable the page cap and keep crawling until all reachable URLs are visited and no new links are found.",
+    )
+    parser.add_argument(
         "--crawler-engine",
         choices=["auto", "async", "http", "tor", "playwright", "selenium", "scrapling"],
         help="Crawler implementation to use for page fetching.",
@@ -142,7 +148,9 @@ def main() -> None:
     if args.clear_db:
         manager.clear_storage()
 
-    if args.max_pages is not None:
+    if args.indefinite_run:
+        manager.set_max_pages(None)
+    elif args.max_pages is not None:
         manager.set_max_pages(args.max_pages)
 
     if args.debug:
