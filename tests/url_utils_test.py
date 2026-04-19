@@ -1,5 +1,7 @@
 """Tests for URL validation and normalization helpers."""
 
+from pathlib import Path
+
 from utils.url_utils import URLUtils
 
 
@@ -15,3 +17,26 @@ def test_clean_url_rejects_markup_artifacts():
 def test_is_onion_url_detects_hidden_services():
     assert URLUtils.is_onion_url("http://exampleexampleexample.onion/") is True
     assert URLUtils.is_onion_url("https://example.com/") is False
+
+
+def test_clean_url_uses_live_domain_blacklist_reload(tmp_path):
+    blacklist_path = tmp_path / "domain_blacklist.txt"
+    blacklist_path.write_text("", encoding="utf-8")
+
+    original_path = URLUtils._blacklist_path
+    original_enabled = URLUtils._blacklist_enabled
+
+    try:
+        URLUtils.set_blacklist_path(str(blacklist_path))
+        URLUtils.set_blacklist_enabled(True)
+
+        assert URLUtils.clean_url("https://sub.example.com/path") == "https://sub.example.com/path"
+
+        blacklist_path.write_text("example.com\n", encoding="utf-8")
+        assert URLUtils.clean_url("https://sub.example.com/path") is None
+
+        URLUtils.set_blacklist_enabled(False)
+        assert URLUtils.clean_url("https://sub.example.com/path") == "https://sub.example.com/path"
+    finally:
+        URLUtils.set_blacklist_path(str(original_path))
+        URLUtils.set_blacklist_enabled(original_enabled)

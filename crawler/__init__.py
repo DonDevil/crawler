@@ -5,6 +5,7 @@ from crawler.http_crawler import HTTPCrawler
 from crawler.hybrid_crawler import HybridCrawler
 from crawler.playwright_crawler import PlaywrightCrawler
 from crawler.selenium_crawler import SeleniumCrawler
+from crawler.scrapling_crawler import ScraplingCrawler
 from crawler.tor_crawler import TorCrawler
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "TorCrawler",
     "PlaywrightCrawler",
     "SeleniumCrawler",
+    "ScraplingCrawler",
 ]

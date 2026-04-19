@@ -37,8 +37,13 @@ JS_REQUIRED_MARKERS = {
 class CrawlerRouter:
     """Choose crawler strategies based on URL traits and fetched content."""
 
-    def __init__(self, classifier: PiracyDomainClassifier | None = None):
+    def __init__(
+        self,
+        classifier: PiracyDomainClassifier | None = None,
+        allow_scrapling: bool = False,
+    ):
         self.classifier = classifier or PiracyDomainClassifier()
+        self.allow_scrapling = allow_scrapling
 
     def _clean_or_raw(self, url: str) -> str:
         return URLUtils.clean_url(url) or url
@@ -75,9 +80,6 @@ class CrawlerRouter:
         if URLUtils.is_onion_url(url):
             return "tor"
 
-        if self.prefers_browser(url):
-            return "playwright"
-
         return "async"
 
     def needs_browser_upgrade(
@@ -102,6 +104,11 @@ class CrawlerRouter:
                 "javascript",
                 "403",
                 "401",
+                "429",
+                "202",
+                "too many requests",
+                "verify you are human",
+                "not a robot",
             )):
                 return True
 
@@ -132,19 +139,36 @@ class CrawlerRouter:
             return ["tor"]
 
         if current_engine is None:
-            if self.prefers_browser(url):
-                return ["playwright", "async", "http", "selenium"]
-            return ["async", "http", "playwright", "selenium"]
+            plan = ["async"]
+            if self.allow_scrapling:
+                plan.append("scrapling")
+            plan.extend(["playwright", "selenium", "http"])
+            return plan
 
         if self.needs_browser_upgrade(url, html=html, failure_reason=failure_reason):
-            return [engine for engine in ("playwright", "selenium", "http", "async") if engine != current_engine]
+            preferred = []
+            if self.allow_scrapling:
+                preferred.append("scrapling")
+            preferred.extend(["playwright", "selenium", "http", "async"])
+            return [engine for engine in preferred if engine != current_engine]
 
         fallback_order = {
-            "async": ["http", "playwright", "selenium"],
-            "http": ["async", "playwright", "selenium"],
+            "async": ["scrapling", "playwright", "selenium", "http"],
+            "scrapling": ["playwright", "selenium", "http"],
             "playwright": ["selenium", "http", "async"],
             "selenium": ["playwright", "http", "async"],
+            "http": ["scrapling", "playwright", "selenium", "async"],
             "tor": [],
         }
 
-        return fallback_order.get(current_engine, ["async", "http", "playwright", "selenium"])
+        if not self.allow_scrapling:
+            fallback_order = {
+                name: [engine for engine in plan if engine != "scrapling"]
+                for name, plan in fallback_order.items()
+            }
+
+        default_plan = ["async", "playwright", "selenium", "http"]
+        if self.allow_scrapling:
+            default_plan.insert(1, "scrapling")
+
+        return fallback_order.get(current_engine, default_plan)

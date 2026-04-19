@@ -2,6 +2,7 @@
 
 from core.url_frontier import URLFrontier
 from storage.url_database import URLDatabase
+from utils.url_utils import URLUtils
 
 
 def test_frontier_marks_cleaned_urls_as_visited_and_prevents_requeue():
@@ -46,3 +47,25 @@ def test_frontier_skips_urls_already_visited_in_database(tmp_path):
         assert frontier.pending_count() == 0
     finally:
         database.close()
+
+
+def test_frontier_drops_queued_urls_when_domain_becomes_blacklisted(tmp_path):
+    blacklist_path = tmp_path / "domain_blacklist.txt"
+    blacklist_path.write_text("", encoding="utf-8")
+
+    original_path = URLUtils._blacklist_path
+    original_enabled = URLUtils._blacklist_enabled
+
+    try:
+        URLUtils.set_blacklist_path(str(blacklist_path))
+        URLUtils.set_blacklist_enabled(True)
+
+        frontier = URLFrontier(rate_limit=0)
+        frontier.add_url("https://blocked.example.com/path")
+
+        blacklist_path.write_text("example.com\n", encoding="utf-8")
+
+        assert frontier.get_next_url() is None
+    finally:
+        URLUtils.set_blacklist_path(str(original_path))
+        URLUtils.set_blacklist_enabled(original_enabled)

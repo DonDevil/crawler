@@ -6,6 +6,8 @@ from core.config import Config, CrawlerConfig, SearchConfig, StorageConfig
 from core.crawler_manager import CrawlerManager
 from crawler.http_crawler import HTTPCrawler
 from crawler.hybrid_crawler import HybridCrawler
+from crawler.scrapling_crawler import ScraplingCrawler
+from utils.url_utils import URLUtils
 
 
 def _make_config(seed_file: str, sqlite_path: str) -> Config:
@@ -162,3 +164,51 @@ def test_manager_uses_hybrid_crawler_for_auto_mode(monkeypatch, tmp_path):
     )
 
     assert isinstance(manager._crawler, HybridCrawler)
+
+
+def test_manager_uses_scrapling_crawler_when_selected(monkeypatch, tmp_path):
+    seed_file = tmp_path / "seeds.txt"
+    seed_file.write_text("https://seed.example.com\n", encoding="utf-8")
+    sqlite_path = tmp_path / "crawl.db"
+
+    monkeypatch.setattr(
+        "core.crawler_manager.discover_urls_from_queries_with_report",
+        lambda *args, **kwargs: DiscoveryBatchReport(),
+    )
+
+    manager = CrawlerManager(
+        config=_make_config(str(seed_file), str(sqlite_path)),
+        crawl_engine="scrapling",
+    )
+
+    assert isinstance(manager._crawler, ScraplingCrawler)
+
+
+def test_manager_can_ignore_blacklist(monkeypatch, tmp_path):
+    seed_file = tmp_path / "seeds.txt"
+    seed_file.write_text("https://news.example.com/story\n", encoding="utf-8")
+    sqlite_path = tmp_path / "crawl.db"
+    blacklist_path = tmp_path / "domain_blacklist.txt"
+    blacklist_path.write_text("example.com\n", encoding="utf-8")
+
+    original_path = URLUtils._blacklist_path
+    original_enabled = URLUtils._blacklist_enabled
+
+    monkeypatch.setattr(
+        "core.crawler_manager.discover_urls_from_queries_with_report",
+        lambda *args, **kwargs: DiscoveryBatchReport(),
+    )
+
+    try:
+        URLUtils.set_blacklist_path(str(blacklist_path))
+
+        manager = CrawlerManager(
+            config=_make_config(str(seed_file), str(sqlite_path)),
+            ignore_blacklist=True,
+        )
+        manager.prepare_frontier()
+
+        assert manager.frontier.get_next_url() == "https://news.example.com/story"
+    finally:
+        URLUtils.set_blacklist_path(str(original_path))
+        URLUtils.set_blacklist_enabled(original_enabled)

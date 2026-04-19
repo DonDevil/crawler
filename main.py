@@ -29,7 +29,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--crawler-engine",
-        choices=["auto", "async", "http", "tor", "playwright", "selenium"],
+        choices=["auto", "async", "http", "tor", "playwright", "selenium", "scrapling"],
         help="Crawler implementation to use for page fetching.",
     )
     parser.add_argument(
@@ -41,6 +41,11 @@ def main() -> None:
         "--clear-db",
         action="store_true",
         help="Clear the stored SQLite crawl state before starting.",
+    )
+    parser.add_argument(
+        "--ignore-blacklist",
+        action="store_true",
+        help="Allow crawling domains listed in datasets/domain_blacklist.txt.",
     )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
@@ -74,6 +79,7 @@ def main() -> None:
         resume_unfinished=args.unfinished,
         query_scope="surface-web" if args.surface_web else "dark-web" if args.dark_web else None,
         crawl_engine=args.crawler_engine,
+        ignore_blacklist=args.ignore_blacklist,
     )
 
     if args.clear_db:

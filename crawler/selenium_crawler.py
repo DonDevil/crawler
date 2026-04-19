@@ -9,6 +9,7 @@ from typing import Optional
 from loguru import logger
 
 from storage.url_database import URLDatabase
+from utils.url_utils import URLUtils
 
 try:
 	from selenium import webdriver
@@ -36,7 +37,7 @@ class SeleniumCrawler:
 	):
 		self.frontier = frontier
 		self.parser = parser
-		self.concurrency = max(1, min(concurrency, 4))
+		self.concurrency = max(1, min(concurrency, 4, max_pages)) if max_pages else max(1, min(concurrency, 4))
 		self.timeout = timeout
 		self.max_retries = max_retries
 		self.max_pages = max_pages
@@ -123,6 +124,13 @@ class SeleniumCrawler:
 
 			try:
 				if not url:
+					continue
+
+				if URLUtils.is_blacklisted(url):
+					logger.info(f"Skipping blacklisted URL during crawl: {url}")
+					self.frontier.mark_visited(url)
+					if self.url_database:
+						self.url_database.update_status(url, "skipped")
 					continue
 
 				if self.url_database:

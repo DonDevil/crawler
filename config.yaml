@@ -5,6 +5,10 @@ crawler:
   max_pages: 200
   rate_limit: 1.0
   user_agent: "AntiPiracyBot/1.0"
+  scrapling_enabled: true
+  scrapling_headless: true
+  scrapling_stealth: true
+  scrapling_network_idle: true
   seed_files:
     - "seeds/piracy_sites.txt"
     - "seeds/torrent_sites.txt"

@@ -22,5 +22,6 @@ pysocks
 fake-useragent
 playwright
 selenium
+scrapling[fetchers]
 pytest
 pytest-asyncio

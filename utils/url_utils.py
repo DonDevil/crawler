@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urldefrag, unquote, urlparse, urlunparse
 
 
@@ -35,6 +36,71 @@ UNWANTED_EXTENSIONS = {
 
 
 class URLUtils:
+
+    _blacklist_path = Path("datasets/domain_blacklist.txt")
+    _blacklist_enabled = True
+    _blacklist_domains: set[str] = set()
+    _blacklist_mtime_ns: int | None = None
+
+    @classmethod
+    def set_blacklist_path(cls, path: str) -> None:
+        cls._blacklist_path = Path(path)
+        cls._blacklist_domains = set()
+        cls._blacklist_mtime_ns = None
+
+    @classmethod
+    def set_blacklist_enabled(cls, enabled: bool) -> None:
+        cls._blacklist_enabled = enabled
+
+    @classmethod
+    def _reload_blacklist_if_needed(cls) -> None:
+        if not cls._blacklist_enabled:
+            return
+
+        try:
+            stat = cls._blacklist_path.stat()
+        except FileNotFoundError:
+            cls._blacklist_domains = set()
+            cls._blacklist_mtime_ns = None
+            return
+
+        if cls._blacklist_mtime_ns == stat.st_mtime_ns:
+            return
+
+        domains: set[str] = set()
+        with open(cls._blacklist_path, "r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip().lower()
+                if not line or line.startswith("#"):
+                    continue
+
+                parsed = urlparse(line if "://" in line else f"http://{line}")
+                host = (parsed.hostname or line).lower().strip().strip(".")
+                if host:
+                    domains.add(host)
+
+        cls._blacklist_domains = domains
+        cls._blacklist_mtime_ns = stat.st_mtime_ns
+
+    @classmethod
+    def is_blacklisted(cls, url: str) -> bool:
+        if not cls._blacklist_enabled:
+            return False
+
+        cls._reload_blacklist_if_needed()
+        if not cls._blacklist_domains:
+            return False
+
+        try:
+            parsed = urlparse(url if "://" in url else f"http://{url}")
+            hostname = (parsed.hostname or "").lower().strip().strip(".")
+        except Exception:
+            return False
+
+        if not hostname:
+            return False
+
+        return any(hostname == blocked or hostname.endswith(f".{blocked}") for blocked in cls._blacklist_domains)
 
     @staticmethod
     def normalize_url(url):
@@ -118,7 +184,7 @@ class URLUtils:
 
         try:
             parsed = urlparse(url)
-            return parsed.netloc.lower()
+            return (parsed.hostname or parsed.netloc).lower()
         except Exception:
             return None
 
@@ -170,6 +236,9 @@ class URLUtils:
             return None
 
         if not URLUtils.has_valid_host(url):
+            return None
+
+        if URLUtils.is_blacklisted(url):
             return None
 
         if URLUtils.is_media_file(url):

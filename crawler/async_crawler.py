@@ -28,7 +28,7 @@ class AsyncCrawler:
 
         self.frontier = frontier
         self.parser = parser
-        self.concurrency = concurrency
+        self.concurrency = max(1, min(concurrency, max_pages)) if max_pages else max(1, concurrency)
         self.timeout = timeout
         self.max_retries = max_retries
         self.max_pages = max_pages
@@ -107,6 +107,13 @@ class AsyncCrawler:
 
             try:
                 if not url:
+                    continue
+
+                if URLUtils.is_blacklisted(url):
+                    logger.info(f"Skipping blacklisted URL during crawl: {url}")
+                    self.frontier.mark_visited(url)
+                    if self.url_database:
+                        self.url_database.update_status(url, "skipped")
                     continue
 
                 if self.url_database:

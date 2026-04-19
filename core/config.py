@@ -47,6 +47,10 @@ class CrawlerConfig(BaseModel):
     max_pages: Optional[int] = 500
     rate_limit: float = 1.0
     user_agent: Optional[str] = None
+    scrapling_enabled: bool = True
+    scrapling_headless: bool = True
+    scrapling_stealth: bool = True
+    scrapling_network_idle: bool = True
     seed_files: List[str] = Field(default_factory=lambda: [
         "seeds/piracy_sites.txt",
         "seeds/torrent_sites.txt",

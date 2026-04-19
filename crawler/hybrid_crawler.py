@@ -15,11 +15,13 @@ from core.crawler_router import CrawlerRouter
 from crawler.async_crawler import AsyncCrawler
 from crawler.http_crawler import HTTPCrawler
 from crawler.playwright_crawler import PlaywrightCrawler
+from crawler.scrapling_crawler import ScraplingCrawler
 from crawler.selenium_crawler import SeleniumCrawler
 from crawler.tor_crawler import TorCrawler
 from storage.url_database import URLDatabase
 from tor.proxy_config import get_default_tor_proxy
 from utils.request_headers import get_default_headers
+from utils.url_utils import URLUtils
 
 
 class HybridCrawler:
@@ -35,16 +37,21 @@ class HybridCrawler:
         max_pages: Optional[int] = None,
         user_agent: Optional[str] = None,
         url_database: Optional[URLDatabase] = None,
+        scrapling_enabled: bool = True,
+        scrapling_headless: bool = True,
+        scrapling_stealth: bool = True,
+        scrapling_network_idle: bool = True,
     ):
         self.frontier = frontier
         self.parser = parser
-        self.concurrency = concurrency
+        self.concurrency = max(1, min(concurrency, max_pages)) if max_pages else max(1, concurrency)
         self.timeout = timeout
         self.max_retries = max_retries
         self.max_pages = max_pages
         self.user_agent = user_agent
         self.url_database = url_database
-        self.router = CrawlerRouter()
+        self.scrapling_enabled = scrapling_enabled
+        self.router = CrawlerRouter(allow_scrapling=self.scrapling_enabled)
 
         self.queue = asyncio.Queue()
         self._stop_event = asyncio.Event()
@@ -59,11 +66,17 @@ class HybridCrawler:
         self._httpx_tor_client: httpx.AsyncClient | None = None
 
         self._playwright_ready = False
+        self._playwright_error: str | None = None
         self._playwright_lock = asyncio.Lock()
+        self._selenium_checked = False
+        self._selenium_ready = False
+        self._selenium_error: str | None = None
+        self._selenium_lock = asyncio.Lock()
 
-        self._http_semaphore = asyncio.Semaphore(max(1, min(10, concurrency)))
-        self._tor_semaphore = asyncio.Semaphore(max(1, min(5, concurrency)))
-        self._playwright_semaphore = asyncio.Semaphore(2)
+        self._http_semaphore = asyncio.Semaphore(max(1, min(10, self.concurrency)))
+        self._tor_semaphore = asyncio.Semaphore(max(1, min(5, self.concurrency)))
+        self._scrapling_semaphore = asyncio.Semaphore(max(1, min(3, self.concurrency)))
+        self._playwright_semaphore = asyncio.Semaphore(max(1, min(2, self.concurrency)))
         self._selenium_semaphore = asyncio.Semaphore(1)
 
         common_args = {
@@ -81,22 +94,56 @@ class HybridCrawler:
         self._tor_engine = TorCrawler(**common_args)
         self._playwright_engine = PlaywrightCrawler(**common_args)
         self._selenium_engine = SeleniumCrawler(**common_args)
+        self._scrapling_engine = ScraplingCrawler(
+            **common_args,
+            headless=scrapling_headless,
+            use_stealth=scrapling_stealth,
+            network_idle=scrapling_network_idle,
+        )
 
     async def _ensure_playwright_ready(self) -> tuple[bool, Optional[str]]:
         if self._playwright_ready:
             return True, None
+        if self._playwright_error:
+            return False, self._playwright_error
 
         async with self._playwright_lock:
             if self._playwright_ready:
                 return True, None
+            if self._playwright_error:
+                return False, self._playwright_error
 
             try:
                 await self._playwright_engine._start_browser()
             except Exception as exc:
-                return False, str(exc)
+                self._playwright_error = str(exc)
+                logger.warning(f"Disabling Playwright for this run: {self._playwright_error}")
+                return False, self._playwright_error
 
             self._playwright_ready = True
             return True, None
+
+    async def _ensure_selenium_ready(self) -> tuple[bool, Optional[str]]:
+        if self._selenium_checked:
+            return self._selenium_ready, self._selenium_error
+
+        async with self._selenium_lock:
+            if self._selenium_checked:
+                return self._selenium_ready, self._selenium_error
+
+            try:
+                driver = await asyncio.to_thread(self._selenium_engine._make_driver)
+                await asyncio.to_thread(driver.quit)
+                self._selenium_ready = True
+                self._selenium_error = None
+            except Exception as exc:
+                self._selenium_ready = False
+                self._selenium_error = str(exc)
+                logger.warning(f"Disabling Selenium for this run: {self._selenium_error}")
+            finally:
+                self._selenium_checked = True
+
+            return self._selenium_ready, self._selenium_error
 
     async def _fetch_with_engine(self, engine_name: str, url: str) -> tuple[Optional[str], Optional[str]]:
         if engine_name == "async":
@@ -124,8 +171,15 @@ class HybridCrawler:
                 return await self._playwright_engine.fetch(url)
 
         if engine_name == "selenium":
+            ready, error = await self._ensure_selenium_ready()
+            if not ready:
+                return None, error or "Selenium unavailable"
             async with self._selenium_semaphore:
                 return await self._selenium_engine.fetch(url)
+
+        if engine_name == "scrapling":
+            async with self._scrapling_semaphore:
+                return await self._scrapling_engine.fetch(url)
 
         return None, f"Unsupported engine: {engine_name}"
 
@@ -151,11 +205,19 @@ class HybridCrawler:
                 if not url:
                     continue
 
+                if URLUtils.is_blacklisted(url):
+                    logger.info(f"Skipping blacklisted URL during crawl: {url}")
+                    self.frontier.mark_visited(url)
+                    if self.url_database:
+                        self.url_database.update_status(url, "skipped")
+                    continue
+
                 if self.url_database:
                     self.url_database.add_url(url, status="pending")
 
                 plan = list(self.router.get_engine_plan(url))
                 attempted: set[str] = set()
+                attempt_chain: list[str] = []
                 html: Optional[str] = None
                 failure_reason: Optional[str] = None
                 engine_used = "unknown"
@@ -166,6 +228,7 @@ class HybridCrawler:
                         continue
 
                     attempted.add(engine_used)
+                    attempt_chain.append(engine_used)
                     html, failure_reason = await self._fetch_with_engine(engine_used, url)
 
                     if html:
@@ -181,6 +244,8 @@ class HybridCrawler:
                                 ),
                                 attempted,
                             )
+                            if plan:
+                                logger.info(f"Escalating {url} from {engine_used} to {plan[0]}: {failure_reason}")
                             continue
                         break
 
@@ -193,6 +258,8 @@ class HybridCrawler:
                         ),
                         attempted,
                     )
+                    if plan:
+                        logger.info(f"Escalating {url} from {engine_used} to {plan[0]}: {failure_reason}")
 
                 status = "visited"
                 if html and self.parser:
@@ -210,7 +277,9 @@ class HybridCrawler:
 
                 self._pages_crawled += 1
                 self._engine_counts[engine_used] += 1
-                logger.info(f"Processed ({self._pages_crawled}): {url} [{status}] via {engine_used}")
+                logger.info(
+                    f"Processed ({self._pages_crawled}): {url} [{status}] via {engine_used} chain={' -> '.join(attempt_chain)}"
+                )
 
                 if self.max_pages and self._pages_crawled >= self.max_pages:
                     logger.info("Reached max pages limit, stopping crawler")

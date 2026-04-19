@@ -43,6 +43,30 @@ def test_router_selects_tor_for_onion_and_async_for_surface():
     assert router.select_crawler("https://example.com/") == "async"
 
 
+def test_router_prefers_async_then_scrapling_for_surface_urls():
+    from core.crawler_router import CrawlerRouter
+
+    router = CrawlerRouter(allow_scrapling=True)
+
+    plan = router.get_engine_plan("https://example.com/watch/movie")
+
+    assert plan[:4] == ["async", "scrapling", "playwright", "selenium"]
+
+
+def test_router_escalates_antibot_failures_to_scrapling_first():
+    from core.crawler_router import CrawlerRouter
+
+    router = CrawlerRouter(allow_scrapling=True)
+
+    plan = router.get_engine_plan(
+        "https://example.com/protected",
+        current_engine="async",
+        failure_reason="not a robot",
+    )
+
+    assert plan[:3] == ["scrapling", "playwright", "selenium"]
+
+
 @pytest.mark.asyncio
 async def test_hybrid_crawler_processes_clearweb_pages():
     from crawler.hybrid_crawler import HybridCrawler

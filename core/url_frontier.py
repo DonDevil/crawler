@@ -82,6 +82,19 @@ class URLFrontier:
                 continue
 
             _, _, url = queue.popleft()
+
+            if URLUtils.is_blacklisted(url):
+                self._queued.discard(url)
+                if self.url_database is not None:
+                    self.url_database.update_status(url, "skipped")
+                logger.info(f"Skipping blacklisted URL from frontier: {url}")
+
+                if queue:
+                    self._schedule_domain(domain)
+                else:
+                    self.domain_queues.pop(domain, None)
+                continue
+
             self.domain_next_time[domain] = now + self.rate_limit
 
             if queue:

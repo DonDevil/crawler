@@ -13,6 +13,7 @@ from crawler.async_crawler import AsyncCrawler
 from crawler.http_crawler import HTTPCrawler
 from crawler.hybrid_crawler import HybridCrawler
 from crawler.playwright_crawler import PlaywrightCrawler
+from crawler.scrapling_crawler import ScraplingCrawler
 from crawler.selenium_crawler import SeleniumCrawler
 from crawler.tor_crawler import TorCrawler
 from discovery.piracy_site_seeds import load_seeds
@@ -35,9 +36,11 @@ class CrawlerManager:
         resume_unfinished: bool = False,
         query_scope: str | None = None,
         crawl_engine: str | None = None,
+        ignore_blacklist: bool = False,
     ):
         self.config = config or load_config()
         configure_logging("INFO")
+        URLUtils.set_blacklist_enabled(not ignore_blacklist)
 
         self.url_database = URLDatabase(path=self.config.crawler.storage.sqlite_path)
 
@@ -58,24 +61,42 @@ class CrawlerManager:
             "max_pages": self.config.crawler.max_pages,
             "user_agent": self.config.crawler.user_agent,
             "url_database": self.url_database,
+            "scrapling_enabled": self.config.crawler.scrapling_enabled,
+            "scrapling_headless": self.config.crawler.scrapling_headless,
+            "scrapling_stealth": self.config.crawler.scrapling_stealth,
+            "scrapling_network_idle": self.config.crawler.scrapling_network_idle,
+        }
+
+        hybrid_args = dict(crawler_args)
+
+        basic_crawler_args = {
+            key: value for key, value in crawler_args.items()
+            if key not in {"scrapling_enabled", "scrapling_headless", "scrapling_stealth", "scrapling_network_idle"}
         }
 
         if selected_engine == "auto":
-            self._crawler = HybridCrawler(**crawler_args)
+            self._crawler = HybridCrawler(**hybrid_args)
         elif selected_engine == "async":
-            self._crawler = AsyncCrawler(**crawler_args)
+            self._crawler = AsyncCrawler(**basic_crawler_args)
         elif selected_engine == "http":
-            self._crawler = HTTPCrawler(**crawler_args)
+            self._crawler = HTTPCrawler(**basic_crawler_args)
         elif selected_engine == "tor":
-            self._crawler = TorCrawler(**crawler_args)
+            self._crawler = TorCrawler(**basic_crawler_args)
         elif selected_engine == "playwright":
-            self._crawler = PlaywrightCrawler(**crawler_args)
+            self._crawler = PlaywrightCrawler(**basic_crawler_args)
         elif selected_engine == "selenium":
-            self._crawler = SeleniumCrawler(**crawler_args)
+            self._crawler = SeleniumCrawler(**basic_crawler_args)
+        elif selected_engine == "scrapling":
+            self._crawler = ScraplingCrawler(
+                **basic_crawler_args,
+                headless=self.config.crawler.scrapling_headless,
+                use_stealth=self.config.crawler.scrapling_stealth,
+                network_idle=self.config.crawler.scrapling_network_idle,
+            )
         else:
             raise ValueError(
                 f"Unsupported crawler engine: {selected_engine}. "
-                "Expected one of: auto, async, http, tor, playwright, selenium"
+                "Expected one of: auto, async, http, tor, playwright, selenium, scrapling"
             )
 
         self.crawl_engine = selected_engine
