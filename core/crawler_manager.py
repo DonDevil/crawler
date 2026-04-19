@@ -19,6 +19,7 @@ from crawler.tor_crawler import TorCrawler
 from discovery.piracy_site_seeds import load_seeds
 from discovery.search_engine_discovery import discover_urls_from_queries_with_report, get_engine_names_for_scope
 from parsers.html_link_extractor import HTMLLinkExtractor
+from storage.domain_database import DomainDatabase
 from storage.media_evidence_database import MediaEvidenceDatabase
 from storage.url_database import URLDatabase
 from utils.logger import configure_logging
@@ -44,6 +45,7 @@ class CrawlerManager:
         URLUtils.set_blacklist_enabled(not ignore_blacklist)
 
         self.url_database = URLDatabase(path=self.config.crawler.storage.sqlite_path)
+        self.domain_database = DomainDatabase(path=self.config.crawler.storage.sqlite_path)
         self.media_database = (
             MediaEvidenceDatabase(path=self.config.crawler.storage.media_sqlite_path)
             if self.config.crawler.storage.enable_media_evidence
@@ -245,6 +247,7 @@ class CrawlerManager:
             logger.info("Crawler stopped")
             logger.info(f"Database status counts: {self.url_database.get_status_counts()}")
             self.url_database.close()
+            self.domain_database.close()
             if self.media_database:
                 self.media_database.close()
 

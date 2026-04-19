@@ -7,11 +7,15 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
+from parsers.javascript_link_extractor import JavaScriptLinkExtractor
 from utils.url_utils import URLUtils
 
 
 class MediaLinkDetector:
     """Extract potential media URLs from an HTML page."""
+
+    def __init__(self) -> None:
+        self._js_extractor = JavaScriptLinkExtractor()
 
     def extract_media_links(self, html: str, base_url: str) -> List[dict]:
         """Return structured media-link candidates for evidence storage."""
@@ -49,5 +53,13 @@ class MediaLinkDetector:
 
             for source in tag.find_all("source"):
                 add_candidate(source.get("src"), "source-tag", source.get("type"))
+
+        for script in soup.find_all("script"):
+            script_text = script.string or script.get_text() or ""
+            for candidate in self._js_extractor.extract_links(script_text):
+                add_candidate(candidate, "script-url")
+
+        for candidate in self._js_extractor.extract_links(soup.get_text(" ")):
+            add_candidate(candidate, "text-url")
 
         return list(links.values())

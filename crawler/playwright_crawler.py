@@ -7,6 +7,7 @@ from typing import Optional
 
 from loguru import logger
 
+from parsers.streaming_manifest_parser import StreamingManifestParser
 from storage.url_database import URLDatabase
 from utils.url_utils import URLUtils
 
@@ -42,6 +43,7 @@ class PlaywrightCrawler:
 		self.user_agent = user_agent
 		self.url_database = url_database
 		self.media_database = media_database
+		self._manifest_parser = StreamingManifestParser()
 
 		self.queue = asyncio.Queue()
 		self._stop_event = asyncio.Event()
@@ -92,6 +94,9 @@ class PlaywrightCrawler:
 					)
 				except Exception as exc:
 					logger.debug(f"Skipping media network capture for {request.url}: {exc}")
+			if URLUtils.classify_media_url(request.url) == "stream-manifest":
+				await route.continue_()
+				return
 			await route.abort()
 			return
 		if request.resource_type in {"image", "font", "beacon"}:
@@ -101,6 +106,35 @@ class PlaywrightCrawler:
 			await route.abort()
 			return
 		await route.continue_()
+
+	async def _capture_response(self, response, source_url: str) -> None:
+		if not self.media_database:
+			return
+
+		try:
+			response_url = response.url
+			headers = await response.all_headers()
+			content_type = headers.get("content-type", "")
+			if not (URLUtils.looks_like_media_content_type(content_type) or URLUtils.is_media_file(response_url)):
+				return
+
+			asset_id = self.media_database.record_media_link(
+				url=response_url,
+				source_page=source_url,
+				referrer_url=source_url,
+				discovered_by="playwright",
+				discovery_method="network-response",
+				media_type=URLUtils.classify_media_url(response_url, content_type),
+				mime_type=content_type,
+				content_length=int(headers.get("content-length", "0") or 0) or None,
+				priority=4,
+			)
+			if URLUtils.classify_media_url(response_url, content_type) == "stream-manifest":
+				body_text = await response.text()
+				parsed = self._manifest_parser.parse_manifest(body_text, manifest_url=response_url)
+				self.media_database.record_manifest_variants(asset_id, parsed.get("variants", []))
+		except Exception as exc:
+			logger.debug(f"Skipping media response capture for {source_url}: {exc}")
 
 	async def fetch(self, url: str) -> tuple[Optional[str], Optional[str]]:
 		"""Fetch and render a page using Playwright."""
@@ -118,6 +152,7 @@ class PlaywrightCrawler:
 				await context.route("**/*", self._route_request)
 				page = await context.new_page()
 				page.on("popup", lambda popup: asyncio.create_task(popup.close()))
+				page.on("response", lambda response: asyncio.create_task(self._capture_response(response, url)))
 				response = await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout * 1000)
 				await page.wait_for_load_state("networkidle", timeout=self.timeout * 1000)
 				html = await page.content()

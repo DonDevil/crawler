@@ -36,7 +36,9 @@ class MediaEvidenceDatabase:
                 last_source_page TEXT,
                 last_referrer_url TEXT,
                 last_discovered_by TEXT,
-                last_discovery_method TEXT
+                last_discovery_method TEXT,
+                match_confidence REAL,
+                matched_title TEXT
             )"""
         )
         self._conn.execute(
@@ -61,9 +63,23 @@ class MediaEvidenceDatabase:
                 priority INTEGER NOT NULL DEFAULT 10,
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 byte_range_strategy TEXT NOT NULL DEFAULT 'head-window',
+                claimed_by TEXT,
                 last_error TEXT,
                 created_at TIMESTAMP,
                 updated_at TIMESTAMP,
+                FOREIGN KEY(asset_id) REFERENCES media_assets(id) ON DELETE CASCADE
+            )"""
+        )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS manifest_variants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id INTEGER NOT NULL,
+                variant_url TEXT NOT NULL,
+                bandwidth INTEGER,
+                resolution TEXT,
+                codecs TEXT,
+                discovered_at TIMESTAMP,
+                UNIQUE(asset_id, variant_url),
                 FOREIGN KEY(asset_id) REFERENCES media_assets(id) ON DELETE CASCADE
             )"""
         )
@@ -171,6 +187,32 @@ class MediaEvidenceDatabase:
         self._conn.commit()
         return asset_id
 
+    def record_manifest_variants(self, asset_id: int, variants: list[dict]) -> None:
+        now = self._now()
+        for variant in variants:
+            variant_url = URLUtils.clean_media_url(variant.get("url", ""))
+            if not variant_url:
+                continue
+            self._conn.execute(
+                """INSERT INTO manifest_variants (
+                    asset_id, variant_url, bandwidth, resolution, codecs, discovered_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(asset_id, variant_url) DO UPDATE SET
+                    bandwidth = COALESCE(excluded.bandwidth, manifest_variants.bandwidth),
+                    resolution = COALESCE(excluded.resolution, manifest_variants.resolution),
+                    codecs = COALESCE(excluded.codecs, manifest_variants.codecs),
+                    discovered_at = excluded.discovered_at""",
+                (
+                    asset_id,
+                    variant_url,
+                    variant.get("bandwidth"),
+                    variant.get("resolution"),
+                    variant.get("codecs"),
+                    now,
+                ),
+            )
+        self._conn.commit()
+
     def list_media_assets(self) -> list[dict]:
         cur = self._conn.execute("SELECT * FROM media_assets ORDER BY last_seen DESC")
         return [dict(row) for row in cur.fetchall()]
@@ -178,6 +220,13 @@ class MediaEvidenceDatabase:
     def list_observations(self, asset_id: int) -> list[dict]:
         cur = self._conn.execute(
             "SELECT * FROM media_observations WHERE asset_id = ? ORDER BY observed_at ASC",
+            (asset_id,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+    def list_manifest_variants(self, asset_id: int) -> list[dict]:
+        cur = self._conn.execute(
+            "SELECT * FROM manifest_variants WHERE asset_id = ? ORDER BY bandwidth ASC, variant_url ASC",
             (asset_id,),
         )
         return [dict(row) for row in cur.fetchall()]
@@ -193,6 +242,75 @@ class MediaEvidenceDatabase:
             cur = self._conn.execute("SELECT * FROM sample_jobs ORDER BY priority ASC, updated_at ASC")
         return [dict(row) for row in cur.fetchall()]
 
+    def claim_next_sample_job(self, worker_name: str) -> dict | None:
+        pending_jobs = self.get_sample_jobs(statuses=["pending"])
+        if not pending_jobs:
+            return None
+
+        job = pending_jobs[0]
+        asset_id = int(job["asset_id"])
+        now = self._now()
+        self._conn.execute(
+            "UPDATE sample_jobs SET status = 'claimed', claimed_by = ?, updated_at = ? WHERE asset_id = ?",
+            (worker_name, now, asset_id),
+        )
+        self._conn.execute(
+            "UPDATE media_assets SET status = 'claimed', last_seen = ? WHERE id = ?",
+            (now, asset_id),
+        )
+        self._conn.commit()
+
+        refreshed = self._conn.execute("SELECT * FROM sample_jobs WHERE asset_id = ?", (asset_id,)).fetchone()
+        return dict(refreshed) if refreshed else None
+
+    def complete_sample_job(
+        self,
+        asset_id: int,
+        *,
+        fingerprint_status: str,
+        match_confidence: float | None = None,
+        matched_title: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        now = self._now()
+        self._conn.execute(
+            "UPDATE sample_jobs SET status = ?, last_error = ?, updated_at = ? WHERE asset_id = ?",
+            (fingerprint_status, last_error, now, asset_id),
+        )
+        self._conn.execute(
+            "UPDATE media_assets SET status = ?, last_seen = ?, match_confidence = ?, matched_title = ? WHERE id = ?",
+            (fingerprint_status, now, match_confidence, matched_title, asset_id),
+        )
+        self._conn.commit()
+
+    def mark_asset_matched(
+        self,
+        asset_id: int,
+        *,
+        matched_title: str,
+        confidence: float,
+        domain_database=None,
+        score_increment: float = 1.0,
+    ) -> str | None:
+        self.complete_sample_job(
+            asset_id,
+            fingerprint_status="matched",
+            match_confidence=confidence,
+            matched_title=matched_title,
+        )
+
+        row = self._conn.execute(
+            "SELECT source_domain FROM media_assets WHERE id = ?",
+            (asset_id,),
+        ).fetchone()
+        source_domain = row[0] if row else None
+
+        if source_domain and domain_database is not None:
+            current_score = domain_database.get_score(source_domain) or 0.0
+            domain_database.add_or_update(source_domain, score=current_score + score_increment)
+
+        return source_domain
+
     def update_sample_job_status(self, asset_id: int, status: str, last_error: str | None = None) -> None:
         now = self._now()
         self._conn.execute(
@@ -206,6 +324,7 @@ class MediaEvidenceDatabase:
         self._conn.commit()
 
     def clear(self) -> None:
+        self._conn.execute("DELETE FROM manifest_variants")
         self._conn.execute("DELETE FROM media_observations")
         self._conn.execute("DELETE FROM sample_jobs")
         self._conn.execute("DELETE FROM media_assets")

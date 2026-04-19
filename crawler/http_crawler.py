@@ -8,6 +8,7 @@ from typing import Optional
 import httpx
 from loguru import logger
 
+from parsers.streaming_manifest_parser import StreamingManifestParser
 from storage.url_database import URLDatabase
 from utils.request_headers import get_default_headers
 from utils.url_utils import URLUtils
@@ -37,6 +38,7 @@ class HTTPCrawler:
 		self.user_agent = user_agent
 		self.url_database = url_database
 		self.media_database = media_database
+		self._manifest_parser = StreamingManifestParser()
 
 		self.queue = asyncio.Queue()
 		self._stop_event = asyncio.Event()
@@ -72,6 +74,26 @@ class HTTPCrawler:
 
 				content_type = response.headers.get("Content-Type", "")
 				if content_type and "html" not in content_type.lower() and "xml" not in content_type.lower():
+					if self.media_database and (
+						URLUtils.looks_like_media_content_type(content_type)
+						or URLUtils.is_media_file(final_url)
+					):
+						body_text = response.text
+						asset_id = self.media_database.record_media_link(
+							url=final_url,
+							source_page=url,
+							referrer_url=url,
+							discovered_by="http",
+							discovery_method="direct-response",
+							media_type=URLUtils.classify_media_url(final_url, content_type),
+							mime_type=content_type,
+							content_length=int(response.headers.get("Content-Length", "0") or 0) or None,
+							priority=6,
+						)
+						if URLUtils.classify_media_url(final_url, content_type) == "stream-manifest":
+							parsed = self._manifest_parser.parse_manifest(body_text, manifest_url=final_url)
+							self.media_database.record_manifest_variants(asset_id, parsed.get("variants", []))
+						return "", None
 					return None, f"Unsupported content type: {content_type}"
 
 				return response.text, None

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 
 from core.crawler_manager import CrawlerManager
+from storage.domain_database import DomainDatabase
+from storage.media_evidence_database import MediaEvidenceDatabase
 
 
 def main() -> None:
@@ -47,6 +50,31 @@ def main() -> None:
         action="store_true",
         help="Allow crawling domains listed in datasets/domain_blacklist.txt.",
     )
+    parser.add_argument(
+        "--claim-sample-job",
+        action="store_true",
+        help="Claim the next pending media sample job for the future fingerprinter service.",
+    )
+    parser.add_argument(
+        "--worker-name",
+        default="fingerprinter-worker",
+        help="Worker name to use when claiming a sample job.",
+    )
+    parser.add_argument(
+        "--mark-match",
+        type=int,
+        help="Mark a media asset ID as matched and increase the source site's priority score.",
+    )
+    parser.add_argument(
+        "--match-title",
+        help="Human-readable title for the confirmed matched media asset.",
+    )
+    parser.add_argument(
+        "--match-confidence",
+        type=float,
+        default=1.0,
+        help="Confidence score for a confirmed matched media asset.",
+    )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--query-only",
@@ -71,6 +99,35 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    if args.claim_sample_job or args.mark_match is not None:
+        media_db = MediaEvidenceDatabase()
+        try:
+            if args.claim_sample_job:
+                job = media_db.claim_next_sample_job(worker_name=args.worker_name)
+                print(json.dumps(job or {}, indent=2, sort_keys=True))
+                return
+
+            if args.mark_match is not None:
+                domain_db = DomainDatabase()
+                try:
+                    domain = media_db.mark_asset_matched(
+                        args.mark_match,
+                        matched_title=args.match_title or "Matched media",
+                        confidence=args.match_confidence,
+                        domain_database=domain_db,
+                        score_increment=2.0,
+                    )
+                    print(json.dumps({
+                        "asset_id": args.mark_match,
+                        "matched_domain": domain,
+                        "confidence": args.match_confidence,
+                    }, indent=2, sort_keys=True))
+                    return
+                finally:
+                    domain_db.close()
+        finally:
+            media_db.close()
 
     manager = CrawlerManager(
         extra_seed_files=args.seed_files,
