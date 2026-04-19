@@ -27,20 +27,22 @@ class URLFrontier:
         self.rate_limit = rate_limit
         self.url_database = url_database
 
-    def add_url(self, url: str, priority: int = 10) -> None:
+    def add_url(self, url: str, priority: int = 10) -> bool:
         """Add a URL to the frontier if it has not already been seen."""
 
         cleaned = URLUtils.clean_url(url)
         if not cleaned:
-            return
+            if URLUtils.is_blacklisted(url):
+                logger.debug(f"Ignoring blacklisted URL before queueing: {url}")
+            return False
 
         if cleaned in self.visited or cleaned in self._queued:
-            return
+            return False
 
         if self.url_database is not None and self.url_database.is_visited(cleaned):
             self.visited.add(cleaned)
             logger.debug(f"Skipping already-visited URL from storage: {cleaned}")
-            return
+            return False
 
         domain = urlparse(cleaned).netloc
         self._sequence += 1
@@ -52,6 +54,7 @@ class URLFrontier:
             self.url_database.add_url(cleaned, status="queued")
 
         logger.debug(f"Added to frontier: {cleaned}")
+        return True
 
     def _schedule_domain(self, domain: str) -> None:
         queue = self.domain_queues.get(domain)
@@ -115,8 +118,11 @@ class URLFrontier:
     def mark_visited(self, url: str) -> None:
         """Mark a URL as visited so it is not crawled again."""
 
-        cleaned = URLUtils.clean_url(url)
+        cleaned = URLUtils.normalize_url(url)
         if not cleaned:
+            return
+
+        if not URLUtils.is_valid_scheme(cleaned) or not URLUtils.has_valid_host(cleaned):
             return
 
         self.visited.add(cleaned)

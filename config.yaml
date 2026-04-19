@@ -16,6 +16,9 @@ crawler:
     - "seeds/darkweb_seeds.txt"
   storage:
     sqlite_path: "storage/crawl_state.db"
+    media_sqlite_path: "storage/media_evidence.db"
+    enable_media_evidence: true
+    enqueue_media_jobs: true
 search:
   enabled_engines:
     - "duckduckgo"

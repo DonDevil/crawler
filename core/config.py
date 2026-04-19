@@ -15,6 +15,9 @@ from pydantic import BaseModel, Field
 
 class StorageConfig(BaseModel):
     sqlite_path: str = "storage/crawl_state.db"
+    media_sqlite_path: str = "storage/media_evidence.db"
+    enable_media_evidence: bool = True
+    enqueue_media_jobs: bool = True
 
 
 class SearchConfig(BaseModel):

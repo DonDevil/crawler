@@ -19,6 +19,7 @@ from crawler.tor_crawler import TorCrawler
 from discovery.piracy_site_seeds import load_seeds
 from discovery.search_engine_discovery import discover_urls_from_queries_with_report, get_engine_names_for_scope
 from parsers.html_link_extractor import HTMLLinkExtractor
+from storage.media_evidence_database import MediaEvidenceDatabase
 from storage.url_database import URLDatabase
 from utils.logger import configure_logging
 from utils.url_utils import URLUtils
@@ -43,6 +44,11 @@ class CrawlerManager:
         URLUtils.set_blacklist_enabled(not ignore_blacklist)
 
         self.url_database = URLDatabase(path=self.config.crawler.storage.sqlite_path)
+        self.media_database = (
+            MediaEvidenceDatabase(path=self.config.crawler.storage.media_sqlite_path)
+            if self.config.crawler.storage.enable_media_evidence
+            else None
+        )
 
         self.frontier = URLFrontier(
             rate_limit=self.config.crawler.rate_limit,
@@ -61,6 +67,7 @@ class CrawlerManager:
             "max_pages": self.config.crawler.max_pages,
             "user_agent": self.config.crawler.user_agent,
             "url_database": self.url_database,
+            "media_database": self.media_database,
             "scrapling_enabled": self.config.crawler.scrapling_enabled,
             "scrapling_headless": self.config.crawler.scrapling_headless,
             "scrapling_stealth": self.config.crawler.scrapling_stealth,
@@ -114,6 +121,8 @@ class CrawlerManager:
 
         counts_before = self.url_database.get_status_counts()
         self.url_database.clear()
+        if self.media_database:
+            self.media_database.clear()
         logger.info(f"Cleared crawl storage. Previous counts: {counts_before}")
 
     def set_max_pages(self, max_pages: int) -> None:
@@ -134,21 +143,25 @@ class CrawlerManager:
         """Load seed URLs from seed files and add them to the frontier."""
         files = list(self.config.crawler.seed_files) + self.extra_seed_files
         loaded = 0
+        accepted = 0
         for seed_file in files:
             for url in load_seeds(seed_file):
-                self.frontier.add_url(url, priority=self._priority_for_seed_url(url))
                 loaded += 1
+                if self.frontier.add_url(url, priority=self._priority_for_seed_url(url)):
+                    accepted += 1
 
-        logger.info(f"Loaded {loaded} seed URLs from {len(files)} file(s)")
+        logger.info(f"Loaded {accepted}/{loaded} seed URLs from {len(files)} file(s)")
 
     def load_unfinished_urls(self) -> None:
         """Load queued and pending URLs from the database into the frontier."""
 
         unfinished_urls = self.url_database.get_urls_and_statuses(["queued", "pending"])
+        accepted = 0
         for url, status in unfinished_urls:
-            self.frontier.add_url(url, priority=self._priority_for_unfinished_url(url, status))
+            if self.frontier.add_url(url, priority=self._priority_for_unfinished_url(url, status)):
+                accepted += 1
 
-        logger.info(f"Loaded {len(unfinished_urls)} unfinished URLs from storage")
+        logger.info(f"Loaded {accepted}/{len(unfinished_urls)} unfinished URLs from storage")
 
     def prepare_frontier(self) -> None:
         """Populate the frontier according to the selected startup mode."""
@@ -206,10 +219,16 @@ class CrawlerManager:
                 for url in report.urls
             ]
 
+        accepted = 0
         for item in discovered_items:
-            self.frontier.add_url(item.url, priority=item.priority)
+            if self.frontier.add_url(item.url, priority=item.priority):
+                accepted += 1
 
-        logger.info(f"Loaded {len(report.urls)} unique URLs from search discovery")
+        logger.info(
+            "Loaded {}/{} unique URLs from search discovery after blacklist and dedupe filtering",
+            accepted,
+            len(report.urls),
+        )
 
     async def run(self):
         """Run the crawler until it completes or is stopped."""
@@ -226,6 +245,8 @@ class CrawlerManager:
             logger.info("Crawler stopped")
             logger.info(f"Database status counts: {self.url_database.get_status_counts()}")
             self.url_database.close()
+            if self.media_database:
+                self.media_database.close()
 
 
 if __name__ == "__main__":

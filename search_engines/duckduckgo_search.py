@@ -19,8 +19,8 @@ class DuckDuckGoSearch(BaseSearchEngine):
         if parsed.path.startswith("/l/"):
             redirect_url = parse_qs(parsed.query).get("uddg", [None])[0]
             if redirect_url:
-                return URLUtils.clean_url(redirect_url)
-        return URLUtils.clean_url(url)
+                return URLUtils.clean_url(redirect_url, apply_blacklist=False)
+        return URLUtils.clean_url(url, apply_blacklist=False)
 
     def search(self, query: str, max_results: int = 20) -> list[str]:
         soup, final_url = self._make_soup(self.BASE_URL, params={"q": query})

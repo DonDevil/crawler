@@ -19,8 +19,8 @@ class AhmiaSearch(BaseSearchEngine):
         parsed = urlparse(url)
         redirect_url = parse_qs(parsed.query).get("redirect_url", [None])[0]
         if redirect_url:
-            return URLUtils.clean_url(redirect_url)
-        return URLUtils.clean_url(url)
+            return URLUtils.clean_url(redirect_url, apply_blacklist=False)
+        return URLUtils.clean_url(url, apply_blacklist=False)
 
     def search(self, query: str, max_results: int = 20) -> list[str]:
         home_soup, _ = self._make_soup(self.HOME_URL)

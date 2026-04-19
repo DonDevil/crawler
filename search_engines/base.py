@@ -105,7 +105,7 @@ class BaseSearchEngine(ABC):
         return urls
 
     def clean_result_url(self, url: str) -> str | None:
-        return URLUtils.clean_url(url)
+        return URLUtils.clean_url(url, apply_blacklist=False)
 
     @abstractmethod
     def search(self, query: str, max_results: int = 20) -> list[str]:

@@ -40,3 +40,60 @@ def test_clean_url_uses_live_domain_blacklist_reload(tmp_path):
     finally:
         URLUtils.set_blacklist_path(str(original_path))
         URLUtils.set_blacklist_enabled(original_enabled)
+
+
+def test_blacklist_is_seeded_with_default_non_target_domains(tmp_path):
+    blacklist_path = tmp_path / "domain_blacklist.txt"
+    blacklist_path.write_text("", encoding="utf-8")
+
+    original_path = URLUtils._blacklist_path
+    original_enabled = URLUtils._blacklist_enabled
+
+    try:
+        URLUtils.set_blacklist_path(str(blacklist_path))
+        URLUtils.set_blacklist_enabled(True)
+
+        content = blacklist_path.read_text(encoding="utf-8")
+        assert "wikipedia.org" in content
+        assert "imdb.com" in content
+    finally:
+        URLUtils.set_blacklist_path(str(original_path))
+        URLUtils.set_blacklist_enabled(original_enabled)
+
+
+def test_irrelevant_domains_are_auto_persisted_to_blacklist(tmp_path):
+    blacklist_path = tmp_path / "domain_blacklist.txt"
+    blacklist_path.write_text("", encoding="utf-8")
+
+    original_path = URLUtils._blacklist_path
+    original_enabled = URLUtils._blacklist_enabled
+
+    try:
+        URLUtils.set_blacklist_path(str(blacklist_path))
+        URLUtils.set_blacklist_enabled(True)
+
+        assert URLUtils.is_blacklisted("https://www.imdb.com/title/tt33379543/") is True
+        assert "imdb.com" in blacklist_path.read_text(encoding="utf-8")
+    finally:
+        URLUtils.set_blacklist_path(str(original_path))
+        URLUtils.set_blacklist_enabled(original_enabled)
+
+
+def test_suspicious_cross_domain_ad_redirect_is_detected():
+    assert URLUtils.is_suspicious_redirect(
+        "https://piracy-site.example/watch/movie",
+        "https://doubleclick.net/redirect-ad",
+    ) is True
+
+
+def test_same_site_links_get_higher_priority_than_external_links():
+    same_site_priority = URLUtils.get_link_priority(
+        "https://piracy-site.example/watch/movie",
+        "https://piracy-site.example/download/file",
+    )
+    external_priority = URLUtils.get_link_priority(
+        "https://piracy-site.example/watch/movie",
+        "https://random-blog.example/post",
+    )
+
+    assert same_site_priority < external_priority

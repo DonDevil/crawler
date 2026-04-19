@@ -11,6 +11,7 @@ from urllib.parse import urljoin
 from loguru import logger
 
 from parsers.javascript_link_extractor import JavaScriptLinkExtractor
+from parsers.media_link_detector import MediaLinkDetector
 from utils.url_utils import URLUtils
 
 
@@ -23,6 +24,13 @@ class HTMLLinkExtractor:
 
         self.allowed_schemes = allowed_schemes
         self._js_extractor = JavaScriptLinkExtractor()
+        self._media_detector = MediaLinkDetector()
+
+    def extract_content(self, html, base_url):
+        return {
+            "links": self.extract_links(html, base_url),
+            "media_links": self._media_detector.extract_media_links(html, base_url),
+        }
 
     def extract_links(self, html, base_url):
 
@@ -74,17 +82,21 @@ class HTMLLinkExtractor:
             for script in soup.find_all("script"):
                 if script.string:
                     for link in self._js_extractor.extract_links(script.string):
-                        if link not in links:
-                            links.add(link)
-                            script_links += 1
-                            logger.debug(f"Link from script: {link}")
+                        cleaned = URLUtils.clean_url(urljoin(base_url, link))
+                        if not cleaned or cleaned in links:
+                            continue
+                        links.add(cleaned)
+                        script_links += 1
+                        logger.debug(f"Link from script: {cleaned}")
 
             text_links = 0
             for link in self._js_extractor.extract_links(soup.get_text()):
-                if link not in links:
-                    links.add(link)
-                    text_links += 1
-                    logger.debug(f"Link from text: {link}")
+                cleaned = URLUtils.clean_url(urljoin(base_url, link))
+                if not cleaned or cleaned in links:
+                    continue
+                links.add(cleaned)
+                text_links += 1
+                logger.debug(f"Link from text: {cleaned}")
 
             logger.info(f"EXTRACTION RESULT from {base_url}: found {found_raw} <a> tags, {found_valid} valid, {script_links} scripts, {text_links} text = {len(links)} TOTAL unique")
 

@@ -27,11 +27,11 @@ class BingSearch(BaseSearchEngine):
                 try:
                     padded = encoded_target + "=" * (-len(encoded_target) % 4)
                     decoded_target = base64.urlsafe_b64decode(padded).decode("utf-8")
-                    return URLUtils.clean_url(decoded_target)
+                    return URLUtils.clean_url(decoded_target, apply_blacklist=False)
                 except Exception:
                     return None
 
-        return URLUtils.clean_url(url)
+        return URLUtils.clean_url(url, apply_blacklist=False)
 
     def search(self, query: str, max_results: int = 20) -> list[str]:
         soup, _ = self._make_soup(self.BASE_URL, params={"q": query})

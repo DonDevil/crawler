@@ -31,6 +31,7 @@ class PlaywrightCrawler:
 		max_pages: Optional[int] = None,
 		user_agent: Optional[str] = None,
 		url_database: Optional[URLDatabase] = None,
+		media_database=None,
 	):
 		self.frontier = frontier
 		self.parser = parser
@@ -40,6 +41,7 @@ class PlaywrightCrawler:
 		self.max_pages = max_pages
 		self.user_agent = user_agent
 		self.url_database = url_database
+		self.media_database = media_database
 
 		self.queue = asyncio.Queue()
 		self._stop_event = asyncio.Event()
@@ -62,6 +64,7 @@ class PlaywrightCrawler:
 				"--disable-setuid-sandbox",
 				"--disable-dev-shm-usage",
 				"--disable-gpu",
+				"--disable-notifications",
 			],
 		)
 
@@ -72,6 +75,32 @@ class PlaywrightCrawler:
 		if self._playwright is not None:
 			await self._playwright.stop()
 			self._playwright = None
+
+	async def _route_request(self, route) -> None:
+		request = route.request
+		if request.resource_type == "media":
+			if self.media_database:
+				try:
+					self.media_database.record_media_link(
+						url=request.url,
+						source_page=getattr(request.frame, "url", "") or request.url,
+						referrer_url=getattr(request.frame, "url", "") or request.url,
+						discovered_by="playwright",
+						discovery_method="network-request",
+						media_type=URLUtils.classify_media_url(request.url),
+						priority=6,
+					)
+				except Exception as exc:
+					logger.debug(f"Skipping media network capture for {request.url}: {exc}")
+			await route.abort()
+			return
+		if request.resource_type in {"image", "font", "beacon"}:
+			await route.abort()
+			return
+		if URLUtils.is_probable_ad_domain(request.url) or URLUtils.is_blacklisted(request.url):
+			await route.abort()
+			return
+		await route.continue_()
 
 	async def fetch(self, url: str) -> tuple[Optional[str], Optional[str]]:
 		"""Fetch and render a page using Playwright."""
@@ -86,10 +115,16 @@ class PlaywrightCrawler:
 			page = None
 			try:
 				context = await self._browser.new_context(user_agent=self.user_agent)
+				await context.route("**/*", self._route_request)
 				page = await context.new_page()
+				page.on("popup", lambda popup: asyncio.create_task(popup.close()))
 				response = await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout * 1000)
 				await page.wait_for_load_state("networkidle", timeout=self.timeout * 1000)
 				html = await page.content()
+				final_url = page.url or url
+
+				if URLUtils.is_suspicious_redirect(url, final_url):
+					return None, f"Suspicious redirect to {final_url}"
 
 				if response is not None and response.status >= 400:
 					return None, f"HTTP {response.status}"
@@ -137,9 +172,31 @@ class PlaywrightCrawler:
 				status = "visited"
 
 				if html and self.parser:
-					links = self.parser.extract_links(html, url)
+					parsed_content = (
+						self.parser.extract_content(html, url)
+						if hasattr(self.parser, "extract_content")
+						else {"links": self.parser.extract_links(html, url), "media_links": []}
+					)
+					links = parsed_content.get("links", set())
+					media_links = parsed_content.get("media_links", [])
+					for media in media_links:
+						if not self.media_database:
+							continue
+						try:
+							self.media_database.record_media_link(
+								url=media["url"],
+								source_page=url,
+								referrer_url=url,
+								discovered_by="playwright",
+								discovery_method=media.get("detection_method", "parser"),
+								media_type=media.get("media_type"),
+								mime_type=media.get("mime_type"),
+								priority=max(0, URLUtils.get_link_priority(url, media["url"]) - 2),
+							)
+						except Exception as exc:
+							logger.debug(f"Skipping media evidence capture for {url}: {exc}")
 					for link in links:
-						self.frontier.add_url(link)
+						self.frontier.add_url(link, priority=URLUtils.get_link_priority(url, link))
 				elif failure_reason:
 					status = "failed"
 					self._pages_failed += 1

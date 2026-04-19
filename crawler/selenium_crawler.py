@@ -34,6 +34,7 @@ class SeleniumCrawler:
 		max_pages: Optional[int] = None,
 		user_agent: Optional[str] = None,
 		url_database: Optional[URLDatabase] = None,
+		media_database=None,
 	):
 		self.frontier = frontier
 		self.parser = parser
@@ -43,6 +44,7 @@ class SeleniumCrawler:
 		self.max_pages = max_pages
 		self.user_agent = user_agent
 		self.url_database = url_database
+		self.media_database = media_database
 
 		self.queue = asyncio.Queue()
 		self._stop_event = asyncio.Event()
@@ -63,6 +65,13 @@ class SeleniumCrawler:
 		if chrome_binary:
 			options.binary_location = chrome_binary
 
+		prefs = {
+			"profile.default_content_setting_values.notifications": 2,
+			"profile.default_content_settings.popups": 0,
+			"profile.managed_default_content_settings.images": 2,
+		}
+		options.add_experimental_option("prefs", prefs)
+
 		for arg in (
 			"--headless=new",
 			"--disable-gpu",
@@ -71,6 +80,7 @@ class SeleniumCrawler:
 			"--disable-dev-shm-usage",
 			"--disable-software-rasterizer",
 			"--disable-extensions",
+			"--disable-notifications",
 			"--no-first-run",
 			"--no-default-browser-check",
 			"--remote-debugging-port=9222",
@@ -90,6 +100,9 @@ class SeleniumCrawler:
 		try:
 			driver = self._make_driver()
 			driver.get(url)
+			final_url = driver.current_url or url
+			if URLUtils.is_suspicious_redirect(url, final_url):
+				return None, f"Suspicious redirect to {final_url}"
 			html = driver.page_source
 			return html, None
 		except WebDriverException as exc:
@@ -140,9 +153,31 @@ class SeleniumCrawler:
 				status = "visited"
 
 				if html and self.parser:
-					links = self.parser.extract_links(html, url)
+					parsed_content = (
+						self.parser.extract_content(html, url)
+						if hasattr(self.parser, "extract_content")
+						else {"links": self.parser.extract_links(html, url), "media_links": []}
+					)
+					links = parsed_content.get("links", set())
+					media_links = parsed_content.get("media_links", [])
+					for media in media_links:
+						if not self.media_database:
+							continue
+						try:
+							self.media_database.record_media_link(
+								url=media["url"],
+								source_page=url,
+								referrer_url=url,
+								discovered_by="selenium",
+								discovery_method=media.get("detection_method", "parser"),
+								media_type=media.get("media_type"),
+								mime_type=media.get("mime_type"),
+								priority=max(0, URLUtils.get_link_priority(url, media["url"]) - 2),
+							)
+						except Exception as exc:
+							logger.debug(f"Skipping media evidence capture for {url}: {exc}")
 					for link in links:
-						self.frontier.add_url(link)
+						self.frontier.add_url(link, priority=URLUtils.get_link_priority(url, link))
 				elif failure_reason:
 					status = "failed"
 					self._pages_failed += 1

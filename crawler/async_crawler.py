@@ -23,6 +23,7 @@ class AsyncCrawler:
         max_pages: Optional[int] = None,
         user_agent: Optional[str] = None,
         url_database: Optional[URLDatabase] = None,
+        media_database=None,
         tor_proxy: Optional[str] = None,
     ):
 
@@ -34,6 +35,7 @@ class AsyncCrawler:
         self.max_pages = max_pages
         self.user_agent = user_agent
         self.url_database = url_database
+        self.media_database = media_database
         self.tor_proxy = tor_proxy or get_default_tor_proxy()
 
         self.queue = asyncio.Queue()
@@ -73,6 +75,12 @@ class AsyncCrawler:
                             await asyncio.sleep(1)
                             continue
 
+                        return None, last_error
+
+                    final_url = str(response.url)
+                    if URLUtils.is_suspicious_redirect(url, final_url):
+                        last_error = f"Suspicious redirect to {final_url}"
+                        logger.warning(f"Fetch rejected for {url}: {last_error}")
                         return None, last_error
 
                     content_type = response.headers.get("Content-Type", "")
@@ -123,11 +131,34 @@ class AsyncCrawler:
                 status = "visited"
 
                 if html and self.parser:
-                    links = self.parser.extract_links(html, url)
+                    parsed_content = (
+                        self.parser.extract_content(html, url)
+                        if hasattr(self.parser, "extract_content")
+                        else {"links": self.parser.extract_links(html, url), "media_links": []}
+                    )
+                    links = parsed_content.get("links", set())
+                    media_links = parsed_content.get("media_links", [])
                     logger.info(f"{len(links)} links extracted from {url}")
 
+                    for media in media_links:
+                        if not self.media_database:
+                            continue
+                        try:
+                            self.media_database.record_media_link(
+                                url=media["url"],
+                                source_page=url,
+                                referrer_url=url,
+                                discovered_by="async",
+                                discovery_method=media.get("detection_method", "parser"),
+                                media_type=media.get("media_type"),
+                                mime_type=media.get("mime_type"),
+                                priority=max(0, URLUtils.get_link_priority(url, media["url"]) - 2),
+                            )
+                        except Exception as exc:
+                            logger.debug(f"Skipping media evidence capture for {url}: {exc}")
+
                     for link in links:
-                        self.frontier.add_url(link)
+                        self.frontier.add_url(link, priority=URLUtils.get_link_priority(url, link))
                 elif failure_reason:
                     status = "failed"
                     self._pages_failed += 1

@@ -25,7 +25,7 @@ class TorchSearch(BaseSearchEngine):
         self._mirror_hosts = {urlparse(url).netloc for url in self.BASE_URLS}
 
     def clean_result_url(self, url: str) -> str | None:
-        cleaned = URLUtils.clean_url(url)
+        cleaned = URLUtils.clean_url(url, apply_blacklist=False)
         if not cleaned:
             return None
 

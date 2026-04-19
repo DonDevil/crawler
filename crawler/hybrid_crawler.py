@@ -37,6 +37,7 @@ class HybridCrawler:
         max_pages: Optional[int] = None,
         user_agent: Optional[str] = None,
         url_database: Optional[URLDatabase] = None,
+        media_database=None,
         scrapling_enabled: bool = True,
         scrapling_headless: bool = True,
         scrapling_stealth: bool = True,
@@ -50,6 +51,7 @@ class HybridCrawler:
         self.max_pages = max_pages
         self.user_agent = user_agent
         self.url_database = url_database
+        self.media_database = media_database
         self.scrapling_enabled = scrapling_enabled
         self.router = CrawlerRouter(allow_scrapling=self.scrapling_enabled)
 
@@ -88,6 +90,7 @@ class HybridCrawler:
             "max_pages": self.max_pages,
             "user_agent": self.user_agent,
             "url_database": self.url_database,
+            "media_database": self.media_database,
         }
         self._async_engine = AsyncCrawler(**common_args)
         self._http_engine = HTTPCrawler(**common_args)
@@ -263,9 +266,33 @@ class HybridCrawler:
 
                 status = "visited"
                 if html and self.parser:
-                    links = self.parser.extract_links(html, url)
+                    parsed_content = (
+                        self.parser.extract_content(html, url)
+                        if hasattr(self.parser, "extract_content")
+                        else {"links": self.parser.extract_links(html, url), "media_links": []}
+                    )
+                    links = parsed_content.get("links", set())
+                    media_links = parsed_content.get("media_links", [])
+
+                    for media in media_links:
+                        if not self.media_database:
+                            continue
+                        try:
+                            self.media_database.record_media_link(
+                                url=media["url"],
+                                source_page=url,
+                                referrer_url=url,
+                                discovered_by=engine_used,
+                                discovery_method=media.get("detection_method", "parser"),
+                                media_type=media.get("media_type"),
+                                mime_type=media.get("mime_type"),
+                                priority=max(0, URLUtils.get_link_priority(url, media["url"]) - 2),
+                            )
+                        except Exception as exc:
+                            logger.debug(f"Skipping media evidence capture for {url}: {exc}")
+
                     for link in links:
-                        self.frontier.add_url(link)
+                        self.frontier.add_url(link, priority=URLUtils.get_link_priority(url, link))
                 elif failure_reason:
                     status = "failed"
                     self._pages_failed += 1
