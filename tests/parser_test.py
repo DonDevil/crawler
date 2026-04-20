@@ -21,3 +21,26 @@ def test_html_link_extractor_finds_links():
     assert "https://example.com/bar" in links
     # The fragment-only link is normalized to the base URL
     assert "https://example.com/" in links
+
+
+def test_html_link_extractor_drops_irrelevant_external_noise_but_keeps_relevant_targets():
+    html = """
+    <html>
+      <body>
+        <a href="/watch/movie-1">Internal watch</a>
+        <a href="https://randomblog.example/post">Random blog</a>
+        Plain text mirror: https://social.example/profile
+        <script>
+          const fallback = "https://streamhub.example/watch/123";
+        </script>
+      </body>
+    </html>
+    """
+
+    extractor = HTMLLinkExtractor()
+    links = extractor.extract_links(html, "https://piracy-site.example")
+
+    assert "https://piracy-site.example/watch/movie-1" in links
+    assert "https://streamhub.example/watch/123" in links
+    assert "https://randomblog.example/post" not in links
+    assert "https://social.example/profile" not in links

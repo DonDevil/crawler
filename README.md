@@ -213,6 +213,8 @@ Crawler implementation is also configurable through `config.yaml` using `crawler
 
 Discovery results are now scored before they enter the frontier. Lower scores are crawled first, with Torch and Ahmia results preferred over surface-web engines by default, and `.onion` URLs receiving an additional priority boost. Engines that return repeated blocked responses, such as Yandex captcha challenges, are temporarily backed off for the rest of the query batch instead of being retried on every query.
 
+During page crawling, the HTML parser now stays focused on same-site links and only keeps a small number of strongly relevant cross-domain targets per page. This prevents noisy ad, profile, and generic blog links from exploding the queue during long runs.
+
 ---
 
 ## Core Components

@@ -97,3 +97,31 @@ def test_same_site_links_get_higher_priority_than_external_links():
     )
 
     assert same_site_priority < external_priority
+
+
+def test_adult_content_domains_are_auto_filtered_and_blacklisted(tmp_path):
+    blacklist_path = tmp_path / "domain_blacklist.txt"
+    blacklist_path.write_text("", encoding="utf-8")
+
+    original_path = URLUtils._blacklist_path
+    original_enabled = URLUtils._blacklist_enabled
+
+    try:
+        URLUtils.set_blacklist_path(str(blacklist_path))
+        URLUtils.set_blacklist_enabled(True)
+
+        adult_url = "https://bestpornportal.com/sex/videos"
+
+        assert URLUtils.clean_url(adult_url) is None
+        assert URLUtils.is_blacklisted(adult_url) is True
+        assert "bestpornportal.com" in blacklist_path.read_text(encoding="utf-8")
+    finally:
+        URLUtils.set_blacklist_path(str(original_path))
+        URLUtils.set_blacklist_enabled(original_enabled)
+
+
+def test_should_queue_link_rejects_adult_cross_domain_targets():
+    assert URLUtils.should_queue_link(
+        "https://piracy-site.example/watch/movie",
+        "https://adult-xxx-videos.com/sex/clip",
+    ) is False

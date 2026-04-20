@@ -138,6 +138,67 @@ CONTENT_PATH_HINTS = (
     "/play",
 )
 
+RELEVANT_EXTERNAL_HINTS = {
+    "torrent",
+    "pirate",
+    "stream",
+    "watch",
+    "movie",
+    "movies",
+    "series",
+    "episode",
+    "download",
+    "magnet",
+    "subtitle",
+    "subtitles",
+    "player",
+    "video",
+    "media",
+    "file",
+    "share",
+    "ddl",
+    "anime",
+}
+
+LOW_SIGNAL_PATH_HINTS = (
+    "/about",
+    "/contact",
+    "/privacy",
+    "/terms",
+    "/login",
+    "/signup",
+    "/register",
+    "/account",
+    "/cookie",
+    "/advert",
+    "/sponsor",
+    "/faq",
+)
+
+ADULT_TOKEN_HINTS = {
+    "porn",
+    "porno",
+    "sex",
+    "xxx",
+    "adult",
+    "erotic",
+    "hentai",
+    "nsfw",
+    "nude",
+    "nudes",
+}
+
+ADULT_SUBSTRING_HINTS = (
+    "pornhub",
+    "youporn",
+    "redtube",
+    "xvideos",
+    "xnxx",
+    "xhamster",
+    "brazzers",
+    "onlyfans",
+)
+
 AUTO_BLACKLIST_HINTS = {
     "wikipedia",
     "wikimedia",
@@ -279,10 +340,28 @@ class URLUtils:
         return True
 
     @classmethod
+    def is_adult_content_url(cls, url: str) -> bool:
+        hostname = cls.extract_domain(url) or ""
+        registered = cls._extract_registered_domain(url) or hostname
+        parsed = urlparse(url)
+        path = (parsed.path or "/").lower()
+        query = (parsed.query or "").lower()
+        haystack = f"{hostname} {registered} {path} {query}".lower()
+        tokens = {token for token in re.split(r"[^a-z0-9]+", haystack) if token}
+
+        if tokens.intersection(ADULT_TOKEN_HINTS):
+            return True
+
+        return any(hint in haystack for hint in ADULT_SUBSTRING_HINTS)
+
+    @classmethod
     def should_auto_blacklist(cls, url: str) -> bool:
         hostname = cls.extract_domain(url) or ""
         registered = cls._extract_registered_domain(url) or hostname
         haystack = f"{hostname} {registered}".lower()
+
+        if cls.is_adult_content_url(url):
+            return True
 
         if registered in AUTO_BLACKLIST_DEFAULTS or hostname in AUTO_BLACKLIST_DEFAULTS:
             return True
@@ -331,12 +410,57 @@ class URLUtils:
         return False
 
     @classmethod
+    def is_likely_piracy_target(cls, url: str) -> bool:
+        hostname = cls.extract_domain(url) or ""
+        registered = cls._extract_registered_domain(url) or hostname
+        path = (urlparse(url).path or "/").lower()
+        haystack = f"{hostname} {registered} {path}".lower()
+        tokens = {token for token in re.split(r"[^a-z0-9]+", haystack) if token}
+
+        if cls.is_onion_url(url):
+            return True
+
+        if tokens.intersection(RELEVANT_EXTERNAL_HINTS):
+            return True
+
+        return any(token in path for token in CONTENT_PATH_HINTS)
+
+    @classmethod
+    def should_queue_link(cls, source_url: str, target_url: str, *, from_text: bool = False) -> bool:
+        if not target_url:
+            return False
+
+        if cls.is_adult_content_url(target_url):
+            return False
+
+        if cls.is_probable_ad_domain(target_url) or cls.is_blacklisted(target_url):
+            return False
+
+        if cls.same_registered_domain(source_url, target_url):
+            return True
+
+        if cls.is_onion_url(target_url):
+            return True
+
+        path = (urlparse(target_url).path or "/").lower()
+        if any(token in path for token in LOW_SIGNAL_PATH_HINTS):
+            return False
+
+        if cls.is_likely_piracy_target(target_url):
+            return True
+
+        return False
+
+    @classmethod
     def get_link_priority(cls, source_url: str, target_url: str) -> int:
         if cls.same_registered_domain(source_url, target_url):
             return 8
 
         if cls.is_onion_url(target_url):
             return 9
+
+        if cls.is_likely_piracy_target(target_url):
+            return 11
 
         if cls.is_probable_ad_domain(target_url) or cls.is_blacklisted(target_url):
             return 50
@@ -529,6 +653,9 @@ class URLUtils:
         if not URLUtils.has_valid_host(url):
             return None
 
+        if URLUtils.is_adult_content_url(url):
+            return None
+
         if apply_blacklist and URLUtils.is_blacklisted(url):
             return None
 
@@ -580,6 +707,11 @@ class URLUtils:
             return None
 
         if not URLUtils.has_valid_host(url):
+            return None
+
+        if URLUtils.is_adult_content_url(url):
+            if apply_blacklist and URLUtils._blacklist_enabled:
+                URLUtils.add_to_blacklist(url)
             return None
 
         if apply_blacklist and URLUtils.is_blacklisted(url):
