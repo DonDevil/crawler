@@ -4,11 +4,29 @@ Purpose: keep one running record of each nightly crawl so performance trends and
 
 ---
 
+## Latest Optimization Status
+
+**DATE: 2026-07-08 00:10 UTC**
+
+**Optimizations Deployed:**
+
+- ✅ Batched database writer (50x fewer commits)
+- ✅ PRAGMA synchronous=NORMAL + busy_timeout=5000
+- ✅ Query-aware link prioritization
+- ✅ Rate limit: 0.3s/domain (was 1.0s)
+
+**Baseline test needed:** Run `python main.py --indefinite-run` for 3+ hours to measure post-optimization performance.
+
+---
+
 ## Summary Table
 
 | Date and Time | Run Length | Found | Attempted | Visited | Failed | Queued | Success Rate | Completion Rate | Queue to Attempt Ratio | Notes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | 2026-04-20 09:26:16 IST | 12h | 129,582 | 2,506 | 1,981 | 525 | 127,051 | 79.05% | 1.93% | 50.70x | Strong discovery, weak crawl completion, backlog growing too fast |
+| 2026-04-20 22:12:07 IST | 11h | 42,538 | 20,495 | 17,830 | 2,665 | 19,189 | 87.01% | 48.20% | 0.94x | Significant improvement in completion rate and queue control |
+| 2026-07-07 18:19:17 IST | 27h | 86,086 | 9,317 | 8,086 | 1,231 | 75,418 | 86.79% | 10.82% | 8.10x | **REGRESSION: Queue exploded, completion rate dropped 37%, discovery pressure quadrupled** |
+| 2026-07-08 (PENDING) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | **POST-OPTIMIZATION BASELINE** - Awaiting test run with batched DB writer & query-aware priority |
 
 ---
 
@@ -70,54 +88,294 @@ Current run efficiency:
 - Stability: Moderate
 - Overall practical efficiency: Low to Moderate
 
-In short: the crawler is excellent at expanding the frontier, but before the recent focus improvements it was not selective enough, so the queue exploded faster than the system could process it.
+---
 
-### Baseline for Future Nightly Comparisons
+## Entry: 2026-04-20 22:12:07 IST
 
-Use this entry as the baseline. On future nights, compare these values first:
+### Raw Run Result
 
-- Attempted sites per hour
-- Success rate
-- Completion rate
-- Queue to attempt ratio
-- Total queued backlog
-- Pirate-domain failure count
+- Run length: ~11h
+- Total found websites: 42,538
+- Total failed websites: 2,665
+- Total visited websites: 17,830
+- Total queued websites: 19,189
+- Total skipped websites: 2,829
+- Total pending websites: 25
+- Video links detected: 198
 
-Target direction for improvement:
+### Calculated Metrics
 
-- Higher visited or attempted per hour
-- Lower queue growth
-- Lower failure rate
-- Better completion rate from found to processed
-- More relevant domains and less off-target discovery noise
+- Attempted = visited + failed = 17,830 + 2,665 = 20,495
+- Success rate = 17,830 / 20,495 = 87.01%
+- Failure rate = 2,665 / 20,495 = 12.99%
+- Completion rate = 20,495 / 42,538 = 48.20%
+- Queue share = 19,189 / 42,538 = 45.13%
+- Discovery pressure = 42,538 / 20,495 = 2.08 discovered per attempted
+- Visits per hour ≈ 17,830 / 11 ≈ 1,621
+- Completion efficiency: 48.20% (BEST TO DATE)
+
+### Analysis
+
+Significant improvement in crawl completion efficiency. The queue is now much more controlled, and the success rate among attempted sites is high. Video link detection is working. Pending/skipped counts are small.
+
+**This represents the best performance achieved so far.**
+
+Key improvements from first run:
+
+- Completion rate improved from 1.93% → 48.20% (25x better)
+- Queue pressure reduced from 51.71x to 2.08x (25x better)
+- Success rate improved from 79.05% → 87.01%
+- Backlog reduced from 127k queued to 19k queued
 
 ---
 
-## Template for the Next Nightly Entry
+## Entry: 2026-07-07 18:19:17 IST
 
-Copy this block and append a new section below each night:
+### Raw Run Result
 
-### Entry: YYYY-MM-DD HH:MM:SS TZ
+- Run length: 27.0 hours
+- Total found websites: 86,086
+- Total failed websites: 1,231
+- Total visited websites: 8,086
+- Total queued websites: 75,418
+- Skipped: 1,325
+- Pending: 26
+- Media assets discovered: 493
+  - Queued for fingerprinting: 165
+  - Rejected (non-video): 293
+  - Pending manual review: 17
+  - Rejected (too short): 11
+  - Uncertain (manual review): 4
+  - Claimed matches: 3
 
-- Run length: 12h
-- Total found websites:
-- Total failed websites:
-- Pirate domains inside failed set:
-- Total visited websites:
-- Total queued websites:
+### Calculated Metrics
 
-Metrics to compute:
+- Attempted = visited + failed = 8,086 + 1,231 = 9,317
+- Success rate = 8,086 / 9,317 = 86.79%
+- Failure rate = 1,231 / 9,317 = 13.21%
+- Completion rate = 9,317 / 86,086 = 10.82%
+- Queue share = 75,418 / 86,086 = 87.67%
+- Discovery pressure = 86,086 / 9,317 = 9.24 discovered per attempted
+- Visits per hour = 8,086 / 27.0 ≈ 299.5
+- Attempted sites per hour = 9,317 / 27.0 ≈ 345.1
 
-- Attempted = visited + failed
-- Success rate = visited / attempted
-- Failure rate = failed / attempted
-- Completion rate = attempted / found
-- Queue share = queued / found
-- Discovery pressure = found / attempted
-- Visits per hour = visited / 12
+### Fingerprinter Integration
 
-Short note:
+⚠️ **NOTE: The fingerprinter tool was implemented, but the matching_status column was NOT found in the database.** Current media status shows initial categorization only (queued/rejected/pending review), not fingerprint matching results. This suggests:
 
-- What improved:
-- What got worse:
-- Main bottleneck now:
+- Fingerprinter may not be writing results to `media_assets` table
+- OR fingerprinter is writing to a different table not yet integrated
+- OR matching_status column schema needs to be added
+
+**Action needed**: Verify fingerprinter output table/schema and update media_assets schema to include matching_status.
+
+### Analysis & Comparison
+
+#### ⚠️ MAJOR REGRESSION FROM APRIL 20 RESULTS
+
+This run shows **significant degradation** in crawl efficiency compared to the peak April 20 performance:
+
+**What Got Worse:**
+
+1. **Completion Rate Collapsed**
+   - April 20: 48.20%
+   - July 07: 10.82%
+   - **Regression: -37.38 percentage points (78% worse)**
+
+2. **Queue Pressure Exploded**
+   - April 20: 2.08x discovery pressure
+   - July 07: 9.24x discovery pressure  
+   - **Regression: 4.4x worse queue pressure**
+
+3. **Queue Backlog Quadrupled**
+   - April 20: 19,189 queued
+   - July 07: 75,418 queued
+   - **Regression: 3.9x more backlog**
+
+4. **Throughput Reduced by 5.5x**
+   - April 20: 1,621 visits/hour
+   - July 07: 299.5 visits/hour
+   - **Regression: -81% throughput loss**
+
+5. **Absolute Visited Count Decreased**
+   - April 20: 17,830 visited in 11h
+   - July 07: 8,086 visited in 27h (more than double the time)
+   - **Regression: 55% fewer visits despite 2.5x runtime**
+
+#### What Stayed Stable
+
+1. **Success Rate (among attempted)**
+   - April 20: 87.01%
+   - July 07: 86.79%
+   - Minimal change, still good
+
+2. **Failure Rate**
+   - April 20: 12.99%
+   - July 07: 13.21%
+   - Minimal change
+
+#### Critical Observations
+
+1. **The queue control mechanism broke**
+   - April 20 had intelligent filtering that kept queue at 19k despite finding 42k URLs
+   - July 07 finds 86k URLs but can only process 9.3k (10.8% completion)
+   - This suggests link filtering/prioritization has degraded or been disabled
+
+2. **Crawl throughput bottleneck**
+   - Visited/hour dropped from 1,621 → 299.5
+   - This could indicate:
+     - Rate limiting is too aggressive
+     - Worker pool capacity reduced
+     - Network issues or timeouts
+     - Database write I/O bottleneck
+     - Fingerprinter processing blocking the crawl
+
+3. **Discovery is fine, crawl is broken**
+   - Finding URLs works (86k found)
+   - Failure rate is acceptable (13%)
+   - But processing velocity is 5.5x slower
+   - This is NOT a filtering problem, it's a throughput problem
+
+### Overall Verdict
+
+**Status: CRITICAL REGRESSION**
+
+- Discovery efficiency: ✓ Good (still finding URLs)
+- Crawl completion efficiency: ✗ **FAILED** (dropped from 48% to 11%)
+- Throughput: ✗ **CRITICAL** (81% slower)
+- Stability: ? Unknown (needs investigation)
+- Overall practical efficiency: ✗ **VERY LOW** – worse than April 20 baseline
+
+### Root Cause Hypotheses (Order of Likelihood)
+
+1. **Fingerprinter integration is blocking crawl pipeline** - If fingerprinter operations are synchronously processing media before returning control to crawler, this would explain the 5.5x slowdown
+2. **Database contention** - 493 media records + 1,406 observations being written while URLs table writes happening
+3. **Rate limiting increased** - If rate-limit backoff was made more conservative
+4. **Worker pool size reduced** - If async workers were reduced or disabled
+5. **Network/environment change** - Different network conditions, ISP throttling, or target sites slower
+6. **Indefinite mode changes** - Recent indefinite mode implementation may have altered queue strategy
+
+### Required Actions
+
+**URGENT:**
+
+1. Profile crawl throughput vs media processing - determine if fingerprinter is blocking crawl
+2. Check rate limiter settings - verify they haven't been made too conservative
+3. Verify worker pool is sized correctly and all workers are active
+4. Check database performance - verify no locking/contention issues
+5. **Fix fingerprinter output schema** - ensure matching_status is being written to media_assets
+
+**FOLLOW-UP:**
+6. Implement adaptive rate limiting that maintains 1,000+ visits/hour target
+7. Consider decoupling fingerprinter from main crawl pipeline (async processing)
+8. Re-enable or re-balance link filtering that made April 20 so efficient
+
+---
+
+## Post-Optimization Baseline Test (2026-07-08)
+
+### Optimizations Applied
+
+**Database Layer:**
+
+- Batched write operations (commit every 50 ops instead of 1)
+- PRAGMA synchronous=NORMAL, busy_timeout=5000, cache_size=10000
+- Thread-safe connection parameters
+- ~50x reduction in disk sync operations
+
+**Link Prioritization:**
+
+- Query-aware link boosting (+4 priority for query-matching URLs)
+- Query context flows from discovery → frontier → link extraction
+- Backward compatible with non-query link extraction
+
+**Configuration:**
+
+- Rate limit: 0.3s/domain (improved from 1.0s)
+
+### How to Run Baseline Test
+
+```bash
+cd /home/darkdevil/Desktop/anti_piracy/crawler
+source env/bin/activate
+
+# Start crawl - let it run for 3+ hours
+python main.py --indefinite-run
+# Watch logs, note start time and initial database state
+
+# After crawl completes or reaches steady state, check results:
+python3 << 'EOF'
+import sqlite3
+from datetime import datetime
+
+conn = sqlite3.connect('storage/crawl_state.db')
+cursor = conn.cursor()
+
+print("=== POST-OPTIMIZATION METRICS ===\n")
+cursor.execute("SELECT status, COUNT(*) FROM urls GROUP BY status")
+print("URL Status Distribution:")
+stats = {}
+for status, count in sorted(cursor.fetchall()):
+    stats[status] = count
+    print(f"  {status:15}: {count:7,}")
+
+total = sum(stats.values())
+visited = stats.get('visited', 0)
+failed = stats.get('failed', 0)
+queued = stats.get('queued', 0)
+attempted = visited + failed
+
+if attempted > 0:
+    success_rate = (visited / attempted) * 100
+    completion_rate = (attempted / total) * 100
+    discovery_pressure = total / attempted
+    print(f"\n  TOTAL           : {total:7,}")
+    
+    print(f"\nEfficiency Metrics:")
+    print(f"  Success Rate: {success_rate:.2f}%")
+    print(f"  Failure Rate: {100-success_rate:.2f}%")
+    print(f"  Completion Rate: {completion_rate:.2f}%")
+    print(f"  Discovery Pressure: {discovery_pressure:.2f}x")
+    print(f"  Queue Backlog: {queued:,}")
+
+EOF
+```
+
+### Baseline Results Template
+
+Once test completes, fill in this template and add to summary table above:
+
+```
+Date: 2026-07-08 HH:MM:SS UTC
+Run Length: ??h
+Found: ??
+Attempted: ??
+Visited: ??
+Failed: ??
+Queued: ??
+Success Rate: ??%
+Completion Rate: ??%
+Discovery Pressure: ??x
+
+Key Observations:
+- Visited/hour: ?? (target: 1,000+)
+- Improvement vs regression run: ??%
+- Query boosting observed: yes/no
+- Database write performance: (smooth/contention/blocking)
+- Any errors or issues: (list)
+```
+
+### Comparison Targets
+
+**Expected Improvements (vs 2026-07-07 regression):**
+
+- Visited/hour: ≥1,000 (from 299.5) = 3.3x improvement
+- Completion rate: ≥30% (from 10.82%) = 2.8x improvement
+- Queue pressure: ≤5x (from 9.24x) = 1.8x improvement
+- Success rate: ≥85% (maintain ~87%)
+
+**Recovery Target (vs April 20 peak):**
+
+- Visited/hour: 1,200+ (original 1,621)
+- Completion rate: 30%+ (original 48% - may be lower due to larger initial queue)
+- Queue pressure: <3x (original 2.08x)

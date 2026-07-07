@@ -3,7 +3,7 @@ crawler:
   concurrency: 25
   timeout: 15
   max_pages: 200
-  rate_limit: 1.0
+  rate_limit: 0.3
   user_agent: "AntiPiracyBot/1.0"
   scrapling_enabled: true
   scrapling_headless: true

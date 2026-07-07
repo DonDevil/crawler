@@ -7,16 +7,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from storage.async_database_writer import BatchedDatabaseWriter
+
 
 class URLDatabase:
-    """A small SQLite-backed URL store."""
+    """A small SQLite-backed URL store with batched writes."""
 
-    def __init__(self, path: str = "storage/crawl_state.db"):
+    def __init__(self, path: str = "storage/crawl_state.db", batch_size: int = 50):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.path))
+        self._conn = sqlite3.connect(str(self.path), timeout=10.0, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA cache_size=10000")
+        self._conn.execute("PRAGMA temp_store=MEMORY")
+        self._writer = BatchedDatabaseWriter(self._conn, batch_size=batch_size)
         self._create_tables()
 
     def _create_tables(self):
@@ -32,7 +39,7 @@ class URLDatabase:
 
     def add_url(self, url: str, status: str = "pending") -> None:
         now = datetime.now(timezone.utc).isoformat()
-        self._conn.execute(
+        self._writer.execute(
             """INSERT INTO urls (url, first_seen, last_seen, status)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(url) DO UPDATE SET
@@ -43,26 +50,24 @@ class URLDatabase:
                     END""",
             (url, now, now, status),
         )
-        self._conn.commit()
 
     def update_status(self, url: str, status: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        self._conn.execute(
+        self._writer.execute(
             """UPDATE urls SET status = ?, last_seen = ? WHERE url = ?""",
             (status, now, url),
         )
-        self._conn.commit()
 
     def update_many_status(self, urls: Sequence[str], status: str) -> None:
         if not urls:
             return
 
         now = datetime.now(timezone.utc).isoformat()
-        self._conn.executemany(
-            """UPDATE urls SET status = ?, last_seen = ? WHERE url = ?""",
-            [(status, now, url) for url in urls],
-        )
-        self._conn.commit()
+        for url in urls:
+            self._writer.execute(
+                """UPDATE urls SET status = ?, last_seen = ? WHERE url = ?""",
+                (status, now, url),
+            )
 
     def is_visited(self, url: str) -> bool:
         cur = self._conn.execute("SELECT 1 FROM urls WHERE url = ? AND status = 'visited'", (url,))
@@ -101,8 +106,9 @@ class URLDatabase:
     def clear(self) -> None:
         """Remove all stored URL crawl state from the database."""
 
-        self._conn.execute("DELETE FROM urls")
-        self._conn.commit()
+        self._writer.execute("DELETE FROM urls")
+        self._writer.flush()
 
     def close(self) -> None:
+        self._writer.flush()
         self._conn.close()

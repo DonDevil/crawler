@@ -153,6 +153,8 @@ class AsyncCrawler:
                 html, failure_reason = await self.fetch(session, url, tor_session=tor_session)
                 status = "visited"
 
+                source_query = self.frontier.get_source_query(url) if self.frontier else ""
+
                 if html and self.parser:
                     parsed_content = (
                         self.parser.extract_content(html, url)
@@ -175,13 +177,13 @@ class AsyncCrawler:
                                 discovery_method=media.get("detection_method", "parser"),
                                 media_type=media.get("media_type"),
                                 mime_type=media.get("mime_type"),
-                                priority=max(0, URLUtils.get_link_priority(url, media["url"]) - 2),
+                                priority=max(0, URLUtils.get_link_priority(url, media["url"], source_query) - 2),
                             )
                         except Exception as exc:
                             logger.debug(f"Skipping media evidence capture for {url}: {exc}")
 
                     for link in links:
-                        self.frontier.add_url(link, priority=URLUtils.get_link_priority(url, link))
+                        self.frontier.add_url(link, priority=URLUtils.get_link_priority(url, link, source_query))
                 elif failure_reason:
                     status = "failed"
                     self._pages_failed += 1

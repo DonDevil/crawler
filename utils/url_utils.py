@@ -452,7 +452,12 @@ class URLUtils:
         return False
 
     @classmethod
-    def get_link_priority(cls, source_url: str, target_url: str) -> int:
+    @classmethod
+    def get_link_priority(cls, source_url: str, target_url: str, source_query: str = "") -> int:
+        """Calculate priority for a link, with optional query-based boosting.
+
+        Lower priority = crawled sooner.
+        """
         if cls.same_registered_domain(source_url, target_url):
             return 8
 
@@ -460,12 +465,20 @@ class URLUtils:
             return 9
 
         if cls.is_likely_piracy_target(target_url):
-            return 11
-
-        if cls.is_probable_ad_domain(target_url) or cls.is_blacklisted(target_url):
+            base_priority = 11
+        elif cls.is_probable_ad_domain(target_url) or cls.is_blacklisted(target_url):
             return 50
+        else:
+            base_priority = 20
 
-        return 20
+        if source_query:
+            import re
+            query_tokens = set(re.split(r'\W+', source_query.lower()))
+            target_lower = target_url.lower()
+            if any(token and token in target_lower for token in query_tokens):
+                return max(5, base_priority - 4)
+
+        return base_priority
 
     @classmethod
     def _reload_blacklist_if_needed(cls) -> None:

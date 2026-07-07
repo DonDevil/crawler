@@ -72,6 +72,7 @@ class DiscoveryURL:
     engine: str
     rank: int
     is_onion: bool = False
+    source_query: str = ""
 
 
 @dataclass(slots=True)
@@ -177,6 +178,7 @@ def discover_urls_from_query_with_report(
                         engine=engine.name,
                         rank=rank,
                         is_onion=URLUtils.is_onion_url(cleaned),
+                        source_query=query,
                     )
                 )
 

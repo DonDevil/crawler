@@ -223,7 +223,8 @@ class CrawlerManager:
 
         accepted = 0
         for item in discovered_items:
-            if self.frontier.add_url(item.url, priority=item.priority):
+            source_query = getattr(item, "source_query", "")
+            if self.frontier.add_url(item.url, priority=item.priority, source_query=source_query):
                 accepted += 1
 
         logger.info(

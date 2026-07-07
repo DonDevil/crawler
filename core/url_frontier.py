@@ -26,9 +26,16 @@ class URLFrontier:
         self.priority_queue: list[tuple[int, int, str]] = []
         self.rate_limit = rate_limit
         self.url_database = url_database
+        self._url_to_query: dict[str, str] = {}
 
-    def add_url(self, url: str, priority: int = 10) -> bool:
-        """Add a URL to the frontier if it has not already been seen."""
+    def add_url(self, url: str, priority: int = 10, source_query: str = "") -> bool:
+        """Add a URL to the frontier if it has not already been seen.
+
+        Args:
+            url: URL to add
+            priority: Priority for crawling (lower = sooner)
+            source_query: Optional query that discovered this URL
+        """
 
         cleaned = URLUtils.clean_url(url)
         if not cleaned:
@@ -48,6 +55,8 @@ class URLFrontier:
         self._sequence += 1
         self.domain_queues[domain].append((priority, self._sequence, cleaned))
         self._queued.add(cleaned)
+        if source_query:
+            self._url_to_query[cleaned] = source_query
         self._schedule_domain(domain)
 
         if self.url_database is not None:
@@ -137,3 +146,9 @@ class URLFrontier:
         """Return the number of queued URLs that have not been visited yet."""
 
         return sum(len(queue) for queue in self.domain_queues.values())
+
+    def get_source_query(self, url: str) -> str:
+        """Return the source query for a URL, or empty string if not found."""
+
+        cleaned = URLUtils.normalize_url(url)
+        return self._url_to_query.get(cleaned, "")

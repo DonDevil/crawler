@@ -7,19 +7,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
+from storage.async_database_writer import BatchedDatabaseWriter
 from utils.url_utils import URLUtils
 
 
 class MediaEvidenceDatabase:
     """Persist discovered media assets, observations, and sampling jobs."""
 
-    def __init__(self, path: str = "storage/media_evidence.db"):
+    def __init__(self, path: str = "storage/media_evidence.db", batch_size: int = 50):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.path))
+        self._conn = sqlite3.connect(str(self.path), timeout=10.0, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA cache_size=10000")
+        self._conn.execute("PRAGMA temp_store=MEMORY")
+        self._writer = BatchedDatabaseWriter(self._conn, batch_size=batch_size)
         self._create_tables()
 
     def _create_tables(self) -> None:
@@ -112,7 +118,7 @@ class MediaEvidenceDatabase:
         now = self._now()
         source_domain = URLUtils.extract_domain(source_page or cleaned)
 
-        self._conn.execute(
+        self._writer.execute(
             """INSERT INTO media_assets (
                 url, media_type, source_domain, mime_type, status, first_seen, last_seen,
                 last_source_page, last_referrer_url, last_discovered_by, last_discovery_method
@@ -147,12 +153,11 @@ class MediaEvidenceDatabase:
         cur = self._conn.execute("SELECT id FROM media_assets WHERE url = ?", (cleaned,))
         row = cur.fetchone()
         if row is None:
-            self._conn.rollback()
             raise RuntimeError(f"Failed to resolve media asset row for {cleaned}")
 
         asset_id = int(row["id"])
 
-        self._conn.execute(
+        self._writer.execute(
             """INSERT INTO media_observations (
                 asset_id, source_page, referrer_url, discovered_by,
                 discovery_method, mime_type, content_length, observed_at
@@ -169,7 +174,7 @@ class MediaEvidenceDatabase:
             ),
         )
 
-        self._conn.execute(
+        self._writer.execute(
             """INSERT INTO sample_jobs (
                 asset_id, status, priority, retry_count, byte_range_strategy,
                 last_error, created_at, updated_at
@@ -184,7 +189,6 @@ class MediaEvidenceDatabase:
             (asset_id, priority, now, now),
         )
 
-        self._conn.commit()
         return asset_id
 
     def record_manifest_variants(self, asset_id: int, variants: list[dict]) -> None:
@@ -193,7 +197,7 @@ class MediaEvidenceDatabase:
             variant_url = URLUtils.clean_media_url(variant.get("url", ""))
             if not variant_url:
                 continue
-            self._conn.execute(
+            self._writer.execute(
                 """INSERT INTO manifest_variants (
                     asset_id, variant_url, bandwidth, resolution, codecs, discovered_at
                 ) VALUES (?, ?, ?, ?, ?, ?)
@@ -211,7 +215,6 @@ class MediaEvidenceDatabase:
                     now,
                 ),
             )
-        self._conn.commit()
 
     def list_media_assets(self) -> list[dict]:
         cur = self._conn.execute("SELECT * FROM media_assets ORDER BY last_seen DESC")
@@ -250,15 +253,14 @@ class MediaEvidenceDatabase:
         job = pending_jobs[0]
         asset_id = int(job["asset_id"])
         now = self._now()
-        self._conn.execute(
+        self._writer.execute(
             "UPDATE sample_jobs SET status = 'claimed', claimed_by = ?, updated_at = ? WHERE asset_id = ?",
             (worker_name, now, asset_id),
         )
-        self._conn.execute(
+        self._writer.execute(
             "UPDATE media_assets SET status = 'claimed', last_seen = ? WHERE id = ?",
             (now, asset_id),
         )
-        self._conn.commit()
 
         refreshed = self._conn.execute("SELECT * FROM sample_jobs WHERE asset_id = ?", (asset_id,)).fetchone()
         return dict(refreshed) if refreshed else None
@@ -273,15 +275,14 @@ class MediaEvidenceDatabase:
         last_error: str | None = None,
     ) -> None:
         now = self._now()
-        self._conn.execute(
+        self._writer.execute(
             "UPDATE sample_jobs SET status = ?, last_error = ?, updated_at = ? WHERE asset_id = ?",
             (fingerprint_status, last_error, now, asset_id),
         )
-        self._conn.execute(
+        self._writer.execute(
             "UPDATE media_assets SET status = ?, last_seen = ?, match_confidence = ?, matched_title = ? WHERE id = ?",
             (fingerprint_status, now, match_confidence, matched_title, asset_id),
         )
-        self._conn.commit()
 
     def mark_asset_matched(
         self,
@@ -313,22 +314,22 @@ class MediaEvidenceDatabase:
 
     def update_sample_job_status(self, asset_id: int, status: str, last_error: str | None = None) -> None:
         now = self._now()
-        self._conn.execute(
+        self._writer.execute(
             "UPDATE sample_jobs SET status = ?, last_error = ?, updated_at = ? WHERE asset_id = ?",
             (status, last_error, now, asset_id),
         )
-        self._conn.execute(
+        self._writer.execute(
             "UPDATE media_assets SET status = ?, last_seen = ? WHERE id = ?",
             (status, now, asset_id),
         )
-        self._conn.commit()
 
     def clear(self) -> None:
-        self._conn.execute("DELETE FROM manifest_variants")
-        self._conn.execute("DELETE FROM media_observations")
-        self._conn.execute("DELETE FROM sample_jobs")
-        self._conn.execute("DELETE FROM media_assets")
-        self._conn.commit()
+        self._writer.execute("DELETE FROM manifest_variants")
+        self._writer.execute("DELETE FROM media_observations")
+        self._writer.execute("DELETE FROM sample_jobs")
+        self._writer.execute("DELETE FROM media_assets")
+        self._writer.flush()
 
     def close(self) -> None:
+        self._writer.flush()
         self._conn.close()

@@ -110,7 +110,7 @@ def main() -> None:
         media_db = MediaEvidenceDatabase()
         try:
             if args.claim_sample_job:
-                job = media_db.claim_next_sample_job(worker_name=args.worker_name)
+                job: dict | None = media_db.claim_next_sample_job(worker_name=args.worker_name)
                 print(json.dumps(job or {}, indent=2, sort_keys=True))
                 return
 
