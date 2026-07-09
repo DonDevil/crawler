@@ -51,6 +51,10 @@ class DomainDatabase:
         cur = self._conn.execute("SELECT domain FROM domains")
         return [row[0] for row in cur.fetchall()]
 
+    def clear(self) -> None:
+        self._writer.execute("DELETE FROM domains")
+        self._writer.flush()
+
     def close(self) -> None:
         self._writer.flush()
         self._conn.close()

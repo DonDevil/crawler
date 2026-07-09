@@ -9,6 +9,17 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
+
+def _resolve_path(path: str, base_dir: Path) -> str:
+    if not path:
+        return path
+
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return str(candidate)
+
+    return str((base_dir / candidate).resolve())
+
 import yaml
 from pydantic import BaseModel, Field
 
@@ -18,6 +29,20 @@ class StorageConfig(BaseModel):
     media_sqlite_path: str = "storage/media_evidence.db"
     enable_media_evidence: bool = True
     enqueue_media_jobs: bool = True
+
+
+class FrontierConfig(BaseModel):
+    """Configuration for URL frontier backend.
+    
+    Supports two modes:
+    - 'sqlite': In-memory frontier with SQLite persistence (single worker)
+    - 'redis': Redis-backed shared frontier (multi-worker, requires Redis server)
+    """
+    type: str = "sqlite"  # 'sqlite' or 'redis'
+    redis_host: str = "localhost"
+    redis_port: int = 6379
+    redis_db: int = 0
+    redis_namespace: str = "crawler"
 
 
 class SearchConfig(BaseModel):
@@ -61,6 +86,7 @@ class CrawlerConfig(BaseModel):
         "seeds/darkweb_seeds.txt",
     ])
     storage: StorageConfig = StorageConfig()
+    frontier: FrontierConfig = FrontierConfig()
 
 
 class Config(BaseModel):
@@ -74,10 +100,19 @@ def load_config(path: str = "config.yaml") -> Config:
     If the file is missing, returns defaults.
     """
 
-    if not os.path.exists(path):
+    config_path = Path(path).expanduser().resolve()
+    if not config_path.exists():
         return Config()
 
-    with open(path, "r", encoding="utf-8") as f:
+    with config_path.open("r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
 
-    return Config(**raw)
+    config = Config(**raw)
+    base_dir = config_path.parent
+
+    if config.crawler.storage.sqlite_path:
+        config.crawler.storage.sqlite_path = _resolve_path(config.crawler.storage.sqlite_path, base_dir)
+    if config.crawler.storage.media_sqlite_path:
+        config.crawler.storage.media_sqlite_path = _resolve_path(config.crawler.storage.media_sqlite_path, base_dir)
+
+    return config

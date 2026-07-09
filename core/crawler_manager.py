@@ -9,6 +9,7 @@ from loguru import logger
 
 from core.config import Config, load_config
 from core.url_frontier import URLFrontier
+from core.redis_frontier import RedisURLFrontier
 from crawler.async_crawler import AsyncCrawler
 from crawler.http_crawler import HTTPCrawler
 from crawler.hybrid_crawler import HybridCrawler
@@ -52,10 +53,35 @@ class CrawlerManager:
             else None
         )
 
-        self.frontier = URLFrontier(
-            rate_limit=self.config.crawler.rate_limit,
-            url_database=self.url_database,
-        )
+        # Initialize frontier based on config
+        frontier_type = self.config.crawler.frontier.type.lower()
+        if frontier_type == "redis":
+            try:
+                self.frontier = RedisURLFrontier(
+                    redis_host=self.config.crawler.frontier.redis_host,
+                    redis_port=self.config.crawler.frontier.redis_port,
+                    redis_db=self.config.crawler.frontier.redis_db,
+                    rate_limit=self.config.crawler.rate_limit,
+                    url_database=self.url_database,
+                    namespace=self.config.crawler.frontier.redis_namespace,
+                )
+                logger.info(
+                    f"Using Redis frontier at {self.config.crawler.frontier.redis_host}:"
+                    f"{self.config.crawler.frontier.redis_port}/{self.config.crawler.frontier.redis_db}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to initialize Redis frontier: {e}, falling back to SQLite")
+                self.frontier = URLFrontier(
+                    rate_limit=self.config.crawler.rate_limit,
+                    url_database=self.url_database,
+                )
+        else:
+            self.frontier = URLFrontier(
+                rate_limit=self.config.crawler.rate_limit,
+                url_database=self.url_database,
+            )
+            logger.info("Using SQLite frontier (single-worker mode)")
+
 
         self.link_extractor = HTMLLinkExtractor()
 
@@ -119,10 +145,11 @@ class CrawlerManager:
         logger.info(f"Using crawler engine: {self.crawl_engine}")
 
     def clear_storage(self) -> None:
-        """Clear all persisted URL crawl state from the SQLite storage."""
+        """Clear all persisted crawl state from the SQLite storage."""
 
         counts_before = self.url_database.get_status_counts()
         self.url_database.clear()
+        self.domain_database.clear()
         if self.media_database:
             self.media_database.clear()
         logger.info(f"Cleared crawl storage. Previous counts: {counts_before}")
@@ -247,6 +274,8 @@ class CrawlerManager:
         finally:
             logger.info("Crawler stopped")
             logger.info(f"Database status counts: {self.url_database.get_status_counts()}")
+            if hasattr(self.frontier, "close"):
+                self.frontier.close()
             self.url_database.close()
             self.domain_database.close()
             if self.media_database:

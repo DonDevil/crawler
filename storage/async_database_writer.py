@@ -39,12 +39,13 @@ class BatchedDatabaseWriter:
     def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> None:
         """Queue a write operation to be executed in a batch.
 
-        Automatically commits if batch size reached.
+        The crawler needs fresh visibility for new rows across connections, so
+        each operation is committed immediately instead of waiting for a large
+        batch to accumulate.
         """
         with self._lock:
             self._batch.append(WriteOperation(sql=sql, params=params))
-            if len(self._batch) >= self.batch_size:
-                self._flush()
+            self._flush()
 
     def flush(self) -> None:
         """Explicitly flush all pending operations and commit."""

@@ -2,11 +2,12 @@
 
 from discovery.search_engine_discovery import DiscoveryBatchReport, QueryDiscoveryReport
 
-from core.config import Config, CrawlerConfig, SearchConfig, StorageConfig
+from core.config import Config, CrawlerConfig, SearchConfig, StorageConfig, load_config
 from core.crawler_manager import CrawlerManager
 from crawler.http_crawler import HTTPCrawler
 from crawler.hybrid_crawler import HybridCrawler
 from crawler.scrapling_crawler import ScraplingCrawler
+from storage.domain_database import DomainDatabase
 from utils.url_utils import URLUtils
 
 
@@ -24,6 +25,42 @@ def _make_config(seed_file: str, sqlite_path: str) -> Config:
             onion_priority_boost=2,
         ),
     )
+
+
+def test_load_config_resolves_relative_storage_paths_from_config_dir(monkeypatch, tmp_path):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    (project_dir / "config.yaml").write_text(
+        """
+crawler:
+  storage:
+    sqlite_path: "storage/crawl_state.db"
+    media_sqlite_path: "storage/media_evidence.db"
+    enable_media_evidence: true
+""",
+        encoding="utf-8",
+    )
+
+    other_dir = tmp_path / "elsewhere"
+    other_dir.mkdir()
+    monkeypatch.chdir(other_dir)
+
+    config = load_config(str(project_dir / "config.yaml"))
+
+    assert config.crawler.storage.sqlite_path == str((project_dir / "storage" / "crawl_state.db").resolve())
+    assert config.crawler.storage.media_sqlite_path == str((project_dir / "storage" / "media_evidence.db").resolve())
+
+
+def test_domain_database_can_be_cleared(tmp_path):
+    db_path = tmp_path / "crawl.db"
+    database = DomainDatabase(path=str(db_path))
+
+    try:
+        database.add_or_update("example.com", score=1.5)
+        database.clear()
+        assert list(database.list_domains()) == []
+    finally:
+        database.close()
 
 
 def test_prepare_frontier_query_only_skips_seed_files(monkeypatch, tmp_path):

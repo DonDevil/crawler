@@ -3,6 +3,22 @@
 from storage.url_database import URLDatabase
 
 
+def test_url_database_persists_new_rows_immediately(tmp_path):
+    db_path = tmp_path / "crawl.db"
+    database = URLDatabase(path=str(db_path))
+
+    try:
+        database.add_url("https://example.com/1", status="queued")
+
+        reopened = URLDatabase(path=str(db_path))
+        try:
+            assert list(reopened.get_all_urls()) == ["https://example.com/1"]
+        finally:
+            reopened.close()
+    finally:
+        database.close()
+
+
 def test_url_database_can_be_cleared(tmp_path):
     db_path = tmp_path / "crawl.db"
     database = URLDatabase(path=str(db_path))
