@@ -9,6 +9,13 @@ crawler:
   scrapling_headless: true
   scrapling_stealth: true
   scrapling_network_idle: true
+  frontier:
+    #type: "sqlite"
+    # For distributed multi-worker crawling, set type to "redis" and configure Redis server:
+    type: "redis"
+    redis_host: "localhost"
+    redis_port: 6379
+    redis_namespace: "crawler"
   seed_files:
     - "seeds/piracy_sites.txt"
     - "seeds/torrent_sites.txt"

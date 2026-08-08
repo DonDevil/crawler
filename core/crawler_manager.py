@@ -70,7 +70,12 @@ class CrawlerManager:
                     f"{self.config.crawler.frontier.redis_port}/{self.config.crawler.frontier.redis_db}"
                 )
             except Exception as e:
-                logger.error(f"Failed to initialize Redis frontier: {e}, falling back to SQLite")
+                logger.warning(
+                    f"Redis frontier unavailable at {self.config.crawler.frontier.redis_host}:"
+                    f"{self.config.crawler.frontier.redis_port}: {e}. "
+                    f"Falling back to SQLite (single-worker mode). "
+                    f"To use multi-worker mode, ensure Redis is running and config.yaml is updated."
+                )
                 self.frontier = URLFrontier(
                     rate_limit=self.config.crawler.rate_limit,
                     url_database=self.url_database,

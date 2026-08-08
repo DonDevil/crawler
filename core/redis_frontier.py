@@ -55,10 +55,6 @@ class RedisURLFrontier:
                 port=redis_port,
                 db=redis_db,
                 socket_keepalive=True,
-                socket_keepalive_options={
-                    1: 1,  # TCP_KEEPIDLE
-                    2: 1,  # TCP_KEEPINTVL
-                },
                 health_check_interval=30,
             )
             # Test connection
@@ -115,7 +111,7 @@ class RedisURLFrontier:
             local now = tonumber(ARGV[3])
             local domain_queue = ARGV[4]
             local domain_next_time_key = ARGV[5]
-            local blacklist_check = ARGV[6]
+            local queued_set = ARGV[6]
 
             -- Check rate limit
             local next_time = redis.call('get', domain_next_time_key)
@@ -123,13 +119,17 @@ class RedisURLFrontier:
                 return nil
             end
 
-            -- Get next URL from domain queue
+            -- Get next URL from domain queue (sorted set with priority as score)
             local urls = redis.call('zrange', domain_queue, 0, 0)
             if #urls == 0 then
                 return nil
             end
 
             local url = urls[1]
+
+            -- Atomically remove URL from queue and queued set
+            redis.call('zrem', domain_queue, url)
+            redis.call('srem', queued_set, url)
 
             -- Update rate limit
             redis.call('set', domain_next_time_key, math.floor(now + rate_limit))
@@ -241,7 +241,7 @@ class RedisURLFrontier:
                             now,
                             domain_queue_key,
                             domain_next_time_key,
-                            "",
+                            self._get_redis_key("urls", "queued"),
                         ],
                     )
 

@@ -27,6 +27,7 @@ def redis_frontier() -> RedisURLFrontier:
             redis_port=6379,
             redis_db=1,  # Use DB 1 for testing to avoid production data
             namespace="test_crawler",
+            rate_limit=0,  # Disable rate limiting for tests
         )
         frontier.clear()  # Clean slate for test
         yield frontier
@@ -129,6 +130,7 @@ class TestMultiWorkerCoordination:
                 redis_port=6379,
                 redis_db=1,
                 namespace="test_crawler",
+                rate_limit=0,  # Disable rate limiting for concurrent testing
             )
             urls = []
             for _ in range(3):  # Each worker fetches 3 URLs
@@ -195,27 +197,40 @@ class TestMultiWorkerCoordination:
         """Verify that rate limiting is enforced per domain."""
         import time
         
+        # Create a new frontier with rate limiting enabled for this test
+        frontier = RedisURLFrontier(
+            redis_host="localhost",
+            redis_port=6379,
+            redis_db=1,
+            namespace="test_crawler_ratelimit",
+            rate_limit=1.0,  # 1 second rate limit
+        )
+        frontier.clear()
+        
         # Add 3 URLs from same domain
         domain = "https://piracy.example.com"
         urls = [f"{domain}/page{i}" for i in range(3)]
         
         for url in urls:
-            redis_frontier.add_url(url, priority=10)
+            frontier.add_url(url, priority=10)
         
         # First fetch should work
-        url1 = redis_frontier.get_next_url()
+        url1 = frontier.get_next_url()
         assert url1 == urls[0], "Should get first URL"
         
         # Second fetch immediately should fail (rate limited)
-        url2 = redis_frontier.get_next_url()
+        url2 = frontier.get_next_url()
         assert url2 is None or url2.split('/')[2] != domain.split('/')[2], \
             "Should not get another URL from same domain immediately"
         
         # After rate limit delay
         time.sleep(1.1)  # Wait for rate limit to expire
         
-        url3 = redis_frontier.get_next_url()
+        url3 = frontier.get_next_url()
         assert url3 == urls[1], "Should get next URL from same domain after rate limit"
+        
+        frontier.clear()
+        frontier.close()
 
     def test_clear_frontier(self, redis_frontier: RedisURLFrontier):
         """Verify clear() wipes all state."""
