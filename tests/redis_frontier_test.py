@@ -1,15 +1,15 @@
-"""Test for multi-worker coordination via Redis frontier.
+"""Tests for the Redis v2 frontier (core/redis_frontier.py).
 
-This test verifies that the Redis frontier correctly handles coordination
-between multiple concurrent workers, preventing race conditions and
-duplicates across workers.
+Covers dedup, atomic claiming, domain-priority scheduling, rate limiting,
+and the claim/lease/retry machinery from docs/architecture/frontier-adr.md
+(FrontierClaim tokens, stale-claim rejection, reclaim_and_promote).
 
 Run this test ONLY if Redis is available locally on port 6379.
 """
 
-import asyncio
+import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import List
+from unittest.mock import patch
 
 import pytest
 import redis
@@ -42,19 +42,24 @@ def url_database() -> URLDatabase:
     """Create a test URL database in memory (SQLite)."""
     import tempfile
     import os
-    
+
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
-    
+
     db = URLDatabase(path=path)
     yield db
     db.close()
-    
-    # Cleanup temp file
+
     try:
         os.remove(path)
     except OSError:
         pass
+
+
+def _force_expire_lease(frontier: RedisURLFrontier, url: str) -> None:
+    """Test hook: backdate a URL's inflight lease score into the past,
+    simulating an abandoned/crashed worker without waiting out lease_ttl."""
+    frontier.redis_conn.zadd(frontier._key("inflight"), {url: 0})
 
 
 class TestMultiWorkerCoordination:
@@ -63,25 +68,21 @@ class TestMultiWorkerCoordination:
     def test_add_url_deduplication(self, redis_frontier: RedisURLFrontier):
         """Verify that adding same URL twice doesn't duplicate."""
         url = "https://piracy.example.com/movie1"
-        
+
         result1 = redis_frontier.add_url(url, priority=10)
         result2 = redis_frontier.add_url(url, priority=10)
-        
+
         assert result1 is True, "First add should succeed"
         assert result2 is False, "Duplicate add should fail"
-        
+
         count = redis_frontier.pending_count()
         assert count == 1, f"Should have exactly 1 URL, got {count}"
 
     def test_concurrent_worker_adds(self, redis_frontier: RedisURLFrontier):
         """Simulate multiple workers adding URLs concurrently."""
-        urls = [
-            f"https://piracy.example.com/movie{i}" 
-            for i in range(100)
-        ]
-        
+        urls = [f"https://piracy.example.com/movie{i}" for i in range(100)]
+
         def add_urls_worker(start_idx: int, batch_size: int):
-            """Worker thread adds its batch of URLs."""
             frontier = RedisURLFrontier(
                 redis_host="localhost",
                 redis_port=6379,
@@ -94,161 +95,214 @@ class TestMultiWorkerCoordination:
                     added += 1
             frontier.close()
             return added
-        
-        # Simulate 4 workers, 25 URLs each
+
         with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = [
-                executor.submit(add_urls_worker, i * 25, 25)
-                for i in range(4)
-            ]
+            futures = [executor.submit(add_urls_worker, i * 25, 25) for i in range(4)]
             results = [f.result() for f in futures]
-        
+
         total_added = sum(results)
         assert total_added == 100, f"Should add 100 URLs, got {total_added}"
-        
+
         pending = redis_frontier.pending_count()
         assert pending == 100, f"Should have 100 pending, got {pending}"
 
     def test_get_next_url_no_duplicates(self, redis_frontier: RedisURLFrontier):
-        """Verify that get_next_url doesn't return duplicates to different workers."""
-        # Add test URLs
-        urls = [
-            f"https://piracy.example.com/page{i}"
-            for i in range(10)
-        ]
-        
+        """Verify that get_next_url doesn't return duplicate claims to different workers."""
+        urls = [f"https://piracy.example.com/page{i}" for i in range(10)]
+
         for url in urls:
             redis_frontier.add_url(url, priority=10)
-        
-        # Simulate 3 workers each getting next URL
-        fetched_urls = []
-        
+
         def worker_fetch():
-            """Worker fetches next URL."""
             frontier = RedisURLFrontier(
                 redis_host="localhost",
                 redis_port=6379,
                 redis_db=1,
                 namespace="test_crawler",
-                rate_limit=0,  # Disable rate limiting for concurrent testing
+                rate_limit=0,
             )
-            urls = []
-            for _ in range(3):  # Each worker fetches 3 URLs
-                url = frontier.get_next_url()
-                if url:
-                    urls.append(url)
+            claimed = []
+            for _ in range(3):
+                claim = frontier.get_next_url()
+                if claim:
+                    claimed.append(claim)
             frontier.close()
-            return urls
-        
+            return claimed
+
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures = [executor.submit(worker_fetch) for _ in range(3)]
             results = [f.result() for f in futures]
-        
-        fetched_urls = [url for worker_urls in results for url in worker_urls]
-        
-        # Check no duplicates across all workers
-        assert len(fetched_urls) == len(set(fetched_urls)), \
+
+        fetched_claims = [claim for worker_claims in results for claim in worker_claims]
+        fetched_urls = [claim.url for claim in fetched_claims]
+        fetched_tokens = [claim.token for claim in fetched_claims]
+
+        assert len(fetched_urls) == len(set(fetched_urls)), (
             f"Found duplicate URLs across workers: {fetched_urls}"
-        
-        assert len(fetched_urls) == 9, \
-            f"Should fetch 9 URLs (3 workers × 3 each), got {len(fetched_urls)}"
+        )
+        assert len(fetched_tokens) == len(set(fetched_tokens)), "Every claim token must be unique"
+        assert len(fetched_urls) == 9, f"Should fetch 9 URLs (3 workers x 3 each), got {len(fetched_urls)}"
+
+    def test_concurrent_claims_same_domain_never_duplicate(self, redis_frontier: RedisURLFrontier):
+        """Stress the atomic pop under contention: many threads racing to claim
+        URLs from a single domain must never receive the same URL/token twice."""
+        n_urls = 200
+        urls = [f"https://contested.example.com/page{i}" for i in range(n_urls)]
+        for url in urls:
+            redis_frontier.add_url(url, priority=10)
+
+        def worker_claim_all():
+            frontier = RedisURLFrontier(
+                redis_host="localhost",
+                redis_port=6379,
+                redis_db=1,
+                namespace="test_crawler",
+                rate_limit=0,
+            )
+            claims = []
+            while True:
+                claim = frontier.get_next_url()
+                if claim is None:
+                    break
+                claims.append(claim)
+            frontier.close()
+            return claims
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(worker_claim_all) for _ in range(8)]
+            results = [f.result() for f in futures]
+
+        all_claims = [c for worker_claims in results for c in worker_claims]
+        all_urls = [c.url for c in all_claims]
+        all_tokens = [c.token for c in all_claims]
+
+        assert len(all_urls) == n_urls, f"Expected {n_urls} total claims, got {len(all_urls)}"
+        assert len(set(all_urls)) == n_urls, "Two workers claimed the same URL"
+        assert len(set(all_tokens)) == n_urls, "Two claims shared the same token"
 
     def test_mark_visited_consistency(self, redis_frontier: RedisURLFrontier):
         """Verify mark_visited is consistent across workers."""
         url = "https://piracy.example.com/film"
-        
-        # Add URL
+
         redis_frontier.add_url(url, priority=10)
-        
-        # Worker 1 fetches it
-        fetched = redis_frontier.get_next_url()
-        assert fetched == url, "Should fetch the added URL"
-        
-        # Worker 2 tries to fetch while Worker 1 still holds it
-        # (Actually marks visited by Worker 1)
+
+        claim = redis_frontier.get_next_url()
+        assert claim.url == url, "Should fetch the added URL"
+
         frontier2 = RedisURLFrontier(
-            redis_host="localhost",
-            redis_port=6379,
-            redis_db=1,
-            namespace="test_crawler",
+            redis_host="localhost", redis_port=6379, redis_db=1, namespace="test_crawler"
         )
-        fetched2 = frontier2.get_next_url()
+        claim2 = frontier2.get_next_url()
         frontier2.close()
-        
-        # Worker 1 marks it visited
-        redis_frontier.mark_visited(url)
-        
-        # Now it shouldn't be available to anyone
+        assert claim2 is None, "URL is already claimed, worker 2 should get nothing"
+
+        redis_frontier.mark_visited(claim)
+
         frontier3 = RedisURLFrontier(
-            redis_host="localhost",
-            redis_port=6379,
-            redis_db=1,
-            namespace="test_crawler",
+            redis_host="localhost", redis_port=6379, redis_db=1, namespace="test_crawler"
         )
-        fetched3 = frontier3.get_next_url()
+        claim3 = frontier3.get_next_url()
         frontier3.close()
-        
-        assert fetched3 is None, "URL should not be available after marking visited"
-        
+
+        assert claim3 is None, "URL should not be available after marking visited"
+
         counts = redis_frontier.get_status_counts()
         assert counts.get("visited", 0) == 1, "Should have 1 visited URL"
+        assert counts.get("inflight", 0) == 0
 
     def test_rate_limit_per_domain(self, redis_frontier: RedisURLFrontier):
         """Verify that rate limiting is enforced per domain."""
-        import time
-        
-        # Create a new frontier with rate limiting enabled for this test
         frontier = RedisURLFrontier(
             redis_host="localhost",
             redis_port=6379,
             redis_db=1,
             namespace="test_crawler_ratelimit",
-            rate_limit=1.0,  # 1 second rate limit
+            rate_limit=1.0,
         )
         frontier.clear()
-        
-        # Add 3 URLs from same domain
+
         domain = "https://piracy.example.com"
         urls = [f"{domain}/page{i}" for i in range(3)]
-        
+
         for url in urls:
             frontier.add_url(url, priority=10)
-        
-        # First fetch should work
-        url1 = frontier.get_next_url()
-        assert url1 == urls[0], "Should get first URL"
-        
-        # Second fetch immediately should fail (rate limited)
-        url2 = frontier.get_next_url()
-        assert url2 is None or url2.split('/')[2] != domain.split('/')[2], \
-            "Should not get another URL from same domain immediately"
-        
-        # After rate limit delay
-        time.sleep(1.1)  # Wait for rate limit to expire
-        
-        url3 = frontier.get_next_url()
-        assert url3 == urls[1], "Should get next URL from same domain after rate limit"
-        
+
+        claim1 = frontier.get_next_url()
+        assert claim1.url == urls[0], "Should get first URL"
+
+        claim2 = frontier.get_next_url()
+        assert claim2 is None, "Should not get another URL from same domain immediately"
+
+        time.sleep(1.1)
+
+        claim3 = frontier.get_next_url()
+        assert claim3.url == urls[1], "Should get next URL from same domain after rate limit"
+
         frontier.clear()
         frontier.close()
 
+    def test_rate_limited_domain_does_not_block_lower_priority_eligible_domain(
+        self, redis_frontier: RedisURLFrontier
+    ):
+        """A rate-gated top-priority domain must not block an eligible domain
+        further down domain_heads from yielding work."""
+        frontier = RedisURLFrontier(
+            redis_host="localhost",
+            redis_port=6379,
+            redis_db=1,
+            namespace="test_crawler_rategate",
+            rate_limit=60.0,
+        )
+        frontier.clear()
+        try:
+            frontier.add_url("https://hot.example.com/a", priority=1)
+            claim = frontier.get_next_url()
+            assert claim.domain == "hot.example.com"
+
+            # hot.example.com is now rate-gated for 60s. A lower-priority
+            # (higher priority number) but currently-eligible domain must
+            # still be claimable, not blocked behind the gated domain.
+            frontier.add_url("https://hot.example.com/b", priority=1)
+            frontier.add_url("https://cold.example.com/a", priority=50)
+
+            next_claim = frontier.get_next_url()
+            assert next_claim is not None, "Rate-gated top domain must not block other domains"
+            assert next_claim.domain == "cold.example.com"
+        finally:
+            frontier.clear()
+            frontier.close()
+
+    def test_priority_ordering_across_domains_via_domain_heads(self, redis_frontier: RedisURLFrontier):
+        """Global priority must win over insertion order / domain identity:
+        a low-priority-number URL added later on a fresh domain must still be
+        claimed before a high-priority-number URL on a domain added earlier."""
+        redis_frontier.add_url("https://early.example.com/a", priority=50)
+        redis_frontier.add_url("https://mid.example.com/a", priority=25)
+        redis_frontier.add_url("https://late.example.com/a", priority=1)
+
+        first = redis_frontier.get_next_url()
+        second = redis_frontier.get_next_url()
+        third = redis_frontier.get_next_url()
+
+        assert [first.domain, second.domain, third.domain] == [
+            "late.example.com",
+            "mid.example.com",
+            "early.example.com",
+        ]
+
     def test_clear_frontier(self, redis_frontier: RedisURLFrontier):
         """Verify clear() wipes all state."""
-        # Add URLs and mark some visited
         for i in range(5):
             redis_frontier.add_url(f"https://example.com/page{i}", priority=10)
-        
-        url = redis_frontier.get_next_url()
-        redis_frontier.mark_visited(url)
-        
-        # Verify state exists
+
+        claim = redis_frontier.get_next_url()
+        redis_frontier.mark_visited(claim)
+
         counts = redis_frontier.get_status_counts()
         assert counts["queued"] > 0, "Should have queued URLs"
-        
-        # Clear
+
         redis_frontier.clear()
-        
-        # Verify cleared
+
         counts = redis_frontier.get_status_counts()
         assert counts.get("queued", 0) == 0, "Should have no queued after clear"
         assert counts.get("visited", 0) == 0, "Should have no visited after clear"
@@ -256,42 +310,257 @@ class TestMultiWorkerCoordination:
     def test_namespace_isolation(self):
         """Verify that different namespaces don't interfere."""
         frontier1 = RedisURLFrontier(
-            redis_host="localhost",
-            redis_port=6379,
-            redis_db=1,
-            namespace="crawler_a",
+            redis_host="localhost", redis_port=6379, redis_db=1, namespace="crawler_a"
         )
         frontier2 = RedisURLFrontier(
-            redis_host="localhost",
-            redis_port=6379,
-            redis_db=1,
-            namespace="crawler_b",
+            redis_host="localhost", redis_port=6379, redis_db=1, namespace="crawler_b"
         )
-        
+
         try:
-            # Clear both
             frontier1.clear()
             frontier2.clear()
-            
-            # Add to frontier1
+
             frontier1.add_url("https://example.com/a", priority=10)
-            
-            # Verify frontier2 doesn't see it
-            url = frontier2.get_next_url()
-            assert url is None, "Different namespace should not see other's URLs"
-            
-            # Add to frontier2
+
+            claim = frontier2.get_next_url()
+            assert claim is None, "Different namespace should not see other's URLs"
+
             frontier2.add_url("https://example.com/b", priority=10)
-            
-            # Verify frontier1 doesn't see it
-            url = frontier1.get_next_url()
-            assert url == "https://example.com/a", "Should only see own namespace"
-            
+
+            claim = frontier1.get_next_url()
+            assert claim.url == "https://example.com/a", "Should only see own namespace"
         finally:
             frontier1.clear()
             frontier2.clear()
             frontier1.close()
             frontier2.close()
+
+
+class TestClaimLifecycle:
+    """Claim tokens, stale-claim rejection, renewal, retry/backoff, and
+    lease-expiry reclaim -- docs/architecture/frontier-adr.md §3-4, §12."""
+
+    def test_stale_claim_rejected_after_lease_reclaim(self, redis_frontier: RedisURLFrontier):
+        """A stale (since-reclaimed) worker must never be able to complete a
+        newer claim on the same URL -- the core concurrency guarantee."""
+        frontier = RedisURLFrontier(
+            redis_host="localhost",
+            redis_port=6379,
+            redis_db=1,
+            namespace="test_crawler_stale",
+            rate_limit=0,
+            max_retries=3,
+            base_backoff=0,
+        )
+        frontier.clear()
+        try:
+            url = "https://stale.example.com/page"
+            frontier.add_url(url, priority=10)
+
+            old_claim = frontier.get_next_url()
+            assert old_claim is not None
+
+            _force_expire_lease(frontier, url)
+            reclaimed, requeued = frontier.reclaim_and_promote()
+            assert reclaimed == 1
+            assert requeued == 1, "base_backoff=0 means it should be immediately re-queued"
+
+            new_claim = frontier.get_next_url()
+            assert new_claim is not None
+            assert new_claim.token != old_claim.token
+            assert new_claim.attempt == old_claim.attempt + 1
+
+            # The old worker finally wakes up and tries to complete its stale claim.
+            frontier.mark_visited(old_claim)
+            counts = frontier.get_status_counts()
+            assert counts["visited"] == 0, "Stale completion must be a no-op"
+            assert counts["inflight"] == 1, "New claim must remain untouched"
+
+            # The current owner completes successfully.
+            frontier.mark_visited(new_claim)
+            counts = frontier.get_status_counts()
+            assert counts["visited"] == 1
+            assert counts["inflight"] == 0
+        finally:
+            frontier.clear()
+            frontier.close()
+
+    def test_renew_claim_extends_lease_and_fails_for_reclaimed_claim(
+        self, redis_frontier: RedisURLFrontier
+    ):
+        url = "https://renew.example.com/page"
+        redis_frontier.add_url(url, priority=10)
+
+        claim = redis_frontier.get_next_url()
+        assert claim is not None
+
+        renewed = redis_frontier.renew_claim(claim)
+        assert renewed is not None
+        assert renewed.lease_expires_at >= claim.lease_expires_at
+        assert renewed.token == claim.token
+
+        _force_expire_lease(redis_frontier, url)
+        redis_frontier.reclaim_and_promote()
+
+        stale_renewal = redis_frontier.renew_claim(claim)
+        assert stale_renewal is None, "Renewal must fail once the claim has been reclaimed"
+
+    def test_mark_failed_retries_with_growing_backoff_then_fails_permanently(
+        self, redis_frontier: RedisURLFrontier
+    ):
+        frontier = RedisURLFrontier(
+            redis_host="localhost",
+            redis_port=6379,
+            redis_db=1,
+            namespace="test_crawler_retry",
+            rate_limit=0,
+            max_retries=3,
+            base_backoff=0,
+            max_backoff=60,
+        )
+        frontier.clear()
+        try:
+            url = "https://retry.example.com/page"
+            frontier.add_url(url, priority=10)
+
+            attempts_seen = []
+            claim = frontier.get_next_url()
+            while claim is not None and len(attempts_seen) < 10:
+                attempts_seen.append(claim.attempt)
+                frontier.mark_failed(claim, "boom")
+                frontier.reclaim_and_promote()  # promote due (backoff=0) retry back to queue
+                claim = frontier.get_next_url()
+
+            assert attempts_seen == [1, 2, 3], f"Expected 3 increasing attempts, got {attempts_seen}"
+
+            counts = frontier.get_status_counts()
+            assert counts["failed_permanent"] == 1
+            assert counts["retry_scheduled"] == 0
+            assert counts["queued"] == 0
+            assert counts["inflight"] == 0
+        finally:
+            frontier.clear()
+            frontier.close()
+
+    def test_crash_injection_reclaim_requeues_below_max_retries(self, redis_frontier: RedisURLFrontier):
+        """Claim a URL, never complete it, force-expire the lease, run one
+        recovery sweep -- it must become claimable again."""
+        frontier = RedisURLFrontier(
+            redis_host="localhost",
+            redis_port=6379,
+            redis_db=1,
+            namespace="test_crawler_crash",
+            rate_limit=0,
+            max_retries=3,
+            base_backoff=0,
+        )
+        frontier.clear()
+        try:
+            url = "https://crash.example.com/page"
+            frontier.add_url(url, priority=10)
+
+            claim = frontier.get_next_url()
+            assert claim is not None
+            # Simulate a crashed worker: never mark_visited/failed/skipped.
+
+            _force_expire_lease(frontier, url)
+            reclaimed, requeued = frontier.reclaim_and_promote()
+            assert reclaimed == 1
+            assert requeued == 1
+
+            new_claim = frontier.get_next_url()
+            assert new_claim is not None
+            assert new_claim.url == url
+            assert new_claim.attempt == 2
+        finally:
+            frontier.clear()
+            frontier.close()
+
+    def test_crash_injection_reclaim_terminalizes_at_max_retries(self, redis_frontier: RedisURLFrontier):
+        """A crashed claim that has already exhausted its retries must land
+        in failed_permanent on reclaim, not be requeued forever."""
+        frontier = RedisURLFrontier(
+            redis_host="localhost",
+            redis_port=6379,
+            redis_db=1,
+            namespace="test_crawler_crash_exhausted",
+            rate_limit=0,
+            max_retries=1,
+            base_backoff=0,
+        )
+        frontier.clear()
+        try:
+            url = "https://crash-exhausted.example.com/page"
+            frontier.add_url(url, priority=10)
+
+            claim = frontier.get_next_url()
+            assert claim is not None
+            assert claim.attempt == 1
+
+            _force_expire_lease(frontier, url)
+            reclaimed, requeued = frontier.reclaim_and_promote()
+            assert reclaimed == 1
+            assert requeued == 0
+
+            assert frontier.get_next_url() is None
+            counts = frontier.get_status_counts()
+            assert counts["failed_permanent"] == 1
+            assert counts["inflight"] == 0
+            assert counts["retry_scheduled"] == 0
+        finally:
+            frontier.clear()
+            frontier.close()
+
+    def test_reclaim_and_promote_is_constant_round_trips_regardless_of_domain_count(
+        self, redis_frontier: RedisURLFrontier
+    ):
+        """Guards against regressing back to SCAN-style O(domains) behavior:
+        reclaim_and_promote must issue the same number of client->Redis
+        commands whether 3 domains or 60 domains are involved."""
+
+        def run_with_n_domains(n_domains: int) -> int:
+            frontier = RedisURLFrontier(
+                redis_host="localhost",
+                redis_port=6379,
+                redis_db=1,
+                namespace=f"test_crawler_rtcount_{n_domains}",
+                rate_limit=0,
+                max_retries=3,
+                base_backoff=0,
+            )
+            frontier.clear()
+            try:
+                urls = [f"https://domain{i}.example.com/page" for i in range(n_domains)]
+                for url in urls:
+                    frontier.add_url(url, priority=10)
+                    claim = frontier.get_next_url()
+                    _force_expire_lease(frontier, claim.url)
+
+                original = frontier.redis_conn.execute_command
+                call_count = {"n": 0}
+
+                def counting_execute_command(*args, **kwargs):
+                    call_count["n"] += 1
+                    return original(*args, **kwargs)
+
+                with patch.object(
+                    frontier.redis_conn, "execute_command", side_effect=counting_execute_command
+                ):
+                    frontier.reclaim_and_promote(batch_size=1000)
+
+                return call_count["n"]
+            finally:
+                frontier.clear()
+                frontier.close()
+
+        calls_small = run_with_n_domains(3)
+        calls_large = run_with_n_domains(60)
+
+        assert calls_small == calls_large, (
+            f"reclaim_and_promote round trips scaled with domain count: "
+            f"{calls_small} (3 domains) vs {calls_large} (60 domains)"
+        )
+        assert calls_small <= 2, f"Expected a single script invocation, got {calls_small} calls"
 
 
 if __name__ == "__main__":
