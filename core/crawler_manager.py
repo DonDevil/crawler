@@ -8,6 +8,7 @@ from typing import Optional
 from loguru import logger
 
 from core.config import Config, load_config
+from core.frontier_executor import AsyncFrontier
 from core.url_frontier import URLFrontier
 from core.redis_frontier import RedisURLFrontier
 from crawler.async_crawler import AsyncCrawler
@@ -54,39 +55,61 @@ class CrawlerManager:
         )
 
         # Initialize frontier based on config
-        frontier_type = self.config.crawler.frontier.type.lower()
+        frontier_config = self.config.crawler.frontier
+        frontier_type = frontier_config.type.lower()
         if frontier_type == "redis":
             try:
                 self.frontier = RedisURLFrontier(
-                    redis_host=self.config.crawler.frontier.redis_host,
-                    redis_port=self.config.crawler.frontier.redis_port,
-                    redis_db=self.config.crawler.frontier.redis_db,
+                    redis_host=frontier_config.redis_host,
+                    redis_port=frontier_config.redis_port,
+                    redis_db=frontier_config.redis_db,
                     rate_limit=self.config.crawler.rate_limit,
                     url_database=self.url_database,
-                    namespace=self.config.crawler.frontier.redis_namespace,
+                    namespace=frontier_config.redis_namespace,
+                    max_retries=frontier_config.max_retries,
+                    base_backoff=frontier_config.base_backoff,
+                    max_backoff=frontier_config.max_backoff,
+                    lease_ttl=frontier_config.lease_ttl,
+                    domain_scan_limit=frontier_config.domain_scan_limit,
+                    reclaim_batch_size=frontier_config.reclaim_batch_size,
                 )
                 logger.info(
-                    f"Using Redis frontier at {self.config.crawler.frontier.redis_host}:"
-                    f"{self.config.crawler.frontier.redis_port}/{self.config.crawler.frontier.redis_db}"
+                    f"Using Redis frontier at {frontier_config.redis_host}:"
+                    f"{frontier_config.redis_port}/{frontier_config.redis_db}"
                 )
             except Exception as e:
                 logger.warning(
-                    f"Redis frontier unavailable at {self.config.crawler.frontier.redis_host}:"
-                    f"{self.config.crawler.frontier.redis_port}: {e}. "
+                    f"Redis frontier unavailable at {frontier_config.redis_host}:"
+                    f"{frontier_config.redis_port}: {e}. "
                     f"Falling back to SQLite (single-worker mode). "
                     f"To use multi-worker mode, ensure Redis is running and config.yaml is updated."
                 )
                 self.frontier = URLFrontier(
                     rate_limit=self.config.crawler.rate_limit,
                     url_database=self.url_database,
+                    max_retries=frontier_config.max_retries,
+                    base_backoff=frontier_config.base_backoff,
+                    max_backoff=frontier_config.max_backoff,
+                    lease_ttl=frontier_config.lease_ttl,
                 )
         else:
             self.frontier = URLFrontier(
                 rate_limit=self.config.crawler.rate_limit,
                 url_database=self.url_database,
+                max_retries=frontier_config.max_retries,
+                base_backoff=frontier_config.base_backoff,
+                max_backoff=frontier_config.max_backoff,
+                lease_ttl=frontier_config.lease_ttl,
             )
             logger.info("Using SQLite frontier (single-worker mode)")
 
+        # Non-blocking boundary for the recovery task below -- see
+        # core/frontier_executor.py and docs/architecture/frontier-step4.md.
+        # `self.frontier` itself stays the raw synchronous object: it's used
+        # directly by prepare_frontier() (sync, startup-only, before any
+        # concurrent event-loop work exists) and by existing callers/tests
+        # that expect synchronous access.
+        self.async_frontier = AsyncFrontier(self.frontier)
 
         self.link_extractor = HTMLLinkExtractor()
 
@@ -146,6 +169,7 @@ class CrawlerManager:
         self.include_seed_files = include_seed_files
         self.resume_unfinished = resume_unfinished
         self.query_scope = query_scope
+        self._recovery_task: Optional[asyncio.Task] = None
 
         logger.info(f"Using crawler engine: {self.crawl_engine}")
 
@@ -265,11 +289,49 @@ class CrawlerManager:
             len(report.urls),
         )
 
+    async def _recovery_loop(self) -> None:
+        """Periodically reclaim abandoned inflight claims and promote due
+        retries (docs/architecture/frontier-adr.md §7).
+
+        Runs independently of whether the scheduler is polling, so it keeps
+        sweeping even when the queue is fully drained except for one
+        crashed worker's orphaned claim. Only started when the active
+        frontier implements `reclaim_and_promote` (Redis today) -- the
+        local frontier already promotes due retries lazily inside its own
+        `get_next_url()` (ADR §10) and has nothing for this loop to do.
+        Uses `self.async_frontier` so the (potentially blocking, Redis)
+        call never runs directly on the event loop thread -- see
+        core/frontier_executor.py.
+        """
+        interval = self.config.crawler.frontier.recovery_interval
+        batch_size = self.config.crawler.frontier.reclaim_batch_size
+
+        while True:
+            try:
+                reclaimed, requeued = await self.async_frontier.reclaim_and_promote(batch_size)
+                if reclaimed or requeued:
+                    logger.debug(f"Recovery sweep: reclaimed={reclaimed} requeued={requeued}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Recovery sweep failed: {e}")
+            await asyncio.sleep(interval)
+
     async def run(self):
         """Run the crawler until it completes or is stopped."""
         self.prepare_frontier()
 
         logger.info("Starting crawler")
+
+        frontier_config = self.config.crawler.frontier
+        self._recovery_task: Optional[asyncio.Task] = None
+        if frontier_config.recovery_enabled and hasattr(self.frontier, "reclaim_and_promote"):
+            self._recovery_task = asyncio.create_task(self._recovery_loop())
+            logger.info(
+                f"Started frontier recovery task (interval={frontier_config.recovery_interval}s, "
+                f"batch_size={frontier_config.reclaim_batch_size})"
+            )
+
         try:
             await self._crawler.run()
         except asyncio.CancelledError:
@@ -277,6 +339,10 @@ class CrawlerManager:
         except Exception as exc:
             logger.exception(f"Crawler encountered an error: {exc}")
         finally:
+            if self._recovery_task is not None:
+                self._recovery_task.cancel()
+                await asyncio.gather(self._recovery_task, return_exceptions=True)
+
             logger.info("Crawler stopped")
             logger.info(f"Database status counts: {self.url_database.get_status_counts()}")
             if hasattr(self.frontier, "close"):

@@ -11,6 +11,7 @@ from typing import Optional
 from loguru import logger
 
 from core.frontier import Frontier, FrontierClaim
+from core.frontier_executor import AsyncFrontier
 
 
 class Scheduler:
@@ -21,7 +22,7 @@ class Scheduler:
         queue: asyncio.Queue[FrontierClaim],
         poll_interval: float = 0.5,
     ):
-        self.frontier = frontier
+        self.frontier = AsyncFrontier(frontier)
         self.queue = queue
         self.poll_interval = poll_interval
         self._stopped = asyncio.Event()
@@ -31,7 +32,7 @@ class Scheduler:
         logger.debug("Scheduler started")
 
         while not self._stopped.is_set():
-            claim = self.frontier.get_next_url()
+            claim = await self.frontier.get_next_url()
 
             if claim:
                 await self.queue.put(claim)

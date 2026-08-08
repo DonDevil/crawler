@@ -6,6 +6,7 @@ from aiohttp_socks import ProxyConnector
 from loguru import logger
 
 from core.frontier import Frontier, FrontierClaim
+from core.frontier_executor import AsyncFrontier
 from parsers.streaming_manifest_parser import StreamingManifestParser
 from storage.url_database import URLDatabase
 from tor.proxy_config import get_default_tor_proxy
@@ -29,7 +30,7 @@ class AsyncCrawler:
         tor_proxy: Optional[str] = None,
     ):
 
-        self.frontier = frontier
+        self.frontier = AsyncFrontier(frontier)
         self.parser = parser
         self.concurrency = max(1, min(concurrency, max_pages)) if max_pages else max(1, concurrency)
         self.timeout = timeout
@@ -144,7 +145,7 @@ class AsyncCrawler:
 
                 if URLUtils.is_blacklisted(url):
                     logger.info(f"Skipping blacklisted URL during crawl: {url}")
-                    self.frontier.mark_skipped(claim)
+                    await self.frontier.mark_skipped(claim)
                     if self.url_database:
                         self.url_database.update_status(url, "skipped")
                     continue
@@ -155,7 +156,7 @@ class AsyncCrawler:
                 html, failure_reason = await self.fetch(session, url, tor_session=tor_session)
                 status = "visited"
 
-                source_query = self.frontier.get_source_query(url) if self.frontier else ""
+                source_query = await self.frontier.get_source_query(url) if self.frontier else ""
 
                 if html and self.parser:
                     parsed_content = (
@@ -185,16 +186,16 @@ class AsyncCrawler:
                             logger.debug(f"Skipping media evidence capture for {url}: {exc}")
 
                     for link in links:
-                        self.frontier.add_url(link, priority=URLUtils.get_link_priority(url, link, source_query))
+                        await self.frontier.add_url(link, priority=URLUtils.get_link_priority(url, link, source_query))
                 elif failure_reason:
                     status = "failed"
                     self._pages_failed += 1
                     logger.warning(f"Failed to crawl {url}: {failure_reason}")
 
                 if status == "failed":
-                    self.frontier.mark_failed(claim, failure_reason or "")
+                    await self.frontier.mark_failed(claim, failure_reason or "")
                 else:
-                    self.frontier.mark_visited(claim)
+                    await self.frontier.mark_visited(claim)
                 if self.url_database:
                     self.url_database.update_status(url, status)
 
@@ -207,12 +208,12 @@ class AsyncCrawler:
 
             except asyncio.CancelledError:
                 if claim is not None:
-                    self.frontier.mark_failed(claim, "worker cancelled")
+                    await self.frontier.mark_failed(claim, "worker cancelled")
                 raise
             except Exception as e:
                 logger.error(f"Worker error for {url}: {e}")
                 if claim is not None:
-                    self.frontier.mark_failed(claim, str(e))
+                    await self.frontier.mark_failed(claim, str(e))
 
             finally:
                 self._active_workers = max(0, self._active_workers - 1)
@@ -224,7 +225,7 @@ class AsyncCrawler:
         idle_loops = 0
 
         while not self._stop_event.is_set():
-            claim = self.frontier.get_next_url()
+            claim = await self.frontier.get_next_url()
 
             if claim:
                 idle_loops = 0
@@ -232,7 +233,7 @@ class AsyncCrawler:
                 continue
 
             # Only stop after the queue, active workers, and frontier are all idle.
-            if self.queue.empty() and self._active_workers == 0 and not self.frontier.has_pending():
+            if self.queue.empty() and self._active_workers == 0 and not await self.frontier.has_pending():
                 idle_loops += 1
                 if idle_loops >= 10:  # ~5 seconds of idle
                     logger.info("No more URLs to crawl, stopping crawler")
@@ -271,5 +272,5 @@ class AsyncCrawler:
                     "Crawler finished: processed={} failed={} pending_frontier={}",
                     self._pages_crawled,
                     self._pages_failed,
-                    self.frontier.pending_count(),
+                    await self.frontier.pending_count(),
                 )

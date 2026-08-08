@@ -16,6 +16,17 @@ crawler:
     redis_host: "localhost"
     redis_port: 6379
     redis_namespace: "crawler"
+    # Shared retry/backoff, applied uniformly by whichever frontier is active.
+    max_retries: 3
+    base_backoff: 5.0
+    max_backoff: 300.0
+    # Redis claim lease + background recovery sweep (core/crawler_manager.py's
+    # recovery task). No effect on the local/sqlite frontier's behavior.
+    lease_ttl: 90.0
+    recovery_enabled: true
+    recovery_interval: 30.0
+    reclaim_batch_size: 200
+    domain_scan_limit: 50
   seed_files:
     - "seeds/piracy_sites.txt"
     - "seeds/torrent_sites.txt"

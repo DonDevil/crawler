@@ -13,6 +13,7 @@ from loguru import logger
 
 from core.crawler_router import CrawlerRouter
 from core.frontier import Frontier, FrontierClaim
+from core.frontier_executor import AsyncFrontier
 from crawler.async_crawler import AsyncCrawler
 from crawler.http_crawler import HTTPCrawler
 from crawler.playwright_crawler import PlaywrightCrawler
@@ -44,7 +45,7 @@ class HybridCrawler:
         scrapling_stealth: bool = True,
         scrapling_network_idle: bool = True,
     ):
-        self.frontier = frontier
+        self.frontier = AsyncFrontier(frontier)
         self.parser = parser
         self.concurrency = max(1, min(concurrency, max_pages)) if max_pages else max(1, concurrency)
         self.timeout = timeout
@@ -82,8 +83,12 @@ class HybridCrawler:
         self._playwright_semaphore = asyncio.Semaphore(max(1, min(2, self.concurrency)))
         self._selenium_semaphore = asyncio.Semaphore(1)
 
+        # Sub-engines wrap `frontier` themselves (each backend wraps whatever
+        # it's given in its own __init__) -- pass the raw object here, not
+        # self.frontier, so it isn't wrapped twice. AsyncFrontier is
+        # idempotent if this ever changes, but staying explicit is clearer.
         common_args = {
-            "frontier": self.frontier,
+            "frontier": frontier,
             "parser": self.parser,
             "concurrency": self.concurrency,
             "timeout": self.timeout,
@@ -212,7 +217,7 @@ class HybridCrawler:
 
                 if URLUtils.is_blacklisted(url):
                     logger.info(f"Skipping blacklisted URL during crawl: {url}")
-                    self.frontier.mark_skipped(claim)
+                    await self.frontier.mark_skipped(claim)
                     if self.url_database:
                         self.url_database.update_status(url, "skipped")
                     continue
@@ -294,16 +299,16 @@ class HybridCrawler:
                             logger.debug(f"Skipping media evidence capture for {url}: {exc}")
 
                     for link in links:
-                        self.frontier.add_url(link, priority=URLUtils.get_link_priority(url, link))
+                        await self.frontier.add_url(link, priority=URLUtils.get_link_priority(url, link))
                 elif failure_reason:
                     status = "failed"
                     self._pages_failed += 1
                     logger.warning(f"Failed to crawl {url}: {failure_reason}")
 
                 if status == "failed":
-                    self.frontier.mark_failed(claim, failure_reason or "")
+                    await self.frontier.mark_failed(claim, failure_reason or "")
                 else:
-                    self.frontier.mark_visited(claim)
+                    await self.frontier.mark_visited(claim)
                 if self.url_database:
                     self.url_database.update_status(url, status)
 
@@ -319,12 +324,12 @@ class HybridCrawler:
 
             except asyncio.CancelledError:
                 if claim is not None:
-                    self.frontier.mark_failed(claim, "worker cancelled")
+                    await self.frontier.mark_failed(claim, "worker cancelled")
                 raise
             except Exception as exc:
                 logger.error(f"Worker error for {url}: {exc}")
                 if claim is not None:
-                    self.frontier.mark_failed(claim, str(exc))
+                    await self.frontier.mark_failed(claim, str(exc))
             finally:
                 self._active_workers = max(0, self._active_workers - 1)
                 self.queue.task_done()
@@ -333,14 +338,14 @@ class HybridCrawler:
         idle_loops = 0
 
         while not self._stop_event.is_set():
-            claim = self.frontier.get_next_url()
+            claim = await self.frontier.get_next_url()
 
             if claim:
                 idle_loops = 0
                 await self.queue.put(claim)
                 continue
 
-            if self.queue.empty() and self._active_workers == 0 and not self.frontier.has_pending():
+            if self.queue.empty() and self._active_workers == 0 and not await self.frontier.has_pending():
                 idle_loops += 1
                 if idle_loops >= 10:
                     logger.info("No more URLs to crawl, stopping crawler")
@@ -396,6 +401,6 @@ class HybridCrawler:
                     "Hybrid crawler finished: processed={} failed={} pending_frontier={} engine_usage={}",
                     self._pages_crawled,
                     self._pages_failed,
-                    self.frontier.pending_count(),
+                    await self.frontier.pending_count(),
                     dict(self._engine_counts),
                 )

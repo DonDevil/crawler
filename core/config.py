@@ -33,16 +33,38 @@ class StorageConfig(BaseModel):
 
 class FrontierConfig(BaseModel):
     """Configuration for URL frontier backend.
-    
+
     Supports two modes:
     - 'sqlite': In-memory frontier with SQLite persistence (single worker)
     - 'redis': Redis-backed shared frontier (multi-worker, requires Redis server)
+
+    Claim/retry/recovery knobs (docs/architecture/frontier-adr.md §4/§7)
+    apply to both backends uniformly -- the local frontier already enforces
+    max_retries/backoff (Step 1); the Redis frontier's claim lease and
+    recovery sweep additionally use lease_ttl/recovery_interval/
+    reclaim_batch_size/domain_scan_limit (Step 3-4).
     """
     type: str = "sqlite"  # 'sqlite' or 'redis'
     redis_host: str = "localhost"
     redis_port: int = 6379
     redis_db: int = 0
     redis_namespace: str = "crawler"
+
+    # Shared retry/backoff (applied uniformly by whichever frontier is active)
+    max_retries: int = 3
+    base_backoff: float = 5.0
+    max_backoff: float = 300.0
+
+    # Redis claim lease + background recovery sweep. Local frontier accepts
+    # lease_ttl for FrontierClaim.lease_expires_at bookkeeping but performs
+    # no lease-expiry logic in-process (ADR §10); recovery_enabled/
+    # recovery_interval/reclaim_batch_size are meaningful only for backends
+    # that implement reclaim_and_promote (Redis today).
+    lease_ttl: float = 90.0
+    recovery_enabled: bool = True
+    recovery_interval: float = 30.0
+    reclaim_batch_size: int = 200
+    domain_scan_limit: int = 50
 
 
 class SearchConfig(BaseModel):

@@ -8,6 +8,7 @@ from typing import Optional
 from loguru import logger
 
 from core.frontier import Frontier, FrontierClaim
+from core.frontier_executor import AsyncFrontier
 from parsers.streaming_manifest_parser import StreamingManifestParser
 from storage.url_database import URLDatabase
 from utils.url_utils import URLUtils
@@ -35,7 +36,7 @@ class PlaywrightCrawler:
 		url_database: Optional[URLDatabase] = None,
 		media_database=None,
 	):
-		self.frontier = frontier
+		self.frontier = AsyncFrontier(frontier)
 		self.parser = parser
 		self.concurrency = max(1, min(concurrency, 8, max_pages)) if max_pages else max(1, min(concurrency, 8))
 		self.timeout = timeout
@@ -197,7 +198,7 @@ class PlaywrightCrawler:
 
 				if URLUtils.is_blacklisted(url):
 					logger.info(f"Skipping blacklisted URL during crawl: {url}")
-					self.frontier.mark_skipped(claim)
+					await self.frontier.mark_skipped(claim)
 					if self.url_database:
 						self.url_database.update_status(url, "skipped")
 					continue
@@ -233,16 +234,16 @@ class PlaywrightCrawler:
 						except Exception as exc:
 							logger.debug(f"Skipping media evidence capture for {url}: {exc}")
 					for link in links:
-						self.frontier.add_url(link, priority=URLUtils.get_link_priority(url, link))
+						await self.frontier.add_url(link, priority=URLUtils.get_link_priority(url, link))
 				elif failure_reason:
 					status = "failed"
 					self._pages_failed += 1
 					logger.warning(f"Failed to crawl {url}: {failure_reason}")
 
 				if status == "failed":
-					self.frontier.mark_failed(claim, failure_reason or "")
+					await self.frontier.mark_failed(claim, failure_reason or "")
 				else:
-					self.frontier.mark_visited(claim)
+					await self.frontier.mark_visited(claim)
 				if self.url_database:
 					self.url_database.update_status(url, status)
 
@@ -254,12 +255,12 @@ class PlaywrightCrawler:
 
 			except asyncio.CancelledError:
 				if claim is not None:
-					self.frontier.mark_failed(claim, "worker cancelled")
+					await self.frontier.mark_failed(claim, "worker cancelled")
 				raise
 			except Exception as exc:
 				logger.error(f"Worker error for {url}: {exc}")
 				if claim is not None:
-					self.frontier.mark_failed(claim, str(exc))
+					await self.frontier.mark_failed(claim, str(exc))
 			finally:
 				self._active_workers = max(0, self._active_workers - 1)
 				self.queue.task_done()
@@ -267,13 +268,13 @@ class PlaywrightCrawler:
 	async def scheduler(self):
 		idle_loops = 0
 		while not self._stop_event.is_set():
-			claim = self.frontier.get_next_url()
+			claim = await self.frontier.get_next_url()
 			if claim:
 				idle_loops = 0
 				await self.queue.put(claim)
 				continue
 
-			if self.queue.empty() and self._active_workers == 0 and not self.frontier.has_pending():
+			if self.queue.empty() and self._active_workers == 0 and not await self.frontier.has_pending():
 				idle_loops += 1
 				if idle_loops >= 10:
 					logger.info("No more URLs to crawl, stopping crawler")
@@ -306,5 +307,5 @@ class PlaywrightCrawler:
 				"Playwright crawler finished: processed={} failed={} pending_frontier={}",
 				self._pages_crawled,
 				self._pages_failed,
-				self.frontier.pending_count(),
+				await self.frontier.pending_count(),
 			)
