@@ -10,15 +10,15 @@ from typing import Optional
 
 from loguru import logger
 
-from core.url_frontier import URLFrontier
+from core.frontier import Frontier, FrontierClaim
 
 
 class Scheduler:
 
     def __init__(
         self,
-        frontier: URLFrontier,
-        queue: asyncio.Queue[str],
+        frontier: Frontier,
+        queue: asyncio.Queue[FrontierClaim],
         poll_interval: float = 0.5,
     ):
         self.frontier = frontier
@@ -27,15 +27,15 @@ class Scheduler:
         self._stopped = asyncio.Event()
 
     async def run(self):
-        """Continuously schedule URLs from the frontier into the work queue."""
+        """Continuously schedule claimed URLs from the frontier into the work queue."""
         logger.debug("Scheduler started")
 
         while not self._stopped.is_set():
-            url = self.frontier.get_next_url()
+            claim = self.frontier.get_next_url()
 
-            if url:
-                await self.queue.put(url)
-                logger.debug(f"Scheduled URL: {url}")
+            if claim:
+                await self.queue.put(claim)
+                logger.debug(f"Scheduled URL: {claim.url}")
                 continue
 
             # nothing available; wait for new URLs to appear

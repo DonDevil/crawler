@@ -8,6 +8,7 @@ from typing import Optional
 
 from loguru import logger
 
+from core.frontier import Frontier, FrontierClaim
 from storage.url_database import URLDatabase
 from utils.url_utils import URLUtils
 
@@ -26,7 +27,7 @@ class SeleniumCrawler:
 
 	def __init__(
 		self,
-		frontier,
+		frontier: Frontier,
 		parser=None,
 		concurrency=2,
 		timeout=30,
@@ -46,7 +47,7 @@ class SeleniumCrawler:
 		self.url_database = url_database
 		self.media_database = media_database
 
-		self.queue = asyncio.Queue()
+		self.queue: asyncio.Queue[FrontierClaim] = asyncio.Queue()
 		self._stop_event = asyncio.Event()
 		self._pages_crawled = 0
 		self._pages_failed = 0
@@ -132,16 +133,17 @@ class SeleniumCrawler:
 
 	async def worker(self):
 		while not self._stop_event.is_set():
-			url = await self.queue.get()
+			claim = await self.queue.get()
 			self._active_workers += 1
+			url = claim.url if claim else None
 
 			try:
-				if not url:
+				if claim is None:
 					continue
 
 				if URLUtils.is_blacklisted(url):
 					logger.info(f"Skipping blacklisted URL during crawl: {url}")
-					self.frontier.mark_visited(url)
+					self.frontier.mark_skipped(claim)
 					if self.url_database:
 						self.url_database.update_status(url, "skipped")
 					continue
@@ -183,7 +185,10 @@ class SeleniumCrawler:
 					self._pages_failed += 1
 					logger.warning(f"Failed to crawl {url}: {failure_reason}")
 
-				self.frontier.mark_visited(url)
+				if status == "failed":
+					self.frontier.mark_failed(claim, failure_reason or "")
+				else:
+					self.frontier.mark_visited(claim)
 				if self.url_database:
 					self.url_database.update_status(url, status)
 
@@ -194,9 +199,13 @@ class SeleniumCrawler:
 					self._stop_event.set()
 
 			except asyncio.CancelledError:
+				if claim is not None:
+					self.frontier.mark_failed(claim, "worker cancelled")
 				raise
 			except Exception as exc:
 				logger.error(f"Worker error for {url}: {exc}")
+				if claim is not None:
+					self.frontier.mark_failed(claim, str(exc))
 			finally:
 				self._active_workers = max(0, self._active_workers - 1)
 				self.queue.task_done()
@@ -204,10 +213,10 @@ class SeleniumCrawler:
 	async def scheduler(self):
 		idle_loops = 0
 		while not self._stop_event.is_set():
-			url = self.frontier.get_next_url()
-			if url:
+			claim = self.frontier.get_next_url()
+			if claim:
 				idle_loops = 0
-				await self.queue.put(url)
+				await self.queue.put(claim)
 				continue
 
 			if self.queue.empty() and self._active_workers == 0 and not self.frontier.has_pending():

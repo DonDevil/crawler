@@ -85,7 +85,9 @@ def test_prepare_frontier_query_only_skips_seed_files(monkeypatch, tmp_path):
 
     manager.prepare_frontier()
 
-    assert manager.frontier.get_next_url() == "https://query.example.com/"
+    claim = manager.frontier.get_next_url()
+    assert claim is not None
+    assert claim.url == "https://query.example.com/"
     assert manager.frontier.get_next_url() is None
 
 
@@ -113,7 +115,7 @@ def test_prepare_frontier_unfinished_loads_only_resume_urls(monkeypatch, tmp_pat
 
     manager.prepare_frontier()
 
-    resumed = {manager.frontier.get_next_url(), manager.frontier.get_next_url()}
+    resumed = {manager.frontier.get_next_url().url, manager.frontier.get_next_url().url}
     assert resumed == {"https://queued.example.com/", "https://pending.example.com/"}
     assert manager.frontier.get_next_url() is None
 
@@ -137,7 +139,9 @@ def test_prepare_frontier_prioritizes_onion_resume_urls(monkeypatch, tmp_path):
 
     manager.prepare_frontier()
 
-    assert manager.frontier.get_next_url() == "http://resumehiddenresumehidden.onion/"
+    claim = manager.frontier.get_next_url()
+    assert claim is not None
+    assert claim.url == "http://resumehiddenresumehidden.onion/"
 
 
 def test_prepare_frontier_uses_surface_scope_for_queries(monkeypatch, tmp_path):
@@ -245,7 +249,9 @@ def test_manager_can_ignore_blacklist(monkeypatch, tmp_path):
         )
         manager.prepare_frontier()
 
-        assert manager.frontier.get_next_url() == "https://news.example.com/story"
+        claim = manager.frontier.get_next_url()
+        assert claim is not None
+        assert claim.url == "https://news.example.com/story"
     finally:
         URLUtils.set_blacklist_path(str(original_path))
         URLUtils.set_blacklist_enabled(original_enabled)

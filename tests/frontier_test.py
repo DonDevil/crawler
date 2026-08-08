@@ -12,9 +12,10 @@ def test_frontier_marks_cleaned_urls_as_visited_and_prevents_requeue():
 
     frontier.add_url(raw_url)
 
-    assert frontier.get_next_url() == cleaned_url
+    claim = frontier.get_next_url()
+    assert claim.url == cleaned_url
 
-    frontier.mark_visited(raw_url)
+    frontier.mark_visited(claim)
     frontier.add_url(cleaned_url)
 
     assert cleaned_url in frontier.visited
@@ -29,7 +30,7 @@ def test_frontier_keeps_other_domains_available_when_one_is_rate_limited():
     first = frontier.get_next_url()
     second = frontier.get_next_url()
 
-    assert {first, second} == {"https://a.example.com/1", "https://b.example.com/1"}
+    assert {first.url, second.url} == {"https://a.example.com/1", "https://b.example.com/1"}
 
 
 def test_frontier_skips_urls_already_visited_in_database(tmp_path):
@@ -66,6 +67,94 @@ def test_frontier_drops_queued_urls_when_domain_becomes_blacklisted(tmp_path):
         blacklist_path.write_text("example.com\n", encoding="utf-8")
 
         assert frontier.get_next_url() is None
+        assert frontier.get_status_counts()["skipped"] == 1
     finally:
         URLUtils.set_blacklist_path(str(original_path))
         URLUtils.set_blacklist_enabled(original_enabled)
+
+
+def test_mark_failed_retries_with_backoff_then_fails_permanently():
+    frontier = URLFrontier(rate_limit=0, max_retries=2, base_backoff=0, max_backoff=0)
+    frontier.add_url("https://example.com/flaky")
+
+    first_claim = frontier.get_next_url()
+    assert first_claim.attempt == 1
+
+    frontier.mark_failed(first_claim, "transient error")
+    assert frontier.get_status_counts()["retry_scheduled"] == 1
+
+    second_claim = frontier.get_next_url()
+    assert second_claim is not None
+    assert second_claim.url == first_claim.url
+    assert second_claim.attempt == 2
+    assert second_claim.token != first_claim.token
+
+    frontier.mark_failed(second_claim, "still failing")
+
+    counts = frontier.get_status_counts()
+    assert counts["failed_permanent"] == 1
+    assert counts["retry_scheduled"] == 0
+    assert frontier.get_next_url() is None
+
+
+def test_stale_claim_is_ignored_by_completion_methods():
+    frontier = URLFrontier(rate_limit=0, max_retries=3, base_backoff=0, max_backoff=0)
+    frontier.add_url("https://example.com/retry-me")
+
+    first_claim = frontier.get_next_url()
+    frontier.mark_failed(first_claim, "transient")
+
+    second_claim = frontier.get_next_url()
+    assert second_claim.token != first_claim.token
+
+    frontier.mark_visited(first_claim)
+    assert frontier.get_status_counts()["visited"] == 0
+
+    frontier.mark_visited(second_claim)
+    assert frontier.get_status_counts()["visited"] == 1
+
+    frontier.mark_visited(second_claim)
+    frontier.mark_failed(second_claim, "too late")
+    frontier.mark_skipped(second_claim)
+    assert frontier.get_status_counts()["visited"] == 1
+
+
+def test_status_counts_partition_every_known_url():
+    frontier = URLFrontier(rate_limit=0, max_retries=1, base_backoff=0, max_backoff=0)
+    for domain in ("a", "b", "c", "d"):
+        frontier.add_url(f"https://{domain}.example.com/1")
+
+    visited_claim = frontier.get_next_url()
+    frontier.mark_visited(visited_claim)
+
+    failed_claim = frontier.get_next_url()
+    frontier.mark_failed(failed_claim, "dead")
+
+    inflight_claim = frontier.get_next_url()
+    assert inflight_claim is not None
+
+    counts = frontier.get_status_counts()
+    assert counts == {
+        "queued": 1,
+        "inflight": 1,
+        "retry_scheduled": 0,
+        "visited": 1,
+        "skipped": 0,
+        "failed_permanent": 1,
+    }
+    assert sum(counts.values()) == 4
+
+
+def test_renew_claim_succeeds_for_current_owner_and_fails_after_completion():
+    frontier = URLFrontier(rate_limit=0)
+    frontier.add_url("https://example.com/renewable")
+
+    claim = frontier.get_next_url()
+    renewed = frontier.renew_claim(claim)
+
+    assert renewed is not None
+    assert renewed.token == claim.token
+    assert renewed.lease_expires_at >= claim.lease_expires_at
+
+    frontier.mark_visited(claim)
+    assert frontier.renew_claim(claim) is None

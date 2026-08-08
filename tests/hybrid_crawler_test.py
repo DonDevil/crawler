@@ -126,3 +126,32 @@ async def test_hybrid_crawler_waits_for_inflight_fetches(monkeypatch):
 
     assert crawler._pages_crawled == 1
     assert "https://example.com/slow" in frontier.visited
+
+
+@pytest.mark.asyncio
+async def test_hybrid_crawler_marks_failed_once_after_exhausting_engine_escalation(monkeypatch):
+    from crawler.hybrid_crawler import HybridCrawler
+
+    async def always_fails(self, engine_name, url):
+        return None, "boom"
+
+    monkeypatch.setattr(HybridCrawler, "_fetch_with_engine", always_fails)
+
+    frontier = URLFrontier(rate_limit=0, max_retries=1, base_backoff=0, max_backoff=0)
+    frontier.add_url("https://example.com/unreachable")
+
+    crawler = HybridCrawler(
+        frontier=frontier,
+        parser=HTMLLinkExtractor(),
+        concurrency=1,
+        max_pages=5,
+        timeout=5,
+        max_retries=1,
+    )
+
+    await crawler.run()
+
+    assert "https://example.com/unreachable" not in frontier.visited
+    counts = frontier.get_status_counts()
+    assert counts["inflight"] == 0
+    assert counts["failed_permanent"] == 1
