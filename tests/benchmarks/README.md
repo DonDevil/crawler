@@ -22,13 +22,13 @@ passed where available), so runs are repeatable.
 
 ## Scripts
 
-| Script | Purpose |
-|---|---|
-| `frontier_benchmark.py` | Single-process throughput/latency benchmark, local or Redis |
-| `distributed_benchmark.py` | N independent OS processes racing against one shared Redis frontier |
-| `crash_recovery.py` | Deterministic kill-mid-claim → lease expiry → reclaim → re-claim timeline |
-| `heartbeat_endurance.py` | Slow synthetic fetch exceeding `lease_ttl`, heartbeat on vs. off |
-| `priority_ratelimit.py` | Reports actual claim order across domains/priorities/rate gates |
+| Script                     | Purpose                                                                  |
+|----------------------------|--------------------------------------------------------------------------|
+| `frontier_benchmark.py`    | Single-process throughput/latency benchmark, local or Redis              |
+| `distributed_benchmark.py` | N independent OS processes racing against one shared Redis frontier      |
+| `crash_recovery.py`        | Deterministic kill-mid-claim → lease expiry → reclaim → re-claim timeline|
+| `heartbeat_endurance.py`   | Slow synthetic fetch exceeding `lease_ttl`, heartbeat on vs. off         |
+| `priority_ratelimit.py`    | Reports actual claim order across domains/priorities/rate gates          |
 
 Every script accepts `--output <path>` (writes JSON, or CSV with
 `--format csv`) in addition to printing the result to stdout. Every
@@ -41,7 +41,7 @@ Redis-backed script accepts `--redis-host/--redis-port/--redis-db/
 Single process; workers are real OS threads calling the frontier's
 synchronous API directly (the same execution boundary `AsyncFrontier` uses
 for Redis via `asyncio.to_thread`). Measures insert rate, claim rate,
-completion rate, claim/completion latency percentiles, and flags any
+completion rate, latency percentiles (see below), and flags any
 **duplicate successful claim** (the same URL completed as `visited` more
 than once — a claim-safety violation, should always be 0).
 
@@ -53,12 +53,68 @@ python tests/benchmarks/frontier_benchmark.py --frontier redis --urls 10000 --wo
 python tests/benchmarks/frontier_benchmark.py --frontier redis --urls 20000 --workers 8 \
     --domains 40 --priority-distribution weighted:1:0.1,5:0.3,10:0.6 --retry-rate 0.1 \
     --rate-limit 0.5 --output /tmp/redis_bench.json
+
+# Pure frontier-throughput scaling run: rate limiting disabled so 1-worker
+# vs. 4-worker actually measures frontier scalability instead of both
+# runs capping out at the same domains/rate_limit ceiling.
+python tests/benchmarks/frontier_benchmark.py --frontier redis --urls 20000 --workers 4 \
+    --domains 40 --no-rate-limit --output /tmp/redis_throughput.json
 ```
 
 Key flags: `--urls`, `--workers`, `--duration` (cap on the claim/complete
 phase), `--retry-rate`, `--domains`, `--priority-distribution` (`fixed:<p>`
 / `uniform:<lo>-<hi>` / `weighted:<p1>:<w1>,<p2>:<w2>,...`), `--process-time`
-(simulated per-claim work), `--rate-limit`.
+(simulated per-claim work), `--rate-limit`, `--no-rate-limit`.
+
+### Latency metrics: queue wait vs. frontier operation
+
+The benchmark reports three separate latency distributions (each as
+min/p50/p90/p99/mean, via `common.latency_stats`), because they measure
+different things and conflating them is misleading:
+
+* **`queue_wait_latency`** — URL insertion (enqueue) timestamp → successful
+  claim timestamp. This is dominated by how long a URL sat behind other
+  queued work and any rate gates, *not* by frontier call cost. In a single
+  big insert-then-drain run (all URLs inserted up front, workers draining
+  after), the first claims' queue-wait is roughly the whole insert-phase
+  duration — that's expected, not a frontier slowdown.
+* **`claim_operation_latency`** — wall-clock time of the `get_next_url()`
+  call itself: immediately before the call → immediately after it returns.
+  This is the actual frontier claim cost (SQLite query / Redis round trip +
+  Lua script), independent of how long the URL waited in queue.
+* **`completion_operation_latency`** — wall-clock time of the
+  `mark_visited()` call itself: immediately before → immediately after it
+  returns. The actual frontier completion cost, same idea as above.
+
+Earlier versions of this script reported a single `claim_latency` /
+`completion_latency` pair measured from insertion, which is actually
+`queue_wait_latency` under a different name — at low, rate-limited
+throughput it looks almost identical to total time-to-completion and can be
+mistaken for the frontier's own per-call latency. Use `queue_wait_latency`
+to reason about end-to-end queueing behavior, and
+`claim_operation_latency`/`completion_operation_latency` to reason about
+the frontier implementation's actual per-call speed.
+
+### Rate-limit-constrained vs. unconstrained throughput
+
+`--rate-limit <seconds>` (default `1.0`) is the frontier's real per-domain
+minimum gap between claims — a workload knob, not a benchmark artifact, and
+worth keeping to measure realistic, politeness-constrained crawls. But with
+few domains it also caps *measured* throughput at
+`domains / rate_limit` claims/sec regardless of worker count, which makes
+worker-count scaling (1 vs. 4 vs. N workers) invisible — every worker count
+saturates at the same domain-gated ceiling instead of showing the
+frontier's own scalability.
+
+Pass **`--no-rate-limit`** (equivalent to `--rate-limit 0`, which the
+frontier's public API already treats as "no wait between claims on the same
+domain" — no frontier code changes needed) to remove that ceiling for a
+**pure frontier-throughput** run: claims are then limited only by the
+frontier implementation and worker contention, which is what a
+worker-count scaling campaign (1 vs. 4 workers, etc.) needs to measure
+anything meaningful. Keep `--rate-limit` at a realistic value (or its
+default) for benchmarks meant to reflect production politeness
+constraints instead.
 
 ## 2. Multi-process distributed benchmark
 

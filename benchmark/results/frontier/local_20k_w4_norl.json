@@ -1,0 +1,86 @@
+{
+  "run": {
+    "tool": "frontier_benchmark",
+    "timestamp": "2026-08-09T14:11:36",
+    "frontier": "local"
+  },
+  "config": {
+    "urls": 20000,
+    "workers": 4,
+    "duration_s": 60.0,
+    "retry_rate": 0.0,
+    "domains": 40,
+    "priority_distribution": "fixed:10",
+    "rate_limit": 0.0,
+    "no_rate_limit": true,
+    "lease_ttl": 90.0,
+    "max_retries": 3,
+    "process_time_s": 0.0,
+    "namespace": null,
+    "redis_db": null
+  },
+  "insert": {
+    "attempted": 20000,
+    "inserted": 20000,
+    "elapsed_s": 139.44755482673645,
+    "urls_per_sec": 143.42309569249883
+  },
+  "claim_and_complete": {
+    "elapsed_s": 60.035892486572266,
+    "claims_issued": 6612,
+    "unique_urls_claimed": 6612,
+    "successful_completions": 6612,
+    "duplicate_successful_claims": 0,
+    "failed_attempts": 0,
+    "claims_per_sec": 110.13411687814671,
+    "completions_per_sec": 110.13411687814671
+  },
+  "queue_wait_latency": {
+    "count": 6612,
+    "min_s": 139.44573187828064,
+    "max_s": 153.06113028526306,
+    "mean_s": 146.51035002633,
+    "p50_s": 146.6710376739502,
+    "p90_s": 151.73337342739106,
+    "p99_s": 152.8750056242943
+  },
+  "claim_operation_latency": {
+    "count": 6612,
+    "min_s": 0.005440711975097656,
+    "max_s": 0.12440633773803711,
+    "mean_s": 0.03630509051278513,
+    "p50_s": 0.034240126609802246,
+    "p90_s": 0.06158249378204346,
+    "p99_s": 0.08551438808441163
+  },
+  "completion_operation_latency": {
+    "count": 6612,
+    "min_s": 4.76837158203125e-07,
+    "max_s": 0.00019073486328125,
+    "mean_s": 9.702251524328103e-07,
+    "p50_s": 9.5367431640625e-07,
+    "p90_s": 1.1920928955078125e-06,
+    "p99_s": 2.1457672119140625e-06
+  },
+  "final_status_counts": {
+    "queued": 13388,
+    "inflight": 0,
+    "retry_scheduled": 0,
+    "visited": 6612,
+    "skipped": 0,
+    "failed_permanent": 0
+  },
+  "resource_usage": {
+    "process_cpu_percent": {
+      "min": 0.0,
+      "max": 118.8,
+      "avg": 101.74036697247708
+    },
+    "process_rss_mb": {
+      "min": 54.125,
+      "max": 58.41796875,
+      "avg": 57.05368405963303
+    }
+  },
+  "total_runtime_s": 199.48344731330872
+}

@@ -1,0 +1,89 @@
+{
+  "run": {
+    "tool": "priority_ratelimit",
+    "timestamp": "2026-08-09T15:35:14",
+    "frontier": "redis"
+  },
+  "config": {
+    "scenario": "urgent:1:2,normal:5:2,bulk:10:1",
+    "rate_limit_s": 1.5
+  },
+  "seeded": [
+    {
+      "url": "https://urgent-pr1786269912.example.test/p0",
+      "domain": "urgent-pr1786269912.example.test",
+      "priority": 1
+    },
+    {
+      "url": "https://urgent-pr1786269912.example.test/p1",
+      "domain": "urgent-pr1786269912.example.test",
+      "priority": 1
+    },
+    {
+      "url": "https://normal-pr1786269912.example.test/p0",
+      "domain": "normal-pr1786269912.example.test",
+      "priority": 5
+    },
+    {
+      "url": "https://normal-pr1786269912.example.test/p1",
+      "domain": "normal-pr1786269912.example.test",
+      "priority": 5
+    },
+    {
+      "url": "https://bulk-pr1786269912.example.test/p0",
+      "domain": "bulk-pr1786269912.example.test",
+      "priority": 10
+    }
+  ],
+  "claim_order": [
+    {
+      "step": 1,
+      "t_offset_s": 0.006,
+      "url": "https://urgent-pr1786269912.example.test/p0",
+      "domain": "urgent-pr1786269912.example.test",
+      "priority": 1,
+      "attempt": 1
+    },
+    {
+      "step": 2,
+      "t_offset_s": 0.013,
+      "url": "https://normal-pr1786269912.example.test/p0",
+      "domain": "normal-pr1786269912.example.test",
+      "priority": 5,
+      "attempt": 1
+    },
+    {
+      "step": 3,
+      "t_offset_s": 0.019,
+      "url": "https://bulk-pr1786269912.example.test/p0",
+      "domain": "bulk-pr1786269912.example.test",
+      "priority": 10,
+      "attempt": 1
+    },
+    {
+      "step": 4,
+      "t_offset_s": 1.549,
+      "url": "https://urgent-pr1786269912.example.test/p1",
+      "domain": "urgent-pr1786269912.example.test",
+      "priority": 1,
+      "attempt": 1
+    },
+    {
+      "step": 5,
+      "t_offset_s": 1.555,
+      "url": "https://normal-pr1786269912.example.test/p1",
+      "domain": "normal-pr1786269912.example.test",
+      "priority": 5,
+      "attempt": 1
+    }
+  ],
+  "final_status_counts": {
+    "queued": 0,
+    "inflight": 0,
+    "retry_scheduled": 0,
+    "visited": 5,
+    "skipped": 0,
+    "failed_permanent": 0
+  },
+  "total_elapsed_s": 1.556016206741333
+}

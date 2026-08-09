@@ -1,0 +1,77 @@
+{
+  "run": {
+    "tool": "crash_recovery",
+    "timestamp": "2026-08-09T15:16:03"
+  },
+  "frontier": "redis",
+  "url": "https://bench-crash.example.test/url-1786268760",
+  "timeline": [
+    {
+      "t_offset_s": 0.036,
+      "event": "add_url",
+      "url": "https://bench-crash.example.test/url-1786268760"
+    },
+    {
+      "t_offset_s": 0.043,
+      "event": "worker_a_claimed",
+      "token": "bcb9122dfa35485ab98756de3954307f",
+      "attempt": 1
+    },
+    {
+      "t_offset_s": 0.043,
+      "event": "worker_a_killed (no completion, no renewal)"
+    },
+    {
+      "t_offset_s": 2.543,
+      "event": "lease_expired",
+      "waited_s": 2.5
+    },
+    {
+      "t_offset_s": 2.544,
+      "event": "recovery_sweep_1 (reclaim expired inflight -> retry_scheduled)",
+      "reclaimed": 1,
+      "requeued": 0
+    },
+    {
+      "t_offset_s": 3.244,
+      "event": "recovery_sweep_2 (promote due retry_scheduled -> domain queue)",
+      "reclaimed": 0,
+      "requeued": 1
+    },
+    {
+      "t_offset_s": 3.251,
+      "event": "worker_b_claimed",
+      "token": "3f59ad9717bd4f0fa63315cfb5a9568e",
+      "attempt": 2
+    },
+    {
+      "t_offset_s": 3.251,
+      "event": "worker_a_stale_mark_visited_attempted",
+      "rejected": true
+    },
+    {
+      "t_offset_s": 3.252,
+      "event": "worker_b_completed"
+    }
+  ],
+  "worker_a_claim": {
+    "token": "bcb9122dfa35485ab98756de3954307f",
+    "attempt": 1
+  },
+  "worker_b_claim": {
+    "token": "3f59ad9717bd4f0fa63315cfb5a9568e",
+    "attempt": 2
+  },
+  "stale_claim_correctly_rejected": true,
+  "recovery_reclaimed_count": 1,
+  "recovery_requeued_count": 1,
+  "final_status_counts": {
+    "queued": 0,
+    "inflight": 0,
+    "retry_scheduled": 0,
+    "visited": 1,
+    "skipped": 0,
+    "failed_permanent": 0
+  },
+  "outcome": "PASS"
+}

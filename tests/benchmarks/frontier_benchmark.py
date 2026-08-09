@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """Frontier throughput benchmark (local/SQLite vs Redis), single process.
 
-Measures insert throughput, claim throughput, completion throughput, claim
-and completion latency, and checks for duplicate successful claims -- all
-against a synthetic in-memory workload (no real HTTP fetching, per Step 6's
-scope: this validates the frontier, not the crawler).
+Measures insert throughput, claim throughput, completion throughput, checks
+for duplicate successful claims, and reports three distinct latencies --
+queue_wait (insertion -> successful claim, i.e. how long a URL sat waiting),
+claim_operation (the get_next_url() call itself), and completion_operation
+(the mark_visited() call itself) -- all against a synthetic in-memory
+workload (no real HTTP fetching, per Step 6's scope: this validates the
+frontier, not the crawler).
+
+Pass --no-rate-limit to disable per-domain rate limiting (rate_limit=0.0)
+for a pure frontier-throughput run that isn't capped by domain pacing.
 
 Workers are real OS threads calling the frontier's synchronous methods
 directly (the same execution boundary `AsyncFrontier` uses for Redis via
@@ -49,6 +55,9 @@ def parse_args() -> argparse.Namespace:
                    help="Simulated per-claim processing time in seconds (sleep before completing)")
     p.add_argument("--process-time-jitter", type=float, default=0.0,
                    help="+/- jitter applied to --process-time")
+    p.add_argument("--no-rate-limit", action="store_true",
+                   help="Disable per-domain rate limiting (overrides --rate-limit with 0.0) "
+                        "for a pure frontier-throughput run, unconstrained by domain pacing")
     p.add_argument("--poll-interval", type=float, default=0.01,
                    help="Sleep between get_next_url() polls when the frontier has pending work "
                         "but nothing eligible right now (rate-gated)")
@@ -66,6 +75,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.no_rate_limit:
+        args.rate_limit = 0.0
     rng = random.Random(args.seed)
 
     frontier = common.build_frontier(args.frontier, **common.frontier_kwargs_from_args(args))
@@ -88,9 +99,20 @@ def main() -> None:
     insert_elapsed = time.time() - insert_start
 
     # --- Phase 2: claim / process / complete ------------------------------
+    #
+    # Three distinct latencies are tracked, since they measure very
+    # different things and collapsing them is misleading (see README):
+    #   - queue_wait: URL insertion timestamp -> successful claim timestamp.
+    #     Dominated by how long a URL sat in the queue behind other work /
+    #     rate gates -- not the frontier's per-call cost.
+    #   - claim_operation: wall-clock time of the get_next_url() call itself
+    #     (immediately before -> immediately after it returns).
+    #   - completion_operation: wall-clock time of the mark_visited() call
+    #     itself (immediately before -> immediately after it returns).
     lock = threading.Lock()
-    claim_latencies: list[float] = []
-    completion_latencies: list[float] = []
+    queue_wait_latencies: list[float] = []
+    claim_operation_latencies: list[float] = []
+    completion_operation_latencies: list[float] = []
     success_counter: Counter[str] = Counter()
     claims_issued = 0
     failed_attempts = 0
@@ -101,7 +123,9 @@ def main() -> None:
         nonlocal claims_issued, failed_attempts
         idle_polls = 0
         while not stop_event.is_set():
+            op_start = time.time()
             claim = frontier.get_next_url()
+            op_end = time.time()
             if claim is None:
                 if not frontier.has_pending():
                     return
@@ -112,13 +136,14 @@ def main() -> None:
                 continue
             idle_polls = 0
 
-            claim_time = time.time()
+            claim_time = op_end
             with lock:
                 claims_issued += 1
                 unique_urls_claimed.add(claim.url)
+                claim_operation_latencies.append(op_end - op_start)
                 t0 = insert_times.get(claim.url)
                 if t0 is not None:
-                    claim_latencies.append(claim_time - t0)
+                    queue_wait_latencies.append(claim_time - t0)
 
             if args.process_time > 0 or args.process_time_jitter > 0:
                 jitter = random.uniform(-args.process_time_jitter, args.process_time_jitter)
@@ -129,12 +154,12 @@ def main() -> None:
                 with lock:
                     failed_attempts += 1
             else:
+                comp_start = time.time()
                 frontier.mark_visited(claim)
-                done_time = time.time()
+                comp_end = time.time()
                 with lock:
                     success_counter[claim.url] += 1
-                    if t0 is not None:
-                        completion_latencies.append(done_time - t0)
+                    completion_operation_latencies.append(comp_end - comp_start)
 
     redis_conn = getattr(frontier, "redis_conn", None)
     monitor = common.ResourceMonitor(redis_conn=redis_conn, interval=args.monitor_interval)
@@ -167,6 +192,7 @@ def main() -> None:
             "domains": args.domains,
             "priority_distribution": args.priority_distribution,
             "rate_limit": args.rate_limit,
+            "no_rate_limit": args.no_rate_limit,
             "lease_ttl": args.lease_ttl,
             "max_retries": args.max_retries,
             "process_time_s": args.process_time,
@@ -189,8 +215,9 @@ def main() -> None:
             "claims_per_sec": (claims_issued / run_elapsed) if run_elapsed > 0 else None,
             "completions_per_sec": (total_successes / run_elapsed) if run_elapsed > 0 else None,
         },
-        "claim_latency": common.latency_stats(claim_latencies),
-        "completion_latency": common.latency_stats(completion_latencies),
+        "queue_wait_latency": common.latency_stats(queue_wait_latencies),
+        "claim_operation_latency": common.latency_stats(claim_operation_latencies),
+        "completion_operation_latency": common.latency_stats(completion_operation_latencies),
         "final_status_counts": status_counts,
         "resource_usage": monitor.summary(),
         "total_runtime_s": insert_elapsed + run_elapsed,

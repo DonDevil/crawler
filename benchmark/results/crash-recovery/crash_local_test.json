@@ -1,0 +1,49 @@
+{
+  "run": {
+    "tool": "crash_recovery",
+    "timestamp": "2026-08-09T15:19:27"
+  },
+  "frontier": "local",
+  "url": "https://bench-crash.example.test/url-1786268964",
+  "timeline": [
+    {
+      "t_offset_s": 0.034,
+      "event": "add_url",
+      "url": "https://bench-crash.example.test/url-1786268964"
+    },
+    {
+      "t_offset_s": 0.04,
+      "event": "worker_a_claimed",
+      "token": "022c5cc500a04b57b9f2658090900da6",
+      "attempt": 1
+    },
+    {
+      "t_offset_s": 0.04,
+      "event": "worker_a_killed (no completion, no renewal)"
+    },
+    {
+      "t_offset_s": 2.54,
+      "event": "lease_would_have_expired -- but the local frontier has no lease-expiry reclaim path in-process (ADR \u00a710): a crashed local worker's claim is never recovered, since a process crash takes all in-memory state with it"
+    },
+    {
+      "t_offset_s": 2.54,
+      "event": "worker_b_get_next_url",
+      "got_claim": false
+    }
+  ],
+  "worker_a_claim": {
+    "token": "022c5cc500a04b57b9f2658090900da6",
+    "attempt": 1
+  },
+  "worker_b_claim": null,
+  "final_status_counts": {
+    "queued": 0,
+    "inflight": 1,
+    "retry_scheduled": 0,
+    "visited": 0,
+    "skipped": 0,
+    "failed_permanent": 0
+  },
+  "outcome": "EXPECTED (no recovery mechanism exists for the local frontier by design)",
+  "note": "This is not a bug: docs/architecture/frontier-adr.md \u00a710 explicitly scopes crash recovery to the Redis backend only. Use --frontier redis to see recovery."
+}

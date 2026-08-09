@@ -1,0 +1,106 @@
+{
+  "run": {
+    "tool": "frontier_benchmark",
+    "timestamp": "2026-08-09T14:20:30",
+    "frontier": "redis"
+  },
+  "config": {
+    "urls": 20000,
+    "workers": 4,
+    "duration_s": 60.0,
+    "retry_rate": 0.0,
+    "domains": 40,
+    "priority_distribution": "fixed:10",
+    "rate_limit": 0.0,
+    "no_rate_limit": true,
+    "lease_ttl": 90.0,
+    "max_retries": 3,
+    "process_time_s": 0.0,
+    "namespace": "bench",
+    "redis_db": 2
+  },
+  "insert": {
+    "attempted": 20000,
+    "inserted": 20000,
+    "elapsed_s": 144.7479763031006,
+    "urls_per_sec": 138.1711890611875
+  },
+  "claim_and_complete": {
+    "elapsed_s": 60.01480555534363,
+    "claims_issued": 7232,
+    "unique_urls_claimed": 7232,
+    "successful_completions": 7232,
+    "duplicate_successful_claims": 0,
+    "failed_attempts": 0,
+    "claims_per_sec": 120.50359795518946,
+    "completions_per_sec": 120.50359795518946
+  },
+  "queue_wait_latency": {
+    "count": 7232,
+    "min_s": 144.73285627365112,
+    "max_s": 152.9029004573822,
+    "mean_s": 148.90986516702492,
+    "p50_s": 148.96061837673187,
+    "p90_s": 151.98295016288756,
+    "p99_s": 152.7991028213501
+  },
+  "claim_operation_latency": {
+    "count": 7232,
+    "min_s": 0.005810976028442383,
+    "max_s": 0.17106842994689941,
+    "mean_s": 0.027698696154145015,
+    "p50_s": 0.028117060661315918,
+    "p90_s": 0.04126513004302979,
+    "p99_s": 0.05798996686935423
+  },
+  "completion_operation_latency": {
+    "count": 7232,
+    "min_s": 0.0001049041748046875,
+    "max_s": 0.030973196029663086,
+    "mean_s": 0.005486673156244565,
+    "p50_s": 0.00574493408203125,
+    "p90_s": 0.011891460418701172,
+    "p99_s": 0.02256596326828002
+  },
+  "final_status_counts": {
+    "queued": 12768,
+    "inflight": 0,
+    "retry_scheduled": 0,
+    "visited": 7232,
+    "skipped": 0,
+    "failed_permanent": 0
+  },
+  "resource_usage": {
+    "process_cpu_percent": {
+      "min": 0.0,
+      "max": 109.4,
+      "avg": 101.29385964912281
+    },
+    "process_rss_mb": {
+      "min": 48.42578125,
+      "max": 53.0546875,
+      "avg": 51.773094846491226
+    },
+    "redis_connected_clients": {
+      "min": 1,
+      "max": 5,
+      "avg": 4.850877192982456
+    },
+    "redis_used_cpu_sys": {
+      "min": 12.4613,
+      "max": 12.757323,
+      "avg": 12.598896210526314
+    },
+    "redis_used_cpu_user": {
+      "min": 19.561129,
+      "max": 20.173866,
+      "avg": 19.881898657894737
+    },
+    "redis_used_memory_mb": {
+      "min": 29.70764923095703,
+      "max": 31.552825927734375,
+      "avg": 30.658049131694593
+    }
+  },
+  "total_runtime_s": 204.7627818584442
+}

@@ -1,0 +1,67 @@
+{
+  "run": {
+    "tool": "heartbeat_endurance",
+    "timestamp": "2026-08-09T15:27:52"
+  },
+  "scenarios": [
+    {
+      "scenario": "heartbeat_enabled",
+      "url": "https://bench-heartbeat.example.test/enabled-1786269452",
+      "config": {
+        "work_duration_s": 10.0,
+        "lease_ttl_s": 3.0,
+        "heartbeat_interval_s": 1.0,
+        "recovery_interval_s": 0.5
+      },
+      "work_elapsed_s": 10.002698183059692,
+      "claim_lost_mid_work": false,
+      "recovery_sweep_log": [],
+      "reclaimed_at_any_point": false,
+      "final_mark_visited_took_effect": true,
+      "final_status_counts": {
+        "queued": 0,
+        "inflight": 0,
+        "retry_scheduled": 0,
+        "visited": 1,
+        "skipped": 0,
+        "failed_permanent": 0
+      },
+      "matches_expected_behavior": true
+    },
+    {
+      "scenario": "heartbeat_disabled",
+      "url": "https://bench-heartbeat.example.test/disabled-1786269462",
+      "config": {
+        "work_duration_s": 10.0,
+        "lease_ttl_s": 3.0,
+        "heartbeat_interval_s": 1.0,
+        "recovery_interval_s": 0.5
+      },
+      "work_elapsed_s": 10.002003908157349,
+      "claim_lost_mid_work": false,
+      "recovery_sweep_log": [
+        {
+          "t": 1786269465.6381102,
+          "reclaimed": 1,
+          "requeued": 0
+        },
+        {
+          "t": 1786269466.1395345,
+          "reclaimed": 0,
+          "requeued": 1
+        }
+      ],
+      "reclaimed_at_any_point": true,
+      "final_mark_visited_took_effect": false,
+      "final_status_counts": {
+        "queued": 1,
+        "inflight": 0,
+        "retry_scheduled": 0,
+        "visited": 0,
+        "skipped": 0,
+        "failed_permanent": 0
+      },
+      "matches_expected_behavior": true
+    }
+  ]
+}
