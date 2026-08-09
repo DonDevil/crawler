@@ -58,12 +58,22 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _worker_main(worker_id: int, frontier_kwargs: dict, args_dict: dict, result_path: str) -> None:
+def _worker_main(
+    worker_id: int, frontier_kwargs: dict, args_dict: dict, result_path: str, blacklist_path: str
+) -> None:
     """Entry point for one independent worker process. Builds its own
     frontier connection (never shares one with the coordinator or siblings)
     and runs an isolated claim/complete loop, then writes its results as
-    JSON to `result_path` for the coordinator to aggregate."""
+    JSON to `result_path` for the coordinator to aggregate.
 
+    `get_next_url()` re-checks the blacklist on every claim (see
+    core/redis_frontier.py), so this process must point `URLUtils` at the
+    same isolated blacklist file the coordinator used -- passed explicitly
+    rather than relied upon via fork inheritance, so this is correct
+    regardless of the multiprocessing start method.
+    """
+
+    common.URLUtils.set_blacklist_path(blacklist_path)
     frontier = common.build_frontier("redis", **frontier_kwargs)
 
     claims_issued = 0
@@ -110,6 +120,8 @@ def main() -> None:
     args = parse_args()
     rng = random.Random(args.seed)
 
+    blacklist_path = str(common.isolate_blacklist())
+
     coordinator_kwargs = common.frontier_kwargs_from_args(args)
     frontier = common.build_frontier("redis", **coordinator_kwargs)
     if not args.no_clear:
@@ -144,7 +156,7 @@ def main() -> None:
             procs = [
                 multiprocessing.Process(
                     target=_worker_main,
-                    args=(i, coordinator_kwargs, worker_args, result_paths[i]),
+                    args=(i, coordinator_kwargs, worker_args, result_paths[i], blacklist_path),
                 )
                 for i in range(args.workers)
             ]

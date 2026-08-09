@@ -79,6 +79,8 @@ def main() -> None:
         args.rate_limit = 0.0
     rng = random.Random(args.seed)
 
+    common.isolate_blacklist()
+
     frontier = common.build_frontier(args.frontier, **common.frontier_kwargs_from_args(args))
     if not args.no_clear:
         frontier.clear()

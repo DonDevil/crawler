@@ -13,10 +13,12 @@ constructors, generates synthetic workloads, and reports results.
 
 from __future__ import annotations
 
+import atexit
 import csv
 import json
 import math
 import os
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -30,6 +32,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from core.redis_frontier import RedisURLFrontier  # noqa: E402
 from core.url_frontier import URLFrontier  # noqa: E402
+from utils.url_utils import URLUtils  # noqa: E402
 
 try:
     import psutil
@@ -137,11 +140,51 @@ def frontier_kwargs_from_args(args) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Blacklist isolation
+# ---------------------------------------------------------------------------
+#
+# `URLUtils.is_blacklisted()`/`clean_url()` (called by every `Frontier.add_url()`
+# and `get_next_url()`) default to reading/writing the production
+# `datasets/domain_blacklist.txt`. Synthetic benchmark URLs must never be
+# checked against -- or ever able to pollute -- that file. See
+# docs/architecture/benchmark_bug_audit.md for the incident this fixes.
+
+def isolate_blacklist(directory: Optional[str] = None) -> Path:
+    """Point `URLUtils` at a fresh, empty, temporary blacklist file for the
+    remainder of this process. Must be called before any frontier workload
+    is built (frontier construction itself doesn't touch the blacklist, but
+    `add_url()`/`get_next_url()` do). Never touches the production
+    `datasets/domain_blacklist.txt`.
+
+    Returns the isolated file's path so it can be forwarded to worker
+    processes that build their own frontier connection (multiprocessing's
+    default fork start method on Linux would already inherit this via the
+    `URLUtils` class attribute, but passing it explicitly doesn't rely on
+    that and works under 'spawn' too).
+    """
+
+    fd, path_str = tempfile.mkstemp(prefix="bench_blacklist_", suffix=".txt", dir=directory)
+    os.close(fd)
+    path = Path(path_str)
+    path.write_text("", encoding="utf-8")  # must start empty for every run
+    URLUtils.set_blacklist_path(str(path))
+    atexit.register(lambda: path.unlink(missing_ok=True))
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Synthetic workload generation
 # ---------------------------------------------------------------------------
 
-def make_domains(domain_count: int, prefix: str = "bench") -> list[str]:
-    return [f"{prefix}{i}.example.test" for i in range(domain_count)]
+def make_domains(domain_count: int, prefix: str = "bench", run_id: str = "") -> list[str]:
+    """`run_id`, when given, is embedded in every domain name so synthetic
+    domains from one run can never collide with a stale blacklist entry (or
+    leftover frontier state) from a previous run -- see
+    docs/architecture/benchmark_bug_audit.md. Matches the per-run-unique
+    naming approach `priority_ratelimit.py` already used."""
+
+    tag = f"{prefix}-{run_id}" if run_id else prefix
+    return [f"{tag}{i}.example.test" for i in range(domain_count)]
 
 
 def parse_priority_distribution(spec: str) -> Callable[["random.Random"], int]:
@@ -188,10 +231,12 @@ def make_synthetic_urls(
     domain_prefix: str = "bench",
 ) -> list[tuple[str, int]]:
     """Generate `count` synthetic (url, priority) pairs spread round-robin
-    across `domain_count` distinct domains. `run_id` disambiguates URLs
-    across repeated runs against the same un-cleared namespace."""
+    across `domain_count` distinct domains. `run_id` disambiguates both URLs
+    and domain names across repeated runs (so a stale blacklist entry or
+    leftover frontier state from a prior run can never collide with this
+    one -- see docs/architecture/benchmark_bug_audit.md)."""
 
-    domains = make_domains(domain_count, prefix=domain_prefix)
+    domains = make_domains(domain_count, prefix=domain_prefix, run_id=run_id)
     urls = []
     for i in range(count):
         domain = domains[i % max(1, domain_count)]
