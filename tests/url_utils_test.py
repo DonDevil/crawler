@@ -125,3 +125,103 @@ def test_should_queue_link_rejects_adult_cross_domain_targets():
         "https://piracy-site.example/watch/movie",
         "https://adult-xxx-videos.com/sex/clip",
     ) is False
+
+
+def test_missing_blacklist_file_is_created(tmp_path):
+    blacklist_path = tmp_path / "nested" / "domain_blacklist.txt"
+    assert not blacklist_path.exists()
+
+    original_path = URLUtils._blacklist_path
+    original_enabled = URLUtils._blacklist_enabled
+
+    try:
+        URLUtils.set_blacklist_path(str(blacklist_path))
+        URLUtils.set_blacklist_enabled(True)
+
+        assert blacklist_path.exists()
+    finally:
+        URLUtils.set_blacklist_path(str(original_path))
+        URLUtils.set_blacklist_enabled(original_enabled)
+
+
+def test_checking_blacklist_does_not_modify_existing_file(tmp_path):
+    blacklist_path = tmp_path / "domain_blacklist.txt"
+    blacklist_path.write_text("blocked.example\n", encoding="utf-8")
+
+    original_path = URLUtils._blacklist_path
+    original_enabled = URLUtils._blacklist_enabled
+
+    try:
+        URLUtils.set_blacklist_path(str(blacklist_path))
+        URLUtils.set_blacklist_enabled(True)
+
+        # Seed once so any first-touch bookkeeping (default seeding) settles.
+        URLUtils.is_blacklisted("https://harmless.example/page")
+        mtime_before = blacklist_path.stat().st_mtime_ns
+        content_before = blacklist_path.read_text(encoding="utf-8")
+
+        for _ in range(20):
+            URLUtils.is_blacklisted("https://harmless.example/page")
+            URLUtils.is_blacklisted("https://blocked.example/other")
+
+        assert blacklist_path.stat().st_mtime_ns == mtime_before
+        assert blacklist_path.read_text(encoding="utf-8") == content_before
+    finally:
+        URLUtils.set_blacklist_path(str(original_path))
+        URLUtils.set_blacklist_enabled(original_enabled)
+
+
+def test_repeated_is_blacklisted_calls_do_not_force_file_reload(tmp_path, monkeypatch):
+    blacklist_path = tmp_path / "domain_blacklist.txt"
+    blacklist_path.write_text("blocked.example\n", encoding="utf-8")
+
+    original_path = URLUtils._blacklist_path
+    original_enabled = URLUtils._blacklist_enabled
+    real_open = open
+
+    read_calls = {"count": 0}
+
+    def counting_open(file, mode="r", *args, **kwargs):
+        if str(file) == str(blacklist_path) and "r" in mode and "+" not in mode:
+            read_calls["count"] += 1
+        return real_open(file, mode, *args, **kwargs)
+
+    try:
+        URLUtils.set_blacklist_path(str(blacklist_path))
+        URLUtils.set_blacklist_enabled(True)
+
+        # Let default-domain seeding (and its own reload) settle before counting,
+        # so the cache is already warm when we start measuring.
+        URLUtils.is_blacklisted("https://harmless.example/page")
+
+        monkeypatch.setattr("utils.url_utils.open", counting_open, raising=False)
+
+        for _ in range(10):
+            URLUtils.is_blacklisted("https://harmless.example/page")
+            URLUtils.is_blacklisted("https://blocked.example/other")
+
+        assert read_calls["count"] == 0
+    finally:
+        URLUtils.set_blacklist_path(str(original_path))
+        URLUtils.set_blacklist_enabled(original_enabled)
+
+
+def test_actual_blacklist_file_modification_is_detected_and_reloaded(tmp_path):
+    blacklist_path = tmp_path / "domain_blacklist.txt"
+    blacklist_path.write_text("", encoding="utf-8")
+
+    original_path = URLUtils._blacklist_path
+    original_enabled = URLUtils._blacklist_enabled
+
+    try:
+        URLUtils.set_blacklist_path(str(blacklist_path))
+        URLUtils.set_blacklist_enabled(True)
+
+        assert URLUtils.is_blacklisted("https://sub.newly-blocked.example/page") is False
+
+        blacklist_path.write_text("newly-blocked.example\n", encoding="utf-8")
+
+        assert URLUtils.is_blacklisted("https://sub.newly-blocked.example/page") is True
+    finally:
+        URLUtils.set_blacklist_path(str(original_path))
+        URLUtils.set_blacklist_enabled(original_enabled)

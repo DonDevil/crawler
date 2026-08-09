@@ -251,6 +251,8 @@ class URLUtils:
 
     @classmethod
     def _ensure_blacklist_file_exists(cls) -> None:
+        if cls._blacklist_path.exists():
+            return
         cls._blacklist_path.parent.mkdir(parents=True, exist_ok=True)
         cls._blacklist_path.touch(exist_ok=True)
 
