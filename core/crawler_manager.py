@@ -128,6 +128,7 @@ class CrawlerManager:
             "scrapling_headless": self.config.crawler.scrapling_headless,
             "scrapling_stealth": self.config.crawler.scrapling_stealth,
             "scrapling_network_idle": self.config.crawler.scrapling_network_idle,
+            "heartbeat_interval": frontier_config.heartbeat_interval,
         }
 
         hybrid_args = dict(crawler_args)

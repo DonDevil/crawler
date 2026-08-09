@@ -27,6 +27,14 @@ crawler:
     recovery_interval: 30.0
     reclaim_batch_size: 200
     domain_scan_limit: 50
+    # Claim heartbeat (core/claim_heartbeat.py): lets a worker still
+    # legitimately fetching a URL renew its claim instead of losing it to
+    # lease expiry. Leave unset (null) to auto-derive a safe interval from
+    # lease_ttl above (lease_ttl / 3, so a live worker gets two renewal
+    # attempts of margin before its lease could lapse). Only set this to
+    # override that default -- it is always clamped below lease_ttl no
+    # matter what's configured here.
+    #heartbeat_interval: null
   seed_files:
     - "seeds/piracy_sites.txt"
     - "seeds/torrent_sites.txt"

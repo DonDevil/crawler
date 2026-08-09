@@ -8,6 +8,7 @@ from typing import Optional
 import httpx
 from loguru import logger
 
+from core.claim_heartbeat import ClaimLostError, resolve_heartbeat_interval, run_with_heartbeat
 from core.frontier import Frontier, FrontierClaim
 from core.frontier_executor import AsyncFrontier
 from parsers.streaming_manifest_parser import StreamingManifestParser
@@ -30,6 +31,7 @@ class HTTPCrawler:
 		user_agent: Optional[str] = None,
 		url_database: Optional[URLDatabase] = None,
 		media_database=None,
+		heartbeat_interval: Optional[float] = None,
 	):
 		self.frontier = AsyncFrontier(frontier)
 		self.parser = parser
@@ -37,6 +39,9 @@ class HTTPCrawler:
 		self.timeout = timeout
 		self.max_retries = max_retries
 		self.max_pages = max_pages
+		self.heartbeat_interval = resolve_heartbeat_interval(
+			heartbeat_interval, getattr(getattr(frontier, "raw", frontier), "lease_ttl", None)
+		)
 		self.user_agent = user_agent
 		self.url_database = url_database
 		self.media_database = media_database
@@ -129,7 +134,9 @@ class HTTPCrawler:
 				if self.url_database:
 					self.url_database.add_url(url, status="pending")
 
-				html, failure_reason = await self.fetch(client, url)
+				(html, failure_reason), claim = await run_with_heartbeat(
+					self.frontier, claim, self.fetch(client, url), self.heartbeat_interval
+				)
 				status = "visited"
 
 				if html and self.parser:
@@ -180,6 +187,12 @@ class HTTPCrawler:
 				if claim is not None:
 					await self.frontier.mark_failed(claim, "worker cancelled")
 				raise
+			except ClaimLostError:
+				logger.warning(
+					f"Claim lost for {url}: lease was reclaimed before this worker "
+					"finished (crashed-worker recovery or another owner); abandoning "
+					"without marking completion"
+				)
 			except Exception as exc:
 				logger.error(f"Worker error for {url}: {exc}")
 				if claim is not None:

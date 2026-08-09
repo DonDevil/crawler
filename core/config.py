@@ -66,6 +66,16 @@ class FrontierConfig(BaseModel):
     reclaim_batch_size: int = 200
     domain_scan_limit: int = 50
 
+    # Claim heartbeat (docs/architecture/frontier-adr.md §8, Step 5): lets a
+    # worker that's still legitimately fetching a URL renew its claim so it
+    # isn't reclaimed as if it had crashed. None (the default) derives a safe
+    # interval from lease_ttl automatically (core.claim_heartbeat.
+    # default_heartbeat_interval) -- only set this explicitly to override
+    # that default, and note it is always clamped below lease_ttl regardless
+    # of what's configured here (a heartbeat interval >= lease_ttl would let
+    # the lease expire before the first renewal could ever land).
+    heartbeat_interval: Optional[float] = None
+
 
 class SearchConfig(BaseModel):
     enabled_engines: List[str] = Field(default_factory=lambda: [

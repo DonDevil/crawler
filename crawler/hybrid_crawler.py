@@ -11,6 +11,7 @@ import httpx
 from aiohttp_socks import ProxyConnector
 from loguru import logger
 
+from core.claim_heartbeat import ClaimLostError, resolve_heartbeat_interval, run_with_heartbeat
 from core.crawler_router import CrawlerRouter
 from core.frontier import Frontier, FrontierClaim
 from core.frontier_executor import AsyncFrontier
@@ -44,6 +45,7 @@ class HybridCrawler:
         scrapling_headless: bool = True,
         scrapling_stealth: bool = True,
         scrapling_network_idle: bool = True,
+        heartbeat_interval: Optional[float] = None,
     ):
         self.frontier = AsyncFrontier(frontier)
         self.parser = parser
@@ -51,6 +53,9 @@ class HybridCrawler:
         self.timeout = timeout
         self.max_retries = max_retries
         self.max_pages = max_pages
+        self.heartbeat_interval = resolve_heartbeat_interval(
+            heartbeat_interval, getattr(getattr(frontier, "raw", frontier), "lease_ttl", None)
+        )
         self.user_agent = user_agent
         self.url_database = url_database
         self.media_database = media_database
@@ -97,6 +102,7 @@ class HybridCrawler:
             "user_agent": self.user_agent,
             "url_database": self.url_database,
             "media_database": self.media_database,
+            "heartbeat_interval": self.heartbeat_interval,
         }
         self._async_engine = AsyncCrawler(**common_args)
         self._http_engine = HTTPCrawler(**common_args)
@@ -205,6 +211,64 @@ class HybridCrawler:
 
         return merged
 
+    async def _run_engine_plan(self, url: str) -> tuple[Optional[str], Optional[str], list[str], str]:
+        """Run the full engine-escalation chain for one claim's URL.
+
+        A single claim can legitimately span several engine attempts
+        (async -> playwright -> selenium, etc.) before a final outcome is
+        known -- this whole chain is the unit of work wrapped by the claim
+        heartbeat in `worker()`, not each individual engine fetch, matching
+        the ADR's guidance that escalation must not surface as a
+        frontier-level failure/new claim mid-chain.
+        """
+        plan = list(self.router.get_engine_plan(url))
+        attempted: set[str] = set()
+        attempt_chain: list[str] = []
+        html: Optional[str] = None
+        failure_reason: Optional[str] = None
+        engine_used = "unknown"
+
+        while plan:
+            engine_used = plan.pop(0)
+            if engine_used in attempted:
+                continue
+
+            attempted.add(engine_used)
+            attempt_chain.append(engine_used)
+            html, failure_reason = await self._fetch_with_engine(engine_used, url)
+
+            if html:
+                if engine_used in {"async", "http"} and self.router.needs_browser_upgrade(url, html=html):
+                    failure_reason = "Content requires browser rendering"
+                    html = None
+                    plan = self._prepend_unique(
+                        plan,
+                        self.router.get_engine_plan(
+                            url,
+                            current_engine=engine_used,
+                            failure_reason=failure_reason,
+                        ),
+                        attempted,
+                    )
+                    if plan:
+                        logger.info(f"Escalating {url} from {engine_used} to {plan[0]}: {failure_reason}")
+                    continue
+                break
+
+            plan = self._prepend_unique(
+                plan,
+                self.router.get_engine_plan(
+                    url,
+                    current_engine=engine_used,
+                    failure_reason=failure_reason,
+                ),
+                attempted,
+            )
+            if plan:
+                logger.info(f"Escalating {url} from {engine_used} to {plan[0]}: {failure_reason}")
+
+        return html, failure_reason, attempt_chain, engine_used
+
     async def worker(self):
         while not self._stop_event.is_set():
             claim = await self.queue.get()
@@ -225,51 +289,9 @@ class HybridCrawler:
                 if self.url_database:
                     self.url_database.add_url(url, status="pending")
 
-                plan = list(self.router.get_engine_plan(url))
-                attempted: set[str] = set()
-                attempt_chain: list[str] = []
-                html: Optional[str] = None
-                failure_reason: Optional[str] = None
-                engine_used = "unknown"
-
-                while plan:
-                    engine_used = plan.pop(0)
-                    if engine_used in attempted:
-                        continue
-
-                    attempted.add(engine_used)
-                    attempt_chain.append(engine_used)
-                    html, failure_reason = await self._fetch_with_engine(engine_used, url)
-
-                    if html:
-                        if engine_used in {"async", "http"} and self.router.needs_browser_upgrade(url, html=html):
-                            failure_reason = "Content requires browser rendering"
-                            html = None
-                            plan = self._prepend_unique(
-                                plan,
-                                self.router.get_engine_plan(
-                                    url,
-                                    current_engine=engine_used,
-                                    failure_reason=failure_reason,
-                                ),
-                                attempted,
-                            )
-                            if plan:
-                                logger.info(f"Escalating {url} from {engine_used} to {plan[0]}: {failure_reason}")
-                            continue
-                        break
-
-                    plan = self._prepend_unique(
-                        plan,
-                        self.router.get_engine_plan(
-                            url,
-                            current_engine=engine_used,
-                            failure_reason=failure_reason,
-                        ),
-                        attempted,
-                    )
-                    if plan:
-                        logger.info(f"Escalating {url} from {engine_used} to {plan[0]}: {failure_reason}")
+                (html, failure_reason, attempt_chain, engine_used), claim = await run_with_heartbeat(
+                    self.frontier, claim, self._run_engine_plan(url), self.heartbeat_interval
+                )
 
                 status = "visited"
                 if html and self.parser:
@@ -326,6 +348,12 @@ class HybridCrawler:
                 if claim is not None:
                     await self.frontier.mark_failed(claim, "worker cancelled")
                 raise
+            except ClaimLostError:
+                logger.warning(
+                    f"Claim lost for {url}: lease was reclaimed before this worker "
+                    "finished (crashed-worker recovery or another owner); abandoning "
+                    "without marking completion"
+                )
             except Exception as exc:
                 logger.error(f"Worker error for {url}: {exc}")
                 if claim is not None:

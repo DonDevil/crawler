@@ -1,5 +1,7 @@
 """Tests for hybrid crawler routing and execution."""
 
+import asyncio
+
 import pytest
 from aiohttp import web
 
@@ -155,3 +157,58 @@ async def test_hybrid_crawler_marks_failed_once_after_exhausting_engine_escalati
     counts = frontier.get_status_counts()
     assert counts["inflight"] == 0
     assert counts["failed_permanent"] == 1
+
+
+@pytest.mark.asyncio
+async def test_hybrid_crawler_heartbeat_spans_full_engine_escalation_chain(monkeypatch):
+    """A single claim can span several engine attempts (async -> scrapling
+    -> ...) before a final outcome is known -- the heartbeat must wrap the
+    whole escalation chain, not just the first engine's fetch, and stop
+    once the chain resolves (docs/architecture/frontier-adr.md §11)."""
+    from crawler.hybrid_crawler import HybridCrawler
+
+    call_log: list[str] = []
+
+    async def escalating_fetch(self, engine_name, url):
+        call_log.append(engine_name)
+        await asyncio.sleep(0.12)
+        if engine_name == "async":
+            return None, "not a robot"  # forces escalation to scrapling/playwright/...
+        return "<html><body>ok</body></html>", None
+
+    monkeypatch.setattr(HybridCrawler, "_fetch_with_engine", escalating_fetch)
+
+    frontier = URLFrontier(rate_limit=0, lease_ttl=0.1, max_retries=1, base_backoff=0, max_backoff=0)
+    frontier.add_url("https://example.com/escalates")
+
+    renew_calls = []
+    original_renew = frontier.renew_claim
+
+    def spy(claim):
+        renew_calls.append(claim)
+        return original_renew(claim)
+
+    frontier.renew_claim = spy
+
+    crawler = HybridCrawler(
+        frontier=frontier,
+        parser=HTMLLinkExtractor(),
+        concurrency=1,
+        max_pages=1,
+        timeout=5,
+        max_retries=1,
+        scrapling_enabled=True,
+    )
+    assert crawler.heartbeat_interval < 0.1
+
+    await crawler.run()
+
+    assert "https://example.com/escalates" in frontier.visited
+    assert len(call_log) >= 2, "expected escalation across more than one engine"
+    assert len(renew_calls) >= 1, (
+        "heartbeat should have renewed at least once across the whole escalation chain"
+    )
+
+    calls_at_finish = len(renew_calls)
+    await asyncio.sleep(0.3)
+    assert len(renew_calls) == calls_at_finish, "heartbeat kept renewing after the chain resolved"
