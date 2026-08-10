@@ -5,10 +5,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 from core.config import load_config
 from core.crawler_manager import CrawlerManager, build_media_evidence_store
 from storage.media_evidence_store import FingerprintResult
+
+_REPO_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(_REPO_ROOT / "tests"))
+sys.path.insert(0, str(_REPO_ROOT / "tests" / "benchmarks"))
 
 
 def main() -> None:
@@ -121,6 +130,27 @@ def main() -> None:
         action="store_true",
         help="Use only dark-web search engines for query discovery.",
     )
+    parser.add_argument(
+        "--monitor-resources",
+        action="store_true",
+        help="Sample process CPU/RSS (and Redis INFO, if using the Redis frontier) on a "
+        "background thread for the duration of the run, using the same "
+        "tests/benchmarks/common.py:ResourceMonitor the benchmark suite uses, and include the "
+        "results in the run report. Lightweight periodic sampling only -- never scans Redis "
+        "keys, never blocks the crawler's event loop.",
+    )
+    parser.add_argument(
+        "--monitor-interval",
+        type=float,
+        default=10.0,
+        help="Seconds between resource samples when --monitor-resources is set (default %(default)s).",
+    )
+    parser.add_argument(
+        "--output",
+        help="Write a machine-readable JSON run report to this path when the crawl finishes "
+        "(counts, timing, throughput, resources, Redis stats, run configuration). "
+        "See tests/report_lib.py for the schema.",
+    )
 
     args = parser.parse_args()
 
@@ -188,7 +218,134 @@ def main() -> None:
 
         configure_logging("DEBUG")
 
-    asyncio.run(manager.run())
+    if not args.monitor_resources and not args.output:
+        # No reporting requested -- run exactly as before, with zero added
+        # overhead (no monitor thread, no post-run Redis/SQLite reconnect).
+        asyncio.run(manager.run())
+        return
+
+    monitor = None
+    if args.monitor_resources:
+        from common import ResourceMonitor  # tests/benchmarks/common.py
+
+        redis_conn = getattr(manager.frontier, "redis_conn", None)
+        monitor = ResourceMonitor(redis_conn=redis_conn, interval=args.monitor_interval, include_children=True)
+
+    # The frontier actually constructed may differ from config.yaml's
+    # crawler.frontier.type: CrawlerManager falls back redis -> sqlite at
+    # construction time if Redis was unreachable (core/crawler_manager.py).
+    backend = "redis" if type(manager.frontier).__name__ == "RedisURLFrontier" else "sqlite"
+    frontier_cfg = manager.config.crawler.frontier
+
+    crawl_mode = "unfinished" if args.unfinished else "query-only" if args.query_only else "seeds+query"
+    query_scope = "surface-web" if args.surface_web else "dark-web" if args.dark_web else None
+
+    search_engines = None
+    if args.queries:
+        from discovery.search_engine_discovery import get_engine_names_for_scope
+
+        search_engines = get_engine_names_for_scope(query_scope, manager.config.search.enabled_engines)
+
+    seed_files = (
+        list(manager.config.crawler.seed_files) + (args.seed_files or [])
+        if not args.query_only and not args.unfinished
+        else None
+    )
+
+    start_dt = datetime.now(timezone.utc)
+    start_monotonic = time.monotonic()
+
+    if monitor is not None:
+        monitor.__enter__()
+    try:
+        asyncio.run(manager.run())
+    finally:
+        if monitor is not None:
+            monitor.__exit__(None, None, None)
+
+    end_dt = datetime.now(timezone.utc)
+    duration_seconds = max(time.monotonic() - start_monotonic, 0.0)
+
+    import report_lib  # tests/report_lib.py
+
+    worker_count = getattr(manager._crawler, "concurrency", manager.config.crawler.concurrency)
+    max_pages_effective = getattr(manager._crawler, "max_pages", manager.config.crawler.max_pages)
+
+    metadata = {
+        "generated_at": report_lib.now_iso(),
+        "backend": backend,
+        "redis": (
+            {
+                "host": frontier_cfg.redis_host,
+                "port": frontier_cfg.redis_port,
+                "db": frontier_cfg.redis_db,
+                "namespace": frontier_cfg.redis_namespace,
+            }
+            if backend == "redis"
+            else None
+        ),
+        "sqlite_path": manager.config.crawler.storage.sqlite_path if backend == "sqlite" else None,
+        "worker_count": worker_count,
+        "crawl_engine": manager.crawl_engine,
+        "search_engines": search_engines,
+        "query_scope": query_scope,
+        "queries": args.queries,
+        "seed_files": seed_files,
+        "crawl_mode": crawl_mode,
+        "max_pages": max_pages_effective,
+        "indefinite_run": bool(args.indefinite_run),
+        "rate_limit": manager.config.crawler.rate_limit,
+        "note": (
+            "backend reflects the frontier actually constructed for this run, which can differ "
+            "from config.yaml's crawler.frontier.type if Redis was unreachable at startup and the "
+            "crawler fell back to SQLite -- see core/crawler_manager.py."
+        ),
+    }
+
+    timing = {
+        "start": start_dt.isoformat(),
+        "end": end_dt.isoformat(),
+        "duration_seconds": duration_seconds,
+        "source": "process-wall-clock",
+        "note": (
+            "Actual wall-clock start (immediately before manager.run()) and end (immediately after "
+            "it returned) of this process -- not derived from URL timestamps."
+        ),
+    }
+
+    if backend == "redis":
+        snapshot = report_lib.redis_snapshot(
+            frontier_cfg.redis_host, frontier_cfg.redis_port, frontier_cfg.redis_db, frontier_cfg.redis_namespace
+        )
+    else:
+        snapshot = report_lib.sqlite_snapshot(manager.config.crawler.storage.sqlite_path)
+
+    if not snapshot.get("available", True):
+        print(f"Warning: could not read final {backend} state: {snapshot.get('error')}", file=sys.stderr)
+
+    resources = None
+    redis_resources = None
+    if monitor is not None:
+        resources = report_lib.build_resource_report(monitor.samples, args.monitor_interval)
+        if backend == "redis":
+            redis_resources = report_lib.build_redis_resource_report(monitor.samples, args.monitor_interval)
+
+    report = report_lib.build_report(
+        metadata=metadata,
+        timing=timing,
+        snapshot=snapshot,
+        resources=resources,
+        redis_resources=redis_resources,
+        configuration=manager.config.model_dump(),
+    )
+
+    print("\n" + report_lib.render_human_report(report))
+
+    if args.output:
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, default=str)
+        print(f"\nWrote run report to {args.output}", file=sys.stderr)
 
 
 if __name__ == "__main__":

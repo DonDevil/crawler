@@ -226,6 +226,56 @@ python main.py --crawler-engine http --query "example query" --max-pages 50
 See [`docs/installation.md`](installation.md#running) for a full set of
 verified command examples covering every CLI flag.
 
+## How to generate a crawl run report
+
+`tests/report.py` reads current state from whichever backend the crawler
+used and prints a human-readable summary (URL counts, throughput, resource
+usage, Redis stats). It always reads state through the same production
+classes the crawler uses (`RedisURLFrontier.get_status_counts()`,
+`URLDatabase`), never a hand-maintained copy of the keyspace, so it can't
+silently drift from the current frontier implementation the way the old
+version did. A metric this tool cannot derive is printed as `N/A` and
+serialized as `null` in JSON -- never fabricated as `0`.
+
+```bash
+python tests/report.py --sql                          # SQLite crawl-state database
+python tests/report.py --redis                        # Redis frontier (config.yaml's namespace)
+python tests/report.py --redis --namespace mycrawl     # a different Redis namespace
+python tests/report.py --redis --output results/report.json
+```
+
+**Ad-hoc snapshot limitation:** the Redis frontier does not persist
+run-level start/end timestamps or per-run parameters (query, seed files,
+worker count, ...) -- per-URL metadata is deleted once a URL reaches a
+terminal state (see `core/redis_frontier.py`'s `terminal_meta_ttl_seconds`).
+An ad-hoc `--redis` report therefore shows accurate *current* URL-state
+counts but `N/A` timing/throughput/run-identity, with a note explaining why.
+The SQLite backend's `--sql` report can compute an approximate duration
+from `MIN(first_seen)`/`MAX(last_seen)` in `storage/crawl_state.db`, since
+that table is durable (unlike Redis's per-URL metadata).
+
+### Overnight / monitored runs
+
+For a run whose report should include real timing, resource usage, and
+Redis stats, pass `--monitor-resources` (and optionally `--output`) to
+`main.py` itself. This wraps the existing `manager.run()` call with the
+same `ResourceMonitor` the benchmark suite uses
+(`tests/benchmarks/common.py`) -- a lightweight background-thread sampler,
+default interval 10s -- and reconnects to the backend after the crawl
+finishes to build the final report from real process start/end timestamps:
+
+```bash
+python main.py --query "example query" --monitor-resources --monitor-interval 10 \
+    --output results/overnight.json
+```
+
+Passing neither flag runs exactly as before (zero added overhead: no
+monitor thread, no post-run reconnect). The JSON result's schema is
+documented in `tests/report_lib.py`; `tests/report.py --run-json
+results/overnight.json` reloads a captured run's metadata/timing/resources
+into a fresh report (optionally combined with a live `--redis`/`--sql`
+counts refresh).
+
 ## How to run Redis mode vs. SQL mode
 
 Set `crawler.frontier.type` and `crawler.media_evidence.type` in

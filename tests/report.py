@@ -1,343 +1,218 @@
-import sqlite3
-import datetime
+#!/usr/bin/env python3
+"""Crawl-run report: analyze the SQLite crawl-state database or the Redis
+frontier's *current* keyspace and print a human-readable summary (and,
+optionally, write a machine-readable JSON result).
+
+The Redis path used to assume keys (`{ns}:urls:queued`, `{ns}:urls:failed`)
+that no longer exist in the current frontier keyspace (core/redis_frontier.py)
+-- see docs/architecture/frontier-adr.md. This tool now reads state
+exclusively through `RedisURLFrontier.get_status_counts()` and the other
+current, documented keys, and reports a metric as "N/A" rather than 0 when
+it genuinely cannot be derived (e.g. run timing for an ad-hoc Redis snapshot
+-- see `report_lib.redis_timing_unavailable`).
+
+Examples:
+  python tests/report.py --sql
+  python tests/report.py --redis
+  python tests/report.py --redis --namespace crawler --output results/report.json
+  python tests/report.py --redis --run-json results/overnight.json   # merge in captured run metadata/timing/resources
+"""
+
+from __future__ import annotations
+
 import argparse
+import json
 import sys
 import os
 
-# Add parent directory to path so we can import from core
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-def get_sqlite_data():
-    """Fetch analytics data from SQLite database."""
-    conn = sqlite3.connect("storage/crawl_state.db")
-    cursor = conn.cursor()
-
-    cursor.execute(
-        "SELECT COUNT(*), SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), SUM(CASE WHEN status = 'visited' THEN 1 ELSE 0 END), SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) FROM urls"
-    )
-    row = cursor.fetchone()
-
-    total_found = row[0] or 0
-    total_failed = row[1] or 0
-    total_visited = row[2] or 0
-    total_queued = row[3] or 0
-
-    # Get time range
-    cursor.execute("SELECT MIN(first_seen), MAX(last_seen) FROM urls")
-    first_seen, last_seen = cursor.fetchone()
-
-    cursor.close()
-    conn.close()
-
-    return {
-        "total_found": total_found,
-        "total_failed": total_failed,
-        "total_visited": total_visited,
-        "total_queued": total_queued,
-        "first_seen": first_seen,
-        "last_seen": last_seen,
-    }
+import report_lib  # noqa: E402
 
 
-def get_redis_data():
-    """Fetch analytics data from Redis frontier."""
-    try:
-        import redis
-        from core.config import load_config
-
-        config = load_config("config.yaml")
-        frontier_config = config.crawler.frontier
-
-        r = redis.Redis(
-            host=frontier_config.redis_host,
-            port=frontier_config.redis_port,
-            db=frontier_config.redis_db,
-            decode_responses=True,
-        )
-
-        # Test connection
-        r.ping()
-
-        namespace = frontier_config.redis_namespace
-
-        # Get frontier counts
-        total_queued = r.scard(f"{namespace}:urls:queued") or 0
-        total_visited = r.scard(f"{namespace}:urls:visited") or 0
-        total_failed = r.scard(f"{namespace}:urls:failed") or 0
-        total_skipped = r.scard(f"{namespace}:urls:skipped") or 0
-
-        total_found = total_queued + total_visited + total_failed + total_skipped
-
-        # Get first/last seen timestamps from metadata
-        first_seen_key = f"{namespace}:metadata:first_crawl_time"
-        last_seen_key = f"{namespace}:metadata:last_crawl_time"
-
-        first_seen = r.get(first_seen_key)
-        last_seen = r.get(last_seen_key)
-
-        return {
-            "total_found": total_found,
-            "total_failed": total_failed,
-            "total_visited": total_visited,
-            "total_queued": total_queued,
-            "total_skipped": total_skipped,
-            "first_seen": first_seen,
-            "last_seen": last_seen,
-        }
-
-    except Exception as e:
-        print(f"Error connecting to Redis: {e}", file=sys.stderr)
-        print("Make sure Redis is running and configured correctly.", file=sys.stderr)
-        sys.exit(1)
-
-
-def get_piracy_stats(data, source="sql"):
-    """Calculate piracy site statistics."""
+def _load_piracy_sites() -> list[str]:
     try:
         with open("seeds/piracy_sites.txt", "r", encoding="utf-8") as f:
-            piracy_sites = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+            return [line.strip() for line in f if line.strip() and not line.startswith("#")]
     except FileNotFoundError:
         print("Warning: seeds/piracy_sites.txt not found, skipping piracy stats", file=sys.stderr)
-        return {}
-
-    if source == "sql":
-        return get_piracy_stats_sql(piracy_sites)
-    elif source == "redis":
-        return get_piracy_stats_redis(piracy_sites)
+        return []
 
 
-def get_piracy_stats_sql(piracy_sites):
-    """Get piracy site statistics from SQLite."""
-    conn = sqlite3.connect("storage/crawl_state.db")
-    cursor = conn.cursor()
+def _frontier_kwargs_from_config(frontier_config) -> dict:
+    return dict(
+        max_retries=frontier_config.max_retries,
+        base_backoff=frontier_config.base_backoff,
+        max_backoff=frontier_config.max_backoff,
+        lease_ttl=frontier_config.lease_ttl,
+        domain_scan_limit=frontier_config.domain_scan_limit,
+        reclaim_batch_size=frontier_config.reclaim_batch_size,
+    )
 
-    pirate_visited_counts = {}
-    pirate_failed_counts = {}
-    pirate_queued_counts = {}
 
-    for site in piracy_sites:
-        cursor.execute(
-            "SELECT SUM(CASE WHEN status = 'visited' THEN 1 ELSE 0 END), SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) FROM urls WHERE url LIKE ?",
-            (f"%{site}%",),
-        )
-        pirate_visited_count, pirate_failed_count, pirate_queued_count = cursor.fetchone()
-        pirate_visited_counts[site] = pirate_visited_count or 0
-        pirate_failed_counts[site] = pirate_failed_count or 0
-        pirate_queued_counts[site] = pirate_queued_count or 0
-
-    cursor.close()
-    conn.close()
-
+def _build_metadata_from_config(config, backend: str, namespace_override: str | None) -> dict:
+    frontier_cfg = config.crawler.frontier
     return {
-        "visited": pirate_visited_counts,
-        "failed": pirate_failed_counts,
-        "queued": pirate_queued_counts,
+        "generated_at": report_lib.now_iso(),
+        "backend": backend,
+        "redis": (
+            {
+                "host": frontier_cfg.redis_host,
+                "port": frontier_cfg.redis_port,
+                "db": frontier_cfg.redis_db,
+                "namespace": namespace_override or frontier_cfg.redis_namespace,
+            }
+            if backend == "redis"
+            else None
+        ),
+        "sqlite_path": config.crawler.storage.sqlite_path if backend == "sqlite" else None,
+        "worker_count": None,
+        "crawl_engine": None,
+        "search_engines": None,
+        "query_scope": None,
+        "queries": None,
+        "seed_files": None,
+        "crawl_mode": None,
+        "max_pages": None,
+        "indefinite_run": None,
+        "rate_limit": None,
+        "config_defaults": {
+            "concurrency": config.crawler.concurrency,
+            "max_pages": config.crawler.max_pages,
+            "rate_limit": config.crawler.rate_limit,
+        },
+        "note": (
+            "Ad-hoc snapshot: per-run CLI parameters (query, seed files, crawl mode, worker count, "
+            "search engines, surface/dark-web scope, indefinite-run) are not persisted by the frontier "
+            "and are unavailable outside a live monitored run. 'config_defaults' reflects config.yaml, "
+            "not necessarily the flags used for any particular past run. Capture a run's real metadata "
+            "with `python main.py ... --monitor-resources --output <file>` and pass --run-json <file> "
+            "here to merge it in."
+        ),
     }
 
 
-def get_piracy_stats_redis(piracy_sites):
-    """Get piracy site statistics from Redis."""
-    try:
-        import redis
-        from core.config import load_config
+def _merge_run_json(report: dict, run_json_path: str) -> dict:
+    with open(run_json_path, "r", encoding="utf-8") as f:
+        captured = json.load(f)
 
-        config = load_config("config.yaml")
-        frontier_config = config.crawler.frontier
+    for key in ("metadata", "timing", "resources", "redis", "configuration"):
+        if captured.get(key) is not None:
+            report[key] = captured[key]
 
-        r = redis.Redis(
-            host=frontier_config.redis_host,
-            port=frontier_config.redis_port,
-            db=frontier_config.redis_db,
-            decode_responses=True,
+    # Recompute throughput/failures against the (possibly freshly-queried)
+    # counts using the captured run's timing/worker_count, so a live counts
+    # refresh combined with a captured duration still yields a correct rate.
+    duration = report["timing"].get("duration_seconds")
+    worker_count = report["metadata"].get("worker_count")
+    snapshot_like = {
+        "discovered_total": report["counts"].get("discovered_total"),
+        "visited": report["counts"].get("visited"),
+        "failed_permanent": report["counts"].get("failed_permanent"),
+        "skipped": report["counts"].get("skipped"),
+    }
+    report["throughput"] = report_lib.compute_throughput(snapshot_like, duration, worker_count)
+    return report
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Analyze crawler database - SQLite or Redis frontier",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--sql", action="store_true", help="Analyze SQLite database (default if neither flag specified)")
+    parser.add_argument("--redis", action="store_true", help="Analyze Redis frontier instead of SQLite")
+    parser.add_argument("--config", default="config.yaml", help="Path to config.yaml (default %(default)s)")
+    parser.add_argument("--namespace", default=None, help="Override the Redis namespace from config.yaml")
+    parser.add_argument("--output", default=None, help="Write the machine-readable JSON report to this path")
+    parser.add_argument(
+        "--run-json",
+        default=None,
+        help="Merge in metadata/timing/resources captured by a prior "
+        "`main.py --monitor-resources --output <file>` run",
+    )
+    parser.add_argument("--no-piracy-stats", action="store_true", help="Skip the piracy-site breakdown section")
+    args = parser.parse_args()
+
+    from core.config import load_config
+
+    config = load_config(args.config)
+
+    source = "redis" if args.redis else "sql"
+
+    if source == "redis":
+        frontier_cfg = config.crawler.frontier
+        namespace = args.namespace or frontier_cfg.redis_namespace
+        snapshot = report_lib.redis_snapshot(
+            frontier_cfg.redis_host,
+            frontier_cfg.redis_port,
+            frontier_cfg.redis_db,
+            namespace,
+            frontier_kwargs=_frontier_kwargs_from_config(frontier_cfg),
         )
-        r.ping()
+        if not snapshot.get("available"):
+            print(f"Error connecting to Redis: {snapshot.get('error')}", file=sys.stderr)
+            print("Make sure Redis is running and configured correctly.", file=sys.stderr)
+            sys.exit(1)
 
-        namespace = frontier_config.redis_namespace
-
-        # Get all URLs from frontier
-        queued = r.smembers(f"{namespace}:urls:queued")
-        visited = r.smembers(f"{namespace}:urls:visited")
-        failed = r.smembers(f"{namespace}:urls:failed")
-
-        pirate_visited_counts = {}
-        pirate_failed_counts = {}
-        pirate_queued_counts = {}
-
-        for site in piracy_sites:
-            pirate_visited_counts[site] = sum(1 for url in visited if site in url)
-            pirate_failed_counts[site] = sum(1 for url in failed if site in url)
-            pirate_queued_counts[site] = sum(1 for url in queued if site in url)
-
-        return {
-            "visited": pirate_visited_counts,
-            "failed": pirate_failed_counts,
-            "queued": pirate_queued_counts,
-        }
-
-    except Exception as e:
-        print(f"Error getting piracy stats from Redis: {e}", file=sys.stderr)
-        return {}
-
-
-# Parse command-line arguments
-parser = argparse.ArgumentParser(
-    description="Analyze crawler database - SQLite or Redis frontier",
-    formatter_class=argparse.RawDescriptionHelpFormatter,
-    epilog="""
-Examples:
-  python report.py --sql       # Analyze SQLite database
-  python report.py --redis     # Analyze Redis frontier
-  python report.py             # Auto-detect (default: SQLite)
-""",
-)
-
-parser.add_argument(
-    "--sql",
-    action="store_true",
-    help="Analyze SQLite database (default if neither flag specified)",
-)
-parser.add_argument(
-    "--redis",
-    action="store_true",
-    help="Analyze Redis frontier instead of SQLite",
-)
-
-args = parser.parse_args()
-
-# Determine data source
-if args.redis:
-    source = "redis"
-    data = get_redis_data()
-elif args.sql or not args.redis:  # Default to SQL
-    source = "sql"
-    data = get_sqlite_data()
-
-# Total Analytics
-
-total_found = data["total_found"]
-total_failed = data["total_failed"]
-total_visited = data["total_visited"]
-total_queued = data["total_queued"]
-
-# Efficiency Metrics
-
-total_attempted = total_visited + total_failed
-successful_visit_rate = (total_visited / total_attempted) * 100 if total_attempted > 0 else 0
-failure_rate = (total_failed / total_attempted) * 100 if total_attempted > 0 else 0
-crawl_completion_rate = (total_visited / total_found) * 100 if total_found > 0 else 0
-remaining_queue_share = (total_queued / total_found) * 100 if total_found > 0 else 0
-discovery_pressure = total_attempted / total_found if total_found > 0 else 0
-
-# Total Run Time Calculation
-
-first_seen = data["first_seen"]
-last_seen = data["last_seen"]
-
-if first_seen and last_seen:
-    try:
-        start_time = datetime.datetime.fromisoformat(first_seen)
-        end_time = datetime.datetime.fromisoformat(last_seen)
-    except (ValueError, TypeError):
-        try:
-            start_time = datetime.datetime.strptime(first_seen, "%Y-%m-%d %H:%M:%S")
-            end_time = datetime.datetime.strptime(last_seen, "%Y-%m-%d %H:%M:%S")
-        except (ValueError, TypeError):
-            total_run_hours = 0
-            start_time = None
-            end_time = None
-    
-    if start_time and end_time:
-        total_run_hours = max((end_time - start_time).total_seconds() / 3600.0, 0)
+        metadata = _build_metadata_from_config(config, "redis", namespace)
+        timing = report_lib.redis_timing_unavailable(namespace)
     else:
-        total_run_hours = 0
-else:
-    total_run_hours = 0
+        db_path = config.crawler.storage.sqlite_path
+        snapshot = report_lib.sqlite_snapshot(db_path)
+        metadata = _build_metadata_from_config(config, "sqlite", None)
+        timing = report_lib.sqlite_timing(snapshot)
 
-# Per-Hour Metrics
+    report = report_lib.build_report(metadata=metadata, timing=timing, snapshot=snapshot)
+    if source == "redis":
+        report["snapshot_redis_info"] = snapshot.get("redis_info")
+        report["counts"]["active_domains"] = snapshot.get("active_domains")
 
-total_attempted_per_hour = total_attempted / total_run_hours if total_run_hours > 0 else 0
-successful_visit_per_hour = total_visited / total_run_hours if total_run_hours > 0 else 0
-failure_per_hour = total_failed / total_run_hours if total_run_hours > 0 else 0
+    if args.run_json:
+        report = _merge_run_json(report, args.run_json)
 
-# Piracy Site Analytics
+    print(report_lib.render_human_report(report))
 
-piracy_stats = get_piracy_stats(data, source=source)
+    if not args.no_piracy_stats:
+        piracy_sites = _load_piracy_sites()
+        if piracy_sites:
+            if source == "redis":
+                frontier_cfg = config.crawler.frontier
+                namespace = args.namespace or frontier_cfg.redis_namespace
+                stats = report_lib.redis_piracy_stats(
+                    frontier_cfg.redis_host,
+                    frontier_cfg.redis_port,
+                    frontier_cfg.redis_db,
+                    namespace,
+                    piracy_sites,
+                    frontier_kwargs=_frontier_kwargs_from_config(frontier_cfg),
+                )
+            else:
+                stats = report_lib.sqlite_piracy_stats(config.crawler.storage.sqlite_path, piracy_sites)
 
-if piracy_stats:
-    pirate_visited_counts = piracy_stats.get("visited", {})
-    pirate_failed_counts = piracy_stats.get("failed", {})
-    pirate_queued_counts = piracy_stats.get("queued", {})
+            total_visited = sum(stats.get("visited", {}).values())
+            total_failed = sum(stats.get("failed", {}).values())
+            total_queued = sum(stats.get("queued", {}).values())
+            total = report["counts"].get("discovered_total") or 0
 
-    total_visited_pirated = sum(pirate_visited_counts.values())
-    total_failed_pirated = sum(pirate_failed_counts.values())
-    total_queued_pirated = sum(pirate_queued_counts.values())
+            print("\n#Piracy Site Analytics\n")
+            print(f"Total Visited Pirated Sites: {total_visited}")
+            print(f"Total Failed Pirated Sites: {total_failed}")
+            print(f"Total Queued Pirated Sites: {total_queued}")
+            print()
+            print(f"Visited Pirated Sites Percentage: {report_lib.fmt_pct(report_lib.safe_pct(total_visited, total))}")
+            print(f"Failed Pirated Sites Percentage: {report_lib.fmt_pct(report_lib.safe_pct(total_failed, total))}")
+            print(f"Queued Pirated Sites Percentage: {report_lib.fmt_pct(report_lib.safe_pct(total_queued, total))}")
+            report["piracy_stats"] = stats
 
-    visited_pirated_percentage = (total_visited_pirated / total_found) * 100 if total_found > 0 else 0
-    failed_pirated_percentage = (total_failed_pirated / total_found) * 100 if total_found > 0 else 0
-    queued_pirated_percentage = (total_queued_pirated / total_found) * 100 if total_found > 0 else 0
-else:
-    total_visited_pirated = 0
-    total_failed_pirated = 0
-    total_queued_pirated = 0
-    visited_pirated_percentage = 0
-    failed_pirated_percentage = 0
-    queued_pirated_percentage = 0
+    if args.output:
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, default=str)
+        print(f"\nWrote JSON report to {args.output}", file=sys.stderr)
 
 
-# Close Connection (not needed for Redis, but kept for consistency)
-# Already closed in data functions
-
-# Display Summary
-
-source_label = "Redis Frontier" if source == "redis" else "SQLite Database"
-print(f"------------------------------------------Summary (from {source_label})------------------------------------------------")
-
-print("#Total")
-
-print("\n")
-
-print(f"Total URLs Found: {total_found}")
-print(f"Total URLs Visited: {total_visited}")
-print(f"Total URLs Failed: {total_failed}")
-print(f"Total URLs Queued: {total_queued}")
-if source == "redis" and data.get("total_skipped"):
-    print(f"Total URLs Skipped: {data['total_skipped']}")
-
-print("\n")
-
-print("#Efficiency Metrics")
-
-print("\n")
-
-print(f"Total Attempted: {total_attempted}")
-print(f"Successful Visit Rate: {successful_visit_rate:.2f}%")
-print(f"Failure Rate: {failure_rate:.2f}%")
-print(f"Crawl Completion Rate: {crawl_completion_rate:.2f}%")
-print(f"Remaining Queue Share: {remaining_queue_share:.2f}%")
-print(f"Discovery Pressure: {discovery_pressure:.2f}")
-
-print("\n")
-
-print("#Per-Hour Metrics")
-
-print("\n")
-
-print(f"Total Run Hours: {total_run_hours:.2f} hours")
-print(f"Total Attempted per Hour: {total_attempted_per_hour:.2f}")
-print(f"Successful Visit per Hour: {successful_visit_per_hour:.2f}")
-print(f"Failure per Hour: {failure_per_hour:.2f}")
-
-print("\n")
-
-print("#Piracy Site Analytics")
-
-print("\n")
-
-print(f"Total Visited Pirated Sites: {total_visited_pirated}")
-print(f"Total Failed Pirated Sites: {total_failed_pirated}")
-print(f"Total Queued Pirated Sites: {total_queued_pirated}")
-print("\n")
-print(f"Visited Pirated Sites Percentage: {visited_pirated_percentage:.2f}%")
-print(f"Failed Pirated Sites Percentage: {failed_pirated_percentage:.2f}%")
-print(f"Queued Pirated Sites Percentage: {queued_pirated_percentage:.2f}%")
-
+if __name__ == "__main__":
+    main()
