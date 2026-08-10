@@ -74,7 +74,7 @@ crawler fleet (multiple machines running main.py)
 ## Installation
 
 ```bash
-git clone <this-repository-url>
+git clone https://github.com/DonDevil/crawler.git
 cd crawler
 python3.12 -m venv env
 source env/bin/activate
