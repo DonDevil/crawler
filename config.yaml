@@ -26,7 +26,16 @@ crawler:
     recovery_enabled: true
     recovery_interval: 30.0
     reclaim_batch_size: 200
-    domain_scan_limit: 50
+    # Max candidate domains claim_next examines per call (the Redis-only `K`
+    # bound -- see docs/architecture/domain-scan-window-design.md and
+    # docs/architecture/domain-scan-limit-decision.md). Raised from 50 to
+    # 250 (2026-08-10): the production seed set alone already spans ~50
+    # distinct domains, and production runs multiple independent crawler
+    # systems/workers against one shared Redis frontier, so headroom above
+    # the seed count is needed. Measured cheap at this value (see the
+    # decision doc); do not raise further without new evidence -- revisit
+    # the eligible-domain-index design instead if 250 stops being enough.
+    domain_scan_limit: 250
     # Claim heartbeat (core/claim_heartbeat.py): lets a worker still
     # legitimately fetching a URL renew its claim instead of losing it to
     # lease expiry. Leave unset (null) to auto-derive a safe interval from

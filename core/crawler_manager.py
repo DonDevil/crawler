@@ -191,6 +191,7 @@ class CrawlerManager:
         self.resume_unfinished = resume_unfinished
         self.query_scope = query_scope
         self._recovery_task: Optional[asyncio.Task] = None
+        self._peak_active_domains: int = 0
 
         logger.info(f"Using crawler engine: {self.crawl_engine}")
 
@@ -396,9 +397,44 @@ class CrawlerManager:
         )
         self._log_deferred_urls(deferred, len(discovered_items), "discovered URLs")
 
+    async def _sample_domain_scan_telemetry(self) -> None:
+        """One cheap, read-only `domain_scan_limit` (K) visibility-risk
+        sample -- see `RedisURLFrontier.get_domain_scan_telemetry` and
+        docs/architecture/domain-scan-limit-decision.md. A no-op for
+        backends without it (the local frontier). Never raises: this is
+        diagnostic only and must not be able to affect the recovery loop's
+        own reliability.
+        """
+        try:
+            telemetry = await self.async_frontier.get_domain_scan_telemetry()
+        except Exception as e:
+            logger.debug(f"Domain scan telemetry sample failed (non-fatal): {e}")
+            return
+
+        if telemetry is None:
+            return
+
+        self._peak_active_domains = max(self._peak_active_domains, telemetry["active_domains"])
+        if telemetry["exceeds_domain_scan_limit"]:
+            logger.warning(
+                f"Active domains ({telemetry['active_domains']}) exceed domain_scan_limit "
+                f"({telemetry['domain_scan_limit']}) -- some domains may be invisible to "
+                "scheduling; see docs/architecture/domain-scan-window-design.md"
+            )
+        else:
+            logger.debug(
+                f"Domain scan telemetry: active_domains={telemetry['active_domains']} "
+                f"domain_scan_limit={telemetry['domain_scan_limit']}"
+            )
+
     async def _recovery_loop(self) -> None:
         """Periodically reclaim abandoned inflight claims and promote due
-        retries (docs/architecture/frontier-adr.md §7).
+        retries (docs/architecture/frontier-adr.md §7), and sample
+        domain_scan_limit visibility-risk telemetry (see
+        `_sample_domain_scan_telemetry`) on the same cadence -- deliberately
+        piggybacked here rather than on a separate loop or the per-claim
+        path, so this stays cheap and low-frequency by construction (see
+        docs/architecture/domain-scan-limit-decision.md).
 
         Runs independently of whether the scheduler is polling, so it keeps
         sweeping even when the queue is fully drained except for one
@@ -422,6 +458,7 @@ class CrawlerManager:
                 raise
             except Exception as e:
                 logger.error(f"Recovery sweep failed: {e}")
+            await self._sample_domain_scan_telemetry()
             await asyncio.sleep(interval)
 
     async def run(self):
@@ -452,6 +489,11 @@ class CrawlerManager:
 
             logger.info("Crawler stopped")
             logger.info(f"Database status counts: {self.url_database.get_status_counts()}")
+            if self._peak_active_domains:
+                logger.info(
+                    f"Peak active domains observed: {self._peak_active_domains} "
+                    f"(domain_scan_limit={frontier_config.domain_scan_limit})"
+                )
             if hasattr(self.frontier, "close"):
                 self.frontier.close()
             self.url_database.close()

@@ -29,7 +29,7 @@ code opts into at construction time.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Optional, TypeVar
 
 from core.frontier import Frontier, FrontierClaim
 from core.url_frontier import URLFrontier
@@ -113,6 +113,20 @@ class AsyncFrontier:
         if method is None:
             return (0, 0)
         return await self._run(method, batch_size)
+
+    async def get_domain_scan_telemetry(self) -> Optional[dict]:
+        """Read-only `domain_scan_limit` (K) visibility-risk sample.
+
+        Only Redis-backed frontiers implement this (the local frontier has
+        no K bound to observe -- see
+        docs/architecture/domain-scan-limit-decision.md); a frontier
+        without it returns `None` rather than a fabricated zero, matching
+        `reclaim_and_promote`'s optional-method pattern above.
+        """
+        method = getattr(self._frontier, "get_domain_scan_telemetry", None)
+        if method is None:
+            return None
+        return await self._run(method)
 
     async def close(self) -> None:
         method = getattr(self._frontier, "close", None)

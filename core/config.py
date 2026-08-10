@@ -64,7 +64,19 @@ class FrontierConfig(BaseModel):
     recovery_enabled: bool = True
     recovery_interval: float = 30.0
     reclaim_batch_size: int = 200
-    domain_scan_limit: int = 50
+
+    # Max candidate domains claim_next examines per call (Redis-only `K`
+    # bound -- meaningless to the local frontier, which scans unbounded).
+    # Raised from 50 to 250 (2026-08-10, see
+    # docs/architecture/domain-scan-limit-decision.md): this is a bounded-
+    # work safety/performance parameter, not a guarantee that every active
+    # domain is globally visible -- a domain ranked outside the top K is
+    # invisible to scheduling regardless of how long it's waited (see
+    # docs/architecture/domain-scan-window-design.md). Do not raise this
+    # indefinitely as active-domain counts grow; the eligible-domain-index
+    # design documented there is the intended fix once real telemetry shows
+    # active domains regularly approaching/exceeding this value.
+    domain_scan_limit: int = 250
 
     # Claim heartbeat (docs/architecture/frontier-adr.md §8, Step 5): lets a
     # worker that's still legitimately fetching a URL renew its claim so it

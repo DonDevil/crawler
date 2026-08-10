@@ -76,7 +76,7 @@ class RedisURLFrontier:
         base_backoff: float = 5.0,
         max_backoff: float = 300.0,
         lease_ttl: float = 90.0,
-        domain_scan_limit: int = 50,
+        domain_scan_limit: int = 250,
         reclaim_batch_size: int = 200,
         terminal_meta_ttl_seconds: Optional[float] = None,
     ):
@@ -472,8 +472,11 @@ class RedisURLFrontier:
         terminating, matching the local frontier's blacklist-while-queued
         eviction behavior.
         Complexity: O(K) server-side Lua work per call, K = domain_scan_limit
-        (default 50) -- never O(domains) network round trips, and never a
-        SCAN.
+        (default 250) -- never O(domains) network round trips, and never a
+        SCAN. K is a bounded-work safety/performance parameter, not a
+        guarantee every active domain is visible: a domain ranked outside
+        the top K is never examined regardless of how long it's waited --
+        see docs/architecture/domain-scan-window-design.md.
         """
         skips = 0
         while skips < _MAX_BLACKLIST_SKIPS_PER_CALL:
@@ -645,6 +648,48 @@ class RedisURLFrontier:
 
         reclaimed, requeued = result
         return int(reclaimed), int(requeued)
+
+    def get_domain_scan_telemetry(self) -> dict:
+        """Cheap, read-only sample of `domain_scan_limit` (K) visibility risk.
+
+        Not part of the claim hot path -- intended to be sampled
+        periodically (e.g. from `CrawlerManager._recovery_loop`, which
+        already runs on `recovery_interval`), not once per claim. See
+        docs/architecture/domain-scan-limit-decision.md and
+        docs/architecture/domain-scan-window-design.md for why this matters:
+        a domain ranked outside the top K is invisible to `claim_next`
+        regardless of how long it's waited, so knowing how `active_domains`
+        compares to `domain_scan_limit` is the cheapest available signal for
+        whether that risk is being approached in a real run.
+
+        `rate_gated_domains` is always `None`: the current keyspace has no
+        aggregate index of which domains are currently rate-gated (only a
+        per-domain `domain:{d}:next_time` STRING key each), so that count
+        is not obtainable without either a Redis `SCAN` (avoided on
+        principle elsewhere in this class) or the eligible-domain-index
+        redesign's `gated` ZSET (deferred -- see the design doc). This is a
+        documented limitation, not an oversight.
+
+        `queued_domains` is reported identically to `active_domains`: in
+        the current keyspace, `domains:active` already means "has at least
+        one queued URL" -- there is no separate, cheaper-or-different
+        "queued" concept to report.
+
+        Round trips: 1 (SCARD). Complexity: O(1) -- never a scan.
+        """
+        try:
+            active_domains = self.redis_conn.scard(self._key("domains", "active"))
+        except redis.RedisError as e:
+            logger.error(f"Redis error sampling domain scan telemetry: {e}")
+            raise FrontierUnavailable(f"get_domain_scan_telemetry: {e}") from e
+
+        return {
+            "active_domains": active_domains,
+            "queued_domains": active_domains,
+            "rate_gated_domains": None,
+            "domain_scan_limit": self.domain_scan_limit,
+            "exceeds_domain_scan_limit": active_domains > self.domain_scan_limit,
+        }
 
     def has_pending(self) -> bool:
         """Return True when the frontier still has queued, in-flight, or
