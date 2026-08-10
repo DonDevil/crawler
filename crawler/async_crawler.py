@@ -8,6 +8,7 @@ from loguru import logger
 from core.claim_heartbeat import ClaimLostError, resolve_heartbeat_interval, run_with_heartbeat
 from core.frontier import Frontier, FrontierClaim, FrontierUnavailable
 from core.frontier_executor import AsyncFrontier
+from core.url_frontier import URLFrontier
 from parsers.streaming_manifest_parser import StreamingManifestParser
 from storage.url_database import URLDatabase
 from tor.proxy_config import get_default_tor_proxy
@@ -43,6 +44,14 @@ class AsyncCrawler:
         )
         self.user_agent = user_agent
         self.url_database = url_database
+        # url_database status mirroring only applies to the local, in-process
+        # frontier (--sql / frontier.type=sqlite), where it is the only
+        # place "pending"/terminal status ever gets recorded (URLFrontier
+        # itself doesn't write those). RedisURLFrontier owns its own status
+        # in Redis and must never have it duplicated into SQLite on the
+        # crawl-time hot path -- see
+        # docs/architecture/redis-sqlite-boundary-decision.md.
+        self._sql_mode_mirror = url_database is not None and isinstance(self.frontier.raw, URLFrontier)
         self.media_database = media_database
         self._manifest_parser = StreamingManifestParser()
         self.tor_proxy = tor_proxy or get_default_tor_proxy()
@@ -151,11 +160,11 @@ class AsyncCrawler:
                 if URLUtils.is_blacklisted(url):
                     logger.info(f"Skipping blacklisted URL during crawl: {url}")
                     await self.frontier.mark_skipped(claim)
-                    if self.url_database:
+                    if self._sql_mode_mirror:
                         self.url_database.update_status(url, "skipped")
                     continue
 
-                if self.url_database:
+                if self._sql_mode_mirror:
                     self.url_database.add_url(url, status="pending")
 
                 (html, failure_reason), claim = await run_with_heartbeat(
@@ -206,7 +215,7 @@ class AsyncCrawler:
                     await self.frontier.mark_failed(claim, failure_reason or "")
                 else:
                     await self.frontier.mark_visited(claim)
-                if self.url_database:
+                if self._sql_mode_mirror:
                     self.url_database.update_status(url, status)
 
                 self._pages_crawled += 1

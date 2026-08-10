@@ -108,7 +108,11 @@ class TestTransientOutageDuringSeeding:
 
             # Not deferred -- the retry absorbed the blip within this run.
             assert manager.frontier.has_pending() is True
-            assert manager.url_database.get_urls_and_statuses(["queued", "pending"]) == [(url, "queued")]
+            # Redis mode no longer mirrors successful adds into url_database
+            # (docs/architecture/redis-sqlite-boundary-decision.md) -- only
+            # the deferred-on-outage branch of _make_seed_url_adder writes
+            # to it, and this URL was never deferred.
+            assert manager.url_database.get_urls_and_statuses(["queued", "pending"]) == []
 
             # And the URL is genuinely claimable from Redis, not just present
             # in local storage.
@@ -202,8 +206,11 @@ class TestOrdinarySeedingUnaffected:
             counts = manager.frontier.get_status_counts()
             assert counts["queued"] == 1
 
+            # Neither the accepted nor the rejected-duplicate outcome is a
+            # deferral, so url_database is never touched (Redis mode no
+            # longer mirrors successful/rejected adds into it).
             recorded = {u for u, _ in manager.url_database.get_urls_and_statuses(["queued", "pending"])}
-            assert recorded == {url}
+            assert recorded == set()
         finally:
             _cleanup(manager)
 
@@ -246,8 +253,10 @@ class TestOrdinarySeedingUnaffected:
             assert spy.call_count == len(urls)
             counts = manager.frontier.get_status_counts()
             assert counts["queued"] == len(urls)
+            # None of these were deferred, so url_database stays empty --
+            # Redis is the sole source of truth for a healthy seeding run.
             recorded = {u for u, _ in manager.url_database.get_urls_and_statuses(["queued", "pending"])}
-            assert recorded == set(urls)
+            assert recorded == set()
         finally:
             _cleanup(manager)
 

@@ -15,6 +15,7 @@ from core.claim_heartbeat import ClaimLostError, resolve_heartbeat_interval, run
 from core.crawler_router import CrawlerRouter
 from core.frontier import Frontier, FrontierClaim, FrontierUnavailable
 from core.frontier_executor import AsyncFrontier
+from core.url_frontier import URLFrontier
 from crawler.async_crawler import AsyncCrawler
 from crawler.http_crawler import HTTPCrawler
 from crawler.playwright_crawler import PlaywrightCrawler
@@ -58,6 +59,9 @@ class HybridCrawler:
         )
         self.user_agent = user_agent
         self.url_database = url_database
+        # See docs/architecture/redis-sqlite-boundary-decision.md: mirroring
+        # status into url_database only applies to the local frontier.
+        self._sql_mode_mirror = url_database is not None and isinstance(self.frontier.raw, URLFrontier)
         self.media_database = media_database
         self.scrapling_enabled = scrapling_enabled
         self.router = CrawlerRouter(allow_scrapling=self.scrapling_enabled)
@@ -282,11 +286,11 @@ class HybridCrawler:
                 if URLUtils.is_blacklisted(url):
                     logger.info(f"Skipping blacklisted URL during crawl: {url}")
                     await self.frontier.mark_skipped(claim)
-                    if self.url_database:
+                    if self._sql_mode_mirror:
                         self.url_database.update_status(url, "skipped")
                     continue
 
-                if self.url_database:
+                if self._sql_mode_mirror:
                     self.url_database.add_url(url, status="pending")
 
                 (html, failure_reason, attempt_chain, engine_used), claim = await run_with_heartbeat(
@@ -331,7 +335,7 @@ class HybridCrawler:
                     await self.frontier.mark_failed(claim, failure_reason or "")
                 else:
                     await self.frontier.mark_visited(claim)
-                if self.url_database:
+                if self._sql_mode_mirror:
                     self.url_database.update_status(url, status)
 
                 self._pages_crawled += 1

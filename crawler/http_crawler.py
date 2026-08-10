@@ -11,6 +11,7 @@ from loguru import logger
 from core.claim_heartbeat import ClaimLostError, resolve_heartbeat_interval, run_with_heartbeat
 from core.frontier import Frontier, FrontierClaim, FrontierUnavailable
 from core.frontier_executor import AsyncFrontier
+from core.url_frontier import URLFrontier
 from parsers.streaming_manifest_parser import StreamingManifestParser
 from storage.url_database import URLDatabase
 from utils.request_headers import get_default_headers
@@ -44,6 +45,9 @@ class HTTPCrawler:
 		)
 		self.user_agent = user_agent
 		self.url_database = url_database
+		# See docs/architecture/redis-sqlite-boundary-decision.md: mirroring
+		# status into url_database only applies to the local frontier.
+		self._sql_mode_mirror = url_database is not None and isinstance(self.frontier.raw, URLFrontier)
 		self.media_database = media_database
 		self._manifest_parser = StreamingManifestParser()
 
@@ -127,11 +131,11 @@ class HTTPCrawler:
 				if URLUtils.is_blacklisted(url):
 					logger.info(f"Skipping blacklisted URL during crawl: {url}")
 					await self.frontier.mark_skipped(claim)
-					if self.url_database:
+					if self._sql_mode_mirror:
 						self.url_database.update_status(url, "skipped")
 					continue
 
-				if self.url_database:
+				if self._sql_mode_mirror:
 					self.url_database.add_url(url, status="pending")
 
 				(html, failure_reason), claim = await run_with_heartbeat(
@@ -174,7 +178,7 @@ class HTTPCrawler:
 					await self.frontier.mark_failed(claim, failure_reason or "")
 				else:
 					await self.frontier.mark_visited(claim)
-				if self.url_database:
+				if self._sql_mode_mirror:
 					self.url_database.update_status(url, status)
 
 				self._pages_crawled += 1

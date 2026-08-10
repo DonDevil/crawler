@@ -25,7 +25,6 @@ import redis
 from loguru import logger
 
 from core.frontier import FrontierClaim, FrontierUnavailable
-from storage.url_database import URLDatabase
 from utils.url_utils import URLUtils
 
 # Score formula shared by domain queues and domain_heads: priority is the
@@ -70,7 +69,6 @@ class RedisURLFrontier:
         redis_port: int = 6379,
         redis_db: int = 0,
         rate_limit: float = 1.0,
-        url_database: URLDatabase | None = None,
         namespace: str = "crawler",
         max_retries: int = 3,
         base_backoff: float = 5.0,
@@ -87,7 +85,6 @@ class RedisURLFrontier:
             redis_port: Redis server port
             redis_db: Redis database number (0-15)
             rate_limit: Minimum seconds between requests to same domain
-            url_database: Optional SQLite database for fallback persistence
             namespace: Redis key namespace prefix
             max_retries: Frontier-level retry attempts before failed_permanent
             base_backoff: Base seconds for exponential retry backoff
@@ -109,7 +106,6 @@ class RedisURLFrontier:
         self.redis_port = redis_port
         self.redis_db = redis_db
         self.rate_limit = rate_limit
-        self.url_database = url_database
         self.namespace = namespace
 
         self.max_retries = max_retries
@@ -454,8 +450,6 @@ class RedisURLFrontier:
             raise FrontierUnavailable(f"add_url({cleaned!r}): {e}") from e
 
         if result:
-            if self.url_database is not None:
-                self.url_database.add_url(cleaned, status="queued")
             logger.debug(f"Added to frontier: {cleaned}")
         return bool(result)
 
@@ -516,9 +510,6 @@ class RedisURLFrontier:
                 self.mark_skipped(claim)
                 skips += 1
                 continue
-
-            if self.url_database is not None:
-                self.url_database.update_status(url, "pending")
 
             return claim
 
@@ -596,15 +587,6 @@ class RedisURLFrontier:
                 logger.info(
                     f"{claim.url} failed permanently after {claim.attempt} attempts: {error}"
                 )
-
-        if self.url_database is not None:
-            db_status = {
-                "visited": "visited",
-                "skipped": "skipped",
-                "retry_scheduled": "queued",
-                "failed_permanent": "failed",
-            }.get(result, outcome)
-            self.url_database.update_status(claim.url, db_status)
 
         return result
 

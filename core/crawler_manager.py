@@ -84,7 +84,6 @@ class CrawlerManager:
                     redis_port=frontier_config.redis_port,
                     redis_db=frontier_config.redis_db,
                     rate_limit=self.config.crawler.rate_limit,
-                    url_database=self.url_database,
                     namespace=frontier_config.redis_namespace,
                     max_retries=frontier_config.max_retries,
                     base_backoff=frontier_config.base_backoff,
