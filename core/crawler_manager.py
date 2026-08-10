@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
+import time
+from typing import Callable, Optional
 
 from loguru import logger
 
 from core.config import Config, load_config
+from core.frontier import FrontierUnavailable
 from core.frontier_executor import AsyncFrontier
 from core.url_frontier import URLFrontier
 from core.redis_frontier import RedisURLFrontier
@@ -26,6 +28,24 @@ from storage.media_evidence_database import MediaEvidenceDatabase
 from storage.url_database import URLDatabase
 from utils.logger import configure_logging
 from utils.url_utils import URLUtils
+
+# Bounded retry for a single URL during startup seeding (`prepare_frontier`
+# runs synchronously before any crawl worker/task exists -- see
+# core/frontier_executor.py's AsyncFrontier docstring -- so a short blocking
+# `time.sleep` here does not compete with worker I/O). Deliberately small:
+# this absorbs a brief Redis blip, it does not hide a sustained outage --
+# see docs/architecture/frontier-redis-failure-semantics.md, "Startup
+# seeding failure semantics".
+_SEED_ADD_MAX_ATTEMPTS = 3
+_SEED_ADD_RETRY_DELAY_SECONDS = 0.5
+
+# After this many consecutive URLs exhaust their retries within one loader
+# call, stop attempting further per-URL retries for the remainder of that
+# call. Without this, a sustained outage would multiply its cost by the
+# size of the seed list (a 10K-URL seed file would burn ~1s/URL retrying a
+# Redis that isn't coming back). Remaining URLs are still recorded via the
+# same durable fallback, just without spending the retry budget on each one.
+_SEED_ADD_CIRCUIT_BREAKER_THRESHOLD = 3
 
 
 class CrawlerManager:
@@ -198,29 +218,109 @@ class CrawlerManager:
             base_priority = max(0, base_priority - self.config.search.onion_priority_boost)
         return base_priority
 
+    def _make_seed_url_adder(self) -> Callable[[str, int, str], str]:
+        """Build a stateful per-loader-call function that adds one URL to
+        the frontier during startup seeding, with bounded retry and a
+        circuit breaker for a sustained Redis outage.
+
+        A `FrontierUnavailable` here must never mean "URL handled" (the
+        Step 7 failure contract) and must never abort the whole seeding
+        pass over one transient blip either (that would lose every URL
+        still left to load, not just this one). Instead: retry a few times,
+        and if the frontier still can't take it, persist the URL directly
+        to `url_database` with status "queued" -- the same status
+        `load_unfinished_urls` already looks for, so the URL is
+        automatically retried by a later `--unfinished` run rather than
+        silently lost. See docs/architecture/frontier-redis-failure-semantics.md.
+
+        Returns one of:
+        - "accepted": queued into the frontier normally.
+        - "rejected": an ordinary duplicate/blacklisted URL -- unrelated to
+          Redis health, frontier.add_url() returned False without raising.
+        - "deferred": the frontier was unavailable; the URL was instead
+          recorded in storage for retry via `--unfinished`.
+        """
+        consecutive_unavailable = 0
+
+        def add(url: str, priority: int, source_query: str = "") -> str:
+            nonlocal consecutive_unavailable
+
+            if consecutive_unavailable < _SEED_ADD_CIRCUIT_BREAKER_THRESHOLD:
+                for attempt in range(1, _SEED_ADD_MAX_ATTEMPTS + 1):
+                    try:
+                        accepted = self.frontier.add_url(url, priority=priority, source_query=source_query)
+                        consecutive_unavailable = 0
+                        return "accepted" if accepted else "rejected"
+                    except FrontierUnavailable as e:
+                        if attempt < _SEED_ADD_MAX_ATTEMPTS:
+                            logger.warning(
+                                f"Frontier unavailable adding seed URL {url} "
+                                f"(attempt {attempt}/{_SEED_ADD_MAX_ATTEMPTS}), retrying: {e}"
+                            )
+                            time.sleep(_SEED_ADD_RETRY_DELAY_SECONDS)
+                        else:
+                            logger.error(
+                                f"Frontier unavailable adding seed URL {url} after "
+                                f"{_SEED_ADD_MAX_ATTEMPTS} attempts; deferring to storage "
+                                f"for retry via --unfinished: {e}"
+                            )
+                consecutive_unavailable += 1
+            else:
+                logger.warning(
+                    f"Frontier still unavailable after {_SEED_ADD_CIRCUIT_BREAKER_THRESHOLD} "
+                    f"consecutive failures; deferring {url} to storage without retrying"
+                )
+
+            self.url_database.add_url(url, status="queued")
+            return "deferred"
+
+        return add
+
+    def _log_deferred_urls(self, deferred: int, total: int, what: str) -> None:
+        if not deferred:
+            return
+        logger.error(
+            f"{deferred}/{total} {what} could not be queued because the frontier "
+            "was unavailable; they were recorded in storage and will be picked up "
+            "by a subsequent run with --unfinished once the frontier recovers"
+        )
+
     def load_seed_urls(self) -> None:
         """Load seed URLs from seed files and add them to the frontier."""
         files = list(self.config.crawler.seed_files) + self.extra_seed_files
         loaded = 0
         accepted = 0
+        deferred = 0
+        add_url = self._make_seed_url_adder()
         for seed_file in files:
             for url in load_seeds(seed_file):
                 loaded += 1
-                if self.frontier.add_url(url, priority=self._priority_for_seed_url(url)):
+                outcome = add_url(url, self._priority_for_seed_url(url))
+                if outcome == "accepted":
                     accepted += 1
+                elif outcome == "deferred":
+                    deferred += 1
 
         logger.info(f"Loaded {accepted}/{loaded} seed URLs from {len(files)} file(s)")
+        self._log_deferred_urls(deferred, loaded, "seed URLs")
 
     def load_unfinished_urls(self) -> None:
         """Load queued and pending URLs from the database into the frontier."""
 
         unfinished_urls = self.url_database.get_urls_and_statuses(["queued", "pending"])
         accepted = 0
+        deferred = 0
+        add_url = self._make_seed_url_adder()
         for url, status in unfinished_urls:
-            if self.frontier.add_url(url, priority=self._priority_for_unfinished_url(url, status)):
+            priority = self._priority_for_unfinished_url(url, status)
+            outcome = add_url(url, priority)
+            if outcome == "accepted":
                 accepted += 1
+            elif outcome == "deferred":
+                deferred += 1
 
         logger.info(f"Loaded {accepted}/{len(unfinished_urls)} unfinished URLs from storage")
+        self._log_deferred_urls(deferred, len(unfinished_urls), "unfinished URLs")
 
     def prepare_frontier(self) -> None:
         """Populate the frontier according to the selected startup mode."""
@@ -279,16 +379,22 @@ class CrawlerManager:
             ]
 
         accepted = 0
+        deferred = 0
+        add_url = self._make_seed_url_adder()
         for item in discovered_items:
             source_query = getattr(item, "source_query", "")
-            if self.frontier.add_url(item.url, priority=item.priority, source_query=source_query):
+            outcome = add_url(item.url, item.priority, source_query)
+            if outcome == "accepted":
                 accepted += 1
+            elif outcome == "deferred":
+                deferred += 1
 
         logger.info(
             "Loaded {}/{} unique URLs from search discovery after blacklist and dedupe filtering",
             accepted,
             len(report.urls),
         )
+        self._log_deferred_urls(deferred, len(discovered_items), "discovered URLs")
 
     async def _recovery_loop(self) -> None:
         """Periodically reclaim abandoned inflight claims and promote due

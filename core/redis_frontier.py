@@ -24,7 +24,7 @@ from urllib.parse import urlparse
 import redis
 from loguru import logger
 
-from core.frontier import FrontierClaim
+from core.frontier import FrontierClaim, FrontierUnavailable
 from storage.url_database import URLDatabase
 from utils.url_utils import URLUtils
 
@@ -451,7 +451,7 @@ class RedisURLFrontier:
             )
         except redis.RedisError as e:
             logger.error(f"Redis error adding URL: {e}")
-            return False
+            raise FrontierUnavailable(f"add_url({cleaned!r}): {e}") from e
 
         if result:
             if self.url_database is not None:
@@ -491,7 +491,7 @@ class RedisURLFrontier:
                 )
             except redis.RedisError as e:
                 logger.error(f"Redis error getting next URL: {e}")
-                return None
+                raise FrontierUnavailable(f"get_next_url: {e}") from e
 
             if not result:
                 return None
@@ -527,6 +527,13 @@ class RedisURLFrontier:
     def renew_claim(self, claim: FrontierClaim) -> FrontierClaim | None:
         """Extend a claim's lease iff its token is still the current owner.
 
+        Returns `None` only when the claim is genuinely no longer current
+        (stale token -- already completed or reclaimed). Raises
+        `FrontierUnavailable` on a Redis failure instead of returning
+        `None`, so a transient outage during a heartbeat renewal is never
+        mistaken for a lost claim (see `core.claim_heartbeat.ClaimLostError`,
+        which is only raised for a genuine `None` here).
+
         Round trips: 1 (HGET + conditional ZADD in one Lua script).
         Complexity: O(1).
         """
@@ -536,7 +543,7 @@ class RedisURLFrontier:
             )
         except redis.RedisError as e:
             logger.error(f"Redis error renewing claim: {e}")
-            return None
+            raise FrontierUnavailable(f"renew_claim({claim.url!r}): {e}") from e
 
         if not result:
             return None
@@ -545,6 +552,11 @@ class RedisURLFrontier:
 
     def _complete(self, claim: FrontierClaim, outcome: str, error: str = "") -> str:
         """Shared implementation for mark_visited/mark_failed/mark_skipped.
+
+        Raises `FrontierUnavailable` on a Redis failure -- completion is a
+        mutating operation, so a caller that doesn't learn it failed would
+        wrongly believe the URL is resolved (see
+        docs/architecture/frontier-redis-failure-semantics.md).
 
         Round trips: 1 (single Lua script -- validate token, ZREM inflight,
         DEL claim, then branch to the terminal set or retry_scheduled).
@@ -565,7 +577,7 @@ class RedisURLFrontier:
             )
         except redis.RedisError as e:
             logger.error(f"Redis error completing claim ({outcome}): {e}")
-            return "error"
+            raise FrontierUnavailable(f"completing claim ({outcome}) for {claim.url!r}: {e}") from e
 
         if result == "stale":
             logger.debug(f"Stale claim ignored ({outcome}): {claim.url}")
@@ -629,7 +641,7 @@ class RedisURLFrontier:
             )
         except redis.RedisError as e:
             logger.error(f"Redis error during reclaim_and_promote: {e}")
-            return (0, 0)
+            raise FrontierUnavailable(f"reclaim_and_promote: {e}") from e
 
         reclaimed, requeued = result
         return int(reclaimed), int(requeued)
@@ -637,6 +649,11 @@ class RedisURLFrontier:
     def has_pending(self) -> bool:
         """Return True when the frontier still has queued, in-flight, or
         retry-pending work.
+
+        Raises `FrontierUnavailable` on a Redis failure instead of `False`:
+        an infrastructure failure is not evidence the frontier is empty, and
+        callers (crawler shutdown decisions) must not conflate the two (see
+        docs/architecture/frontier-redis-failure-semantics.md).
 
         Round trips: 1 (pipelined SCARD/SCARD/SCARD/SCARD).
         Complexity: O(1) -- derived from set/zset cardinalities, never a scan.
@@ -650,13 +667,16 @@ class RedisURLFrontier:
             known, visited, skipped, failed_permanent = pipe.execute()
         except redis.RedisError as e:
             logger.error(f"Redis error checking has_pending: {e}")
-            return False
+            raise FrontierUnavailable(f"has_pending: {e}") from e
 
         non_terminal = known - visited - skipped - failed_permanent
         return non_terminal > 0
 
     def pending_count(self) -> int:
         """Return the number of queued + retry-pending URLs (in-flight excluded).
+
+        Raises `FrontierUnavailable` on a Redis failure (propagated from
+        `get_status_counts`) rather than returning `0`.
 
         Round trips: 1 (pipelined cardinalities).
         Complexity: O(1).
@@ -687,6 +707,11 @@ class RedisURLFrontier:
         queue, so this stays O(1) regardless of how many domains exist --
         per-domain queue lengths are never enumerated.
 
+        Raises `FrontierUnavailable` on a Redis failure instead of an
+        all-zero dict -- a zero count here must mean "observed zero," never
+        "couldn't observe" (see
+        docs/architecture/frontier-redis-failure-semantics.md).
+
         Round trips: 1 (pipelined SCARD x4 + ZCARD x2).
         Complexity: O(1).
         """
@@ -701,14 +726,7 @@ class RedisURLFrontier:
             known, visited, skipped, failed_permanent, inflight, retry_scheduled = pipe.execute()
         except redis.RedisError as e:
             logger.error(f"Redis error getting status counts: {e}")
-            return {
-                "queued": 0,
-                "inflight": 0,
-                "retry_scheduled": 0,
-                "visited": 0,
-                "skipped": 0,
-                "failed_permanent": 0,
-            }
+            raise FrontierUnavailable(f"get_status_counts: {e}") from e
 
         queued = max(0, known - visited - skipped - failed_permanent - inflight - retry_scheduled)
         return {

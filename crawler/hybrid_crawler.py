@@ -13,7 +13,7 @@ from loguru import logger
 
 from core.claim_heartbeat import ClaimLostError, resolve_heartbeat_interval, run_with_heartbeat
 from core.crawler_router import CrawlerRouter
-from core.frontier import Frontier, FrontierClaim
+from core.frontier import Frontier, FrontierClaim, FrontierUnavailable
 from core.frontier_executor import AsyncFrontier
 from crawler.async_crawler import AsyncCrawler
 from crawler.http_crawler import HTTPCrawler
@@ -346,7 +346,12 @@ class HybridCrawler:
 
             except asyncio.CancelledError:
                 if claim is not None:
-                    await self.frontier.mark_failed(claim, "worker cancelled")
+                    try:
+                        await self.frontier.mark_failed(claim, "worker cancelled")
+                    except FrontierUnavailable as e:
+                        logger.warning(
+                            f"Frontier unavailable while abandoning cancelled claim for {url}: {e}"
+                        )
                 raise
             except ClaimLostError:
                 logger.warning(
@@ -354,10 +359,22 @@ class HybridCrawler:
                     "finished (crashed-worker recovery or another owner); abandoning "
                     "without marking completion"
                 )
+            except FrontierUnavailable as e:
+                logger.error(
+                    f"Frontier unavailable while processing {url}: {e}; abandoning "
+                    "without marking completion (lease-based recovery will retry once "
+                    "the frontier is reachable again)"
+                )
             except Exception as exc:
                 logger.error(f"Worker error for {url}: {exc}")
                 if claim is not None:
-                    await self.frontier.mark_failed(claim, str(exc))
+                    try:
+                        await self.frontier.mark_failed(claim, str(exc))
+                    except FrontierUnavailable as unavailable:
+                        logger.error(
+                            f"Frontier unavailable while recording failure for {url}: "
+                            f"{unavailable}; abandoning without marking completion"
+                        )
             finally:
                 self._active_workers = max(0, self._active_workers - 1)
                 self.queue.task_done()
@@ -366,20 +383,28 @@ class HybridCrawler:
         idle_loops = 0
 
         while not self._stop_event.is_set():
-            claim = await self.frontier.get_next_url()
+            try:
+                claim = await self.frontier.get_next_url()
+            except FrontierUnavailable as e:
+                logger.error(f"Frontier unavailable, will retry: {e}")
+                claim = None
 
             if claim:
                 idle_loops = 0
                 await self.queue.put(claim)
                 continue
 
-            if self.queue.empty() and self._active_workers == 0 and not await self.frontier.has_pending():
-                idle_loops += 1
-                if idle_loops >= 10:
-                    logger.info("No more URLs to crawl, stopping crawler")
-                    self._stop_event.set()
-                    break
-            else:
+            try:
+                if self.queue.empty() and self._active_workers == 0 and not await self.frontier.has_pending():
+                    idle_loops += 1
+                    if idle_loops >= 10:
+                        logger.info("No more URLs to crawl, stopping crawler")
+                        self._stop_event.set()
+                        break
+                else:
+                    idle_loops = 0
+            except FrontierUnavailable as e:
+                logger.error(f"Frontier unavailable while checking pending state, will retry: {e}")
                 idle_loops = 0
 
             await asyncio.sleep(0.5)
