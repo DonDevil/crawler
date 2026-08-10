@@ -1,5 +1,18 @@
 # Report Tool - SQLite & Redis Analysis
 
+> **Known bug, not yet fixed (documentation only — this file does not
+> modify code):** `tests/report.py --redis` queries `{namespace}:urls:queued`
+> and `{namespace}:urls:failed` via `SCARD`. The current production
+> frontier keyspace (`core/redis_frontier.py`) has no such keys — "queued"
+> is derived arithmetically rather than stored as a literal set, and the
+> terminal-failure set is named `{namespace}:urls:failed_permanent`, not
+> `{namespace}:urls:failed`. As a result, `--redis` mode currently always
+> reports `Total URLs Queued: 0` and `Total URLs Failed: 0` against a real
+> production Redis frontier. `--sql`/default (SQLite) mode is accurate
+> against the current `storage/url_database.py` schema. See
+> [`../docs/development.md`](development.md#how-to-run-tests) and
+> [`architecture/system-architecture.md` §25](architecture/system-architecture.md#25-current-limitations).
+
 The `tests/report.py` script analyzes crawler performance metrics from either SQLite database or Redis frontier.
 
 ## Features
@@ -180,6 +193,9 @@ The report continues with core metrics; piracy analysis is skipped.
 
 - **Data Source**: Redis sets and sorted sets (configured namespace)
 - **Deduplication**: Uses `{namespace}:urls:visited`, `{namespace}:urls:queued`, `{namespace}:urls:failed`
+  — **the last two do not exist in the current frontier keyspace** (see the
+  known-bug notice at the top of this file); only `visited` reads
+  correctly today.
 - **Time Tracking**: Optional metadata keys `{namespace}:metadata:first_crawl_time` and `{namespace}:metadata:last_crawl_time`
 - **Piracy Matching**: Iterates through set members, matches domain substring
 
@@ -224,5 +240,7 @@ The report continues with core metrics; piracy analysis is skipped.
 
 ---
 
-**Updated**: 2026-07-09  
-**Tested**: Both SQLite and Redis modes verified working
+**Updated**: 2026-07-09 (original), documentation corrected 2026-08-10.
+**Tested**: SQLite mode verified working against the current schema.
+Redis mode (`--redis`) has a known `queued`/`failed` reporting bug against
+the current frontier keyspace — see the notice at the top of this file.

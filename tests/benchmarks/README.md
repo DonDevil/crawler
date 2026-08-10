@@ -3,12 +3,15 @@
 Small, deterministic, manually-run scripts for comparing the local/SQLite
 frontier against the Redis frontier and validating Redis's distributed
 behavior (crash recovery, heartbeat renewal, priority/rate-limit
-scheduling). See `docs/architecture/frontier-adr.md` and
-`docs/architecture/frontier-step1.md`..`frontier-step5.md` for the design
-these scripts exercise. **No frontier code, Lua scripts, or crawler worker
-logic is touched by anything here** — these scripts only call the existing
-public `Frontier` API (`core/frontier.py`) against synthetic workloads; they
-do not perform real HTTP fetches or a real crawl.
+scheduling). See `docs/architecture/frontier-adr.md` for the design
+vocabulary and `docs/architecture/history/frontier-step1.md`..`frontier-step5.md`
+for the implementation history these scripts exercise. See
+`docs/benchmarks.md` for the current, consolidated interpretation of what
+these scripts have already established. **No frontier code, Lua scripts,
+or crawler worker logic is touched by anything here** — these scripts only
+call the existing public `Frontier` API (`core/frontier.py`) against
+synthetic workloads; they do not perform real HTTP fetches or a real
+crawl.
 
 None of these files match pytest's `test_*.py`/`*_test.py` discovery
 pattern on purpose, so `pytest` never auto-collects them — they're CLI
@@ -22,13 +25,15 @@ passed where available), so runs are repeatable.
 
 ## Scripts
 
-| Script                     | Purpose                                                                  |
-|----------------------------|--------------------------------------------------------------------------|
-| `frontier_benchmark.py`    | Single-process throughput/latency benchmark, local or Redis              |
-| `distributed_benchmark.py` | N independent OS processes racing against one shared Redis frontier      |
-| `crash_recovery.py`        | Deterministic kill-mid-claim → lease expiry → reclaim → re-claim timeline|
-| `heartbeat_endurance.py`   | Slow synthetic fetch exceeding `lease_ttl`, heartbeat on vs. off         |
-| `priority_ratelimit.py`    | Reports actual claim order across domains/priorities/rate gates          |
+| Script                       | Purpose                                                                  |
+|------------------------------|--------------------------------------------------------------------------|
+| `frontier_benchmark.py`      | Single-process throughput/latency benchmark, local or Redis              |
+| `distributed_benchmark.py`   | N independent OS processes racing against one shared Redis frontier      |
+| `crash_recovery.py`          | Deterministic kill-mid-claim → lease expiry → reclaim → re-claim timeline|
+| `heartbeat_endurance.py`     | Slow synthetic fetch exceeding `lease_ttl`, heartbeat on vs. off         |
+| `priority_ratelimit.py`      | Reports actual claim order across domains/priorities/rate gates          |
+| `domain_starvation.py`       | Reproduces strict-priority and `domain_scan_limit`-window starvation     |
+| `media_evidence_benchmark.py`| Insert/claim/completion throughput for the Media Evidence Redis backend  |
 
 Every script accepts `--output <path>` (writes JSON, or CSV with
 `--format csv`) in addition to printing the result to stdout. Every
@@ -186,6 +191,35 @@ rather than blocking the whole queue.
 python tests/benchmarks/priority_ratelimit.py
 python tests/benchmarks/priority_ratelimit.py --frontier redis --rate-limit 1.5
 python tests/benchmarks/priority_ratelimit.py --scenario fast:1:3,slow:1:3,filler:9:4 --rate-limit 1.0
+```
+
+## 6. Domain starvation probe
+
+Reproduces two distinct starvation mechanisms against either frontier
+backend via named scenarios: `finite`, `rate-limit-skip`, `replenish`,
+`scan-limit-window`, `retries`, `multi-worker`, `recovery`. Strict-priority
+starvation (a continuously-replenished high-priority domain can starve a
+low-priority one at `rate_limit=0`) and, Redis-only, `domain_scan_limit`
+window starvation (a domain ranked outside the top-K candidates is never
+examined by `claim_next` regardless of wait time).
+
+```bash
+python tests/benchmarks/domain_starvation.py replenish --high-count 5 --low-count 3
+python tests/benchmarks/domain_starvation.py scan-limit-window --domain-scan-limit 10 --domain-count 15
+```
+
+See `docs/architecture/system-architecture.md` §10-11 and
+`docs/architecture/history/domain-starvation-audit.md` for the full design
+and measured results.
+
+## 7. Media Evidence benchmark
+
+Insert/claim/completion throughput and duplicate-claim safety for
+`RedisMediaEvidenceStore` — the fingerprint-job-queue equivalent of
+`frontier_benchmark.py`.
+
+```bash
+python tests/benchmarks/media_evidence_benchmark.py --assets 500 --claim-workers 4
 ```
 
 ## Resource monitoring

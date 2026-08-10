@@ -1,11 +1,26 @@
 # Media Evidence — Distributed Redis Architecture (Design Only)
 
+> **Current status (added 2026-08-10, doc consolidation):** this design
+> has since been implemented as Phase 1 — see
+> [`media-evidence-step1.md`](media-evidence-step1.md) for the
+> implementation record (including the small number of deviations from
+> this design) and
+> [`system-architecture.md`](system-architecture.md#16-media-evidence-architecture)
+> for the current, as-built summary. The "no implementation" status line
+> directly below is the as-originally-written status, kept for historical
+> accuracy. This document remains the canonical **detailed design**
+> reference — its "Architecture Boundaries" section in particular
+> (Redis as sole production backend, no SQL↔Redis synchronization, no
+> fingerprinting logic in scope) is still the authoritative statement of
+> intent and is echoed verbatim in the implementation's own module
+> docstrings.
+
 Status: **architecture decision, no implementation**. Nothing in this document has been
 built. It defines the data model, Redis keyspace, distributed claim/lease semantics,
 durability boundary, and migration path for turning the current single-machine SQLite
 media-evidence store into a fleet-wide distributed subsystem, following the same pattern
 already proven for the URL frontier (`docs/architecture/frontier-adr.md`,
-`docs/architecture/redis-sqlite-boundary-decision.md`).
+`docs/architecture/history/redis-sqlite-boundary-decision.md`).
 
 Everywhere below, **CURRENT** describes what exists in the repository today (verified by
 reading the source, not inferred). **PROPOSED** describes the new architecture. The two are

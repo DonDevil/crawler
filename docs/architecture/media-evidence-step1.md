@@ -1,5 +1,12 @@
 # Media Evidence — Phase 1 Implementation
 
+> See [`system-architecture.md`](system-architecture.md#16-media-evidence-architecture)
+> for the current, as-built high-level summary, and
+> [`media-evidence-redis-design.md`](media-evidence-redis-design.md) for
+> the detailed design this phase implemented. This document is the
+> implementation record: what Phase 1 actually built, including where it
+> deviated from the design.
+
 Status: **implemented**. This document records what Phase 1 actually built,
 against the design in `docs/architecture/media-evidence-redis-design.md`
 (referenced below by section, e.g. "§5"). Phase 1 scope: the storage/

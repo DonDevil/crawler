@@ -1,287 +1,205 @@
-# Anti Piracy Web Crawler
+# Anti-Piracy Crawler
 
 ## Overview
 
-The **Anti Piracy Web Crawler** is a modular large-scale discovery engine designed to identify potential piracy sources across the **surface web and dark web**.
+The Anti-Piracy Crawler is a distributed discovery system that finds URLs
+which may host or link to pirated media. It discovers candidate URLs from
+search engines and seed lists, crawls them, extracts further links and any
+media it observes on the page, and records that media as **evidence** — a
+URL plus context and metadata — into a queue for a separate, future
+fingerprinting system to identify.
 
-It continuously discovers websites, crawls pages, extracts links, and builds a database of domains that may host or distribute pirated content.
+This repository implements discovery and crawling, plus the storage and
+distributed-coordination layer for that evidence. It does **not**
+implement fingerprinting, media downloading, or piracy classification
+itself — those are a separate project, described in
+[Current Status](#current-status) below.
 
-This crawler is part of a broader **anti-piracy research system** that will later integrate:
+## Architecture
 
-* Image fingerprinting
-* Video fingerprinting
-* Audio fingerprinting
-* Automated piracy detection
-
-At its current stage, the project focuses on **large-scale web discovery and crawling infrastructure**.
-
----
-
-## Project Structure
-
-```text
-crawler/
-
-├── main.py
-├── config.yaml
-├── requirements.txt
-
-├── core/
-│   ├── crawler_manager.py
-│   ├── scheduler.py
-│   ├── url_frontier.py
-│   ├── worker_pool.py
-│   └── rate_limiter.py
-
-├── discovery/
-│   ├── search_engine_discovery.py
-│   ├── piracy_site_seeds.py
-│   ├── darkweb_discovery.py
-│   ├── torrent_site_discovery.py
-│   └── domain_expander.py
-
-├── search_engines/
-│   ├── duckduckgo_search.py
-│   ├── bing_search.py
-│   ├── brave_search.py
-│   ├── yandex_search.py
-│   ├── ahmia_search.py
-│   ├── torch_search.py
-│   └── custom_query_generator.py
-
-├── crawler/
-│   ├── http_crawler.py
-│   ├── tor_crawler.py
-│   ├── playwright_crawler.py
-│   ├── selenium_crawler.py
-│   └── async_crawler.py
-
-├── parsers/
-│   ├── html_link_extractor.py
-│   ├── page_metadata_parser.py
-│   ├── media_link_detector.py
-│   └── javascript_link_extractor.py
-
-├── tor/
-│   ├── tor_manager.py
-│   ├── proxy_config.py
-│   └── onion_router.py
-
-├── storage/
-│   ├── url_database.py
-│   ├── crawl_state_db.py
-│   ├── domain_database.py
-│   └── result_exporter.py
-
-├── intelligence/
-│   ├── piracy_domain_classifier.py
-│   ├── domain_reputation.py
-│   └── duplicate_url_filter.py
-
-├── utils/
-│   ├── logger.py
-│   ├── url_utils.py
-│   ├── request_headers.py
-│   └── retry_handler.py
-
-├── seeds/
-│   ├── piracy_sites.txt
-│   ├── torrent_sites.txt
-│   ├── streaming_sites.txt
-│   ├── file_hosts.txt
-│   └── darkweb_seeds.txt
-
-├── datasets/
-│   ├── known_pirate_domains.txt
-│   └── domain_blacklist.txt
-
-├── tests/
-│   ├── crawler_test.py
-│   ├── parser_test.py
-│   └── discovery_test.py
-
-└── docs/
-    ├── architecture.md
-    ├── crawler_flow.md
-    └── modules.md
+```mermaid
+flowchart LR
+    D["Discovery<br/>(search engines, seeds, links)"] --> F["URL Frontier<br/>(Redis, distributed)"]
+    F --> W["Crawler workers"]
+    W --> F
+    W --> E["Media Evidence<br/>(Redis, distributed)"]
+    E -.-> FP["Fingerprinter fleet<br/>(separate project, future)"]
 ```
 
----
+Production runs multiple crawler machines against one shared Redis
+instance, which coordinates both the URL frontier and the media evidence
+store across the fleet. Full details, including claim/lease/recovery
+semantics and the Redis/SQLite boundary:
+[`docs/architecture/system-architecture.md`](docs/architecture/system-architecture.md).
 
-## System Requirements
+## Features
 
-### Operating System
+- Search-engine discovery across six engines (DuckDuckGo, Bing, Brave,
+  Yandex, Ahmia, Torch), with query-aware link scoring and automatic
+  backoff on blocked engines.
+- Seven crawler engine implementations (async HTTP, plain HTTP, Tor,
+  Playwright, Selenium, Scrapling, and a hybrid engine that escalates
+  per-URL between them).
+- A distributed, Redis-backed URL frontier: priority scheduling, per-domain
+  rate limiting, atomic distributed claims, lease-based crash recovery,
+  and retry/backoff — with an independent SQLite backend for local
+  development.
+- Media evidence recording: deterministic asset identity, observation
+  history, manifest-variant capture, and a distributed fingerprint-job
+  queue (claim/lease/retry/recovery, mirroring the frontier's model) for
+  a future fingerprinting consumer.
+- Domain blacklist filtering, media-URL classification, and trap/ad/
+  adult-content heuristics.
 
-Recommended:
+## Production Architecture
 
-* **Ubuntu 24.04 LTS**
-
-### Python
-
-```text
-Python 3.12+
 ```
-
-### Required Services
-
-Install required services:
-
-```bash
-sudo apt install tor redis-server postgresql chromium-browser
+crawler fleet (multiple machines running main.py)
+        │
+        ▼
+   shared Redis  ──────────────┐
+        │                      │
+        ▼                      ▼
+   URL frontier          Media Evidence
+   (namespace: crawler)  (namespace: evidence)
+        │                      │
+        ▼                      ▼
+   discovery + crawl     fingerprint-job queue
+                                │
+                                ▼
+                    future fingerprinter fleet
+                    (separate project, not in this repo)
 ```
-
-These services support:
-
-* **Tor** → dark web crawling
-* **Redis** → crawler queue / scheduling
-* **PostgreSQL** → persistent crawler data
-
----
 
 ## Installation
 
-Clone the repository:
-
 ```bash
-git clone https://github.com/DonDevil/crawler.git
+git clone <this-repository-url>
 cd crawler
-```
-
-Create a Python environment:
-
-```bash
-python3 -m venv env
-```
-
-Activate environment:
-
-```bash
+python3.12 -m venv env
 source env/bin/activate
-```
-
-Install dependencies:
-
-```bash
 pip install -r requirements.txt
 ```
 
-Install browser engines for Playwright:
+Redis is required for production/distributed mode; local development can
+run entirely on SQLite with no external services. Full setup, including
+Redis configuration and every real dependency:
+[`docs/installation.md`](docs/installation.md).
+
+## Configuration
+
+Runtime configuration lives in `config.yaml` at the repository root —
+crawler engine/concurrency, frontier backend and Redis settings, media
+evidence backend and Redis settings, seed files, and search-engine
+selection. Full structure and every field:
+[`docs/installation.md`](docs/installation.md#configuration).
+
+## Usage
 
 ```bash
-playwright install
-```
-
----
-
-## Running the Crawler
-
-Run the main crawler:
-
-```bash
+# Crawl from configured seed files
 python main.py
+
+# Discover and crawl from a search query
+python main.py --query "movie title"
+
+# Query discovery only, restricted to surface-web engines
+python main.py --query-only --surface-web --query "movie title"
+
+# Pick a specific crawler engine
+python main.py --crawler-engine playwright
+
+# Resume a previous run from stored state
+python main.py --unfinished
+
+# Run until the frontier is genuinely empty, no page cap
+python main.py --indefinite-run
 ```
 
-Useful startup modes:
+Every CLI flag, verified against the current `argparse` definition, with
+working examples: [`docs/installation.md`](docs/installation.md#running).
+
+## Testing
 
 ```bash
-python main.py --query "movie title"
-python main.py --query-only --query "movie title"
-python main.py --query-only --surface-web --query "movie title"
-python main.py --query-only --dark-web --query "movie title"
-python main.py --unfinished
-python main.py --crawler-engine http
-python main.py --crawler-engine tor
-python main.py --crawler-engine playwright
-python main.py --crawler-engine selenium
+pytest
 ```
 
-The system will:
+Redis-dependent tests self-skip if no Redis is reachable; browser-crawler
+tests require `RUN_BROWSER_CRAWLER_TESTS=1`. Benchmark scripts (throughput,
+crash recovery, heartbeat endurance, domain-starvation, priority/rate-limit
+behavior) live in `tests/benchmarks/` and are run manually, not via pytest:
 
-1. Load seed URLs
-2. Discover domains from search engines
-3. Add URLs to the frontier
-4. Crawl pages using the selected crawler engine
-5. Extract links for further discovery
+```bash
+python tests/benchmarks/frontier_benchmark.py --frontier redis --urls 10000 --workers 8
+```
 
-Search discovery is configurable through `config.yaml`. The crawler now supports DuckDuckGo, Bing, Brave, Yandex, Ahmia, and Torch search adapters, but some engines may still return no results at runtime when they require captcha verification, JavaScript-only flows, or a reachable Tor proxy.
+Full testing and benchmarking guide:
+[`docs/development.md`](docs/development.md#how-to-run-tests) and
+[`docs/benchmarks.md`](docs/benchmarks.md).
 
-Crawler implementation is also configurable through `config.yaml` using `crawler.engine` (`auto`, `async`, `http`, `tor`, `playwright`, `selenium`) or with `--crawler-engine` from CLI. The default `auto` mode keeps one shared frontier and routes each URL to the most suitable crawler strategy instead of forcing a single engine for the entire run.
+## Project Structure
 
-`--query-only` skips configured seed files and starts from search results only. `--unfinished` resumes `queued` and `pending` URLs from `storage/crawl_state.db` without loading seed files or running fresh discovery.
+```
+main.py              CLI entry point
+config.yaml           runtime configuration
+core/                 orchestration, frontier, config
+crawler/              7 crawler-engine implementations
+discovery/            seed loading + search-engine discovery
+search_engines/       6 search-engine scraping adapters
+parsers/               link/media/manifest extraction
+storage/               SQLite + Redis backends (URL DB, media evidence)
+intelligence/          fetch-routing classifier
+tor/                   Tor SOCKS proxy configuration
+utils/                 URL utilities, logging
+seeds/, datasets/      seed lists, domain blacklist
+tests/                 pytest suite + tests/benchmarks/ (manual scripts)
+docs/                  documentation (see below)
+```
 
-`--surface-web` restricts query discovery to DuckDuckGo, Bing, Brave, and Yandex. `--dark-web` restricts query discovery to Ahmia and Torch. If neither flag is used, query discovery uses all enabled engines.
+## Documentation
 
-Discovery results are now scored before they enter the frontier. Lower scores are crawled first, with Torch and Ahmia results preferred over surface-web engines by default, and `.onion` URLs receiving an additional priority boost. Engines that return repeated blocked responses, such as Yandex captcha challenges, are temporarily backed off for the rest of the query batch instead of being retried on every query.
+- [`docs/architecture/system-architecture.md`](docs/architecture/system-architecture.md) — the current system, end to end.
+- [`docs/development.md`](docs/development.md) — repository structure, conventions, how to extend the crawler.
+- [`docs/installation.md`](docs/installation.md) — setup, configuration reference, every CLI command.
+- [`docs/benchmarks.md`](docs/benchmarks.md) — what's been measured about frontier/evidence performance and why.
+- [`docs/architecture/frontier-adr.md`](docs/architecture/frontier-adr.md) — detailed frontier design.
+- [`docs/architecture/media-evidence-redis-design.md`](docs/architecture/media-evidence-redis-design.md) — detailed Media Evidence design.
+- [`docs/architecture/media-evidence-step1.md`](docs/architecture/media-evidence-step1.md) — Media Evidence Phase 1 implementation record.
+- [`docs/architecture/history/`](docs/architecture/history/) — investigation and decision records (Redis/SQLite boundary, frontier performance, domain starvation, blacklist incident, and more), preserved for their reasoning and measurements.
 
-During page crawling, the HTML parser now stays focused on same-site links and only keeps a small number of strongly relevant cross-domain targets per page. This prevents noisy ad, profile, and generic blog links from exploding the queue during long runs.
+## Current Status
 
----
+- **Crawler (discovery, frontier, crawling, extraction):** implemented and
+  validated, including the distributed Redis frontier with claim/lease/
+  heartbeat/recovery.
+- **Media Evidence Phase 1 (storage + distributed coordination):**
+  implemented and validated.
+- **Fingerprinting (DINOv2, pHash, audio, temporal verification,
+  FFmpeg processing):** not implemented in this repository. It is a
+  separate, not-yet-built project that will consume the fingerprint-job
+  queue this repository produces.
+- The complete anti-piracy pipeline (discovery → crawl → evidence →
+  fingerprint match → confirmed-match feedback) is **not** finished —
+  only the discovery/crawl/evidence portion exists today.
 
-## Core Components
+## Roadmap
 
-### URL Frontier
-
-Controls:
-
-* URL deduplication
-* crawl scheduling
-* domain politeness rules
-* crawl priority
-
-### Discovery Engine
-
-Discovers domains from:
-
-* search engines
-* torrent indexes
-* piracy site seeds
-* dark web search engines
-
-### Crawlers
-
-Multiple crawling strategies:
-
-* HTTP crawler
-* Async crawler
-* Tor crawler
-* Playwright crawler
-* Selenium crawler
-
-### Parsers
-
-Extract information from pages:
-
-* internal links
-* external links
-* media URLs
-* metadata
-
----
-
-## Future Development
-
-Planned enhancements include:
-
-* Image piracy detection
-* Video fingerprint matching
-* Audio fingerprinting
-* Distributed crawler nodes
-* AI-based piracy classification
-* Automated evidence generation
-
----
+- A separate fingerprinter project/environment implementing real media
+  download and fingerprinting algorithms against the existing
+  fingerprint-job queue.
+- A consumer of the `confirmed_match` Redis event stream for domain-score
+  feedback.
+- The eligible-domain-index frontier scheduling redesign, if telemetry
+  ever shows the current `domain_scan_limit` cutoff becoming a real
+  constraint.
 
 ## Legal Notice
 
-This project is intended for **research and anti-piracy investigation purposes only**.
-
-Users must ensure all crawling activities comply with:
-
-* applicable laws
-* website terms of service
-* ethical research guidelines
-
----
+This project is intended for research and anti-piracy investigation
+purposes only. Users must ensure all crawling activity complies with
+applicable laws, website terms of service, and ethical research
+guidelines.
 
 ## License
 

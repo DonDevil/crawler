@@ -1,5 +1,20 @@
 # ADR: Frontier Contract + Redis Frontier v2 (Revision 2)
 
+> **Current status (added 2026-08-10, doc consolidation):** this ADR's
+> design has since been fully implemented and is live in production. The
+> "implementation not started" status line directly below is the
+> as-originally-written status and is kept for historical accuracy — do
+> not read it as current. For the as-built current state, see
+> [`system-architecture.md`](system-architecture.md#7-frontier-architecture).
+> The implementation history (each migration step) is archived under
+> [`history/frontier-step1.md`](history/frontier-step1.md) through
+> [`history/frontier-step5.md`](history/frontier-step5.md) and
+> [`history/frontier-redis-failure-semantics.md`](history/frontier-redis-failure-semantics.md).
+> This document remains the canonical **design vocabulary** reference
+> (states, keyspace shape, claim/lease principles) — its content below is
+> still accurate against current source except where a later step
+> explicitly changed a detail (each step doc notes its own deltas).
+
 Status: design approved with changes below, **implementation not started**. This revision incorporates: failure classification (Decision 1), asyncio-background lease recovery (Decision 2), `domain_heads`-based global priority (Decision 3), typed `FrontierClaim` tokens, a renewal recommendation, and an explicit metadata lifecycle.
 
 ---
