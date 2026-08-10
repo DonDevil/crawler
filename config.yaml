@@ -54,6 +54,39 @@ crawler:
     media_sqlite_path: "storage/media_evidence.db"
     enable_media_evidence: true
     enqueue_media_jobs: true
+  # Media evidence storage/coordination backend (see
+  # docs/architecture/media-evidence-redis-design.md and
+  # docs/architecture/media-evidence-step1.md). Independent of the URL
+  # frontier above -- its own namespace, its own Redis connection settings.
+  # There is NO fallback from redis to sqlite: if type is "redis" and Redis
+  # is unavailable, the crawler fails to start rather than silently using
+  # SQLite (a production Redis outage must be visible, not masked).
+  media_evidence:
+    #type: "sqlite"
+    type: "redis"
+    redis_host: "localhost"
+    redis_port: 6379
+    redis_namespace: "evidence"
+    # Bounded observation/variant retention per asset (§4/§10) -- exact
+    # counts are always tracked separately (HINCRBY), only the *detailed*
+    # history is capped.
+    max_observations_per_asset: 20
+    max_variants_per_asset: 20
+    # Fingerprint job lease + heartbeat (§7). An order of magnitude longer
+    # than the frontier's lease_ttl (90s) -- fingerprinting (download +
+    # FFmpeg + DINOv2/pHash/audio) is minutes, not milliseconds. Leave
+    # fingerprint_heartbeat_interval unset (null) to auto-derive lease/3.
+    fingerprint_lease_ttl: 900.0
+    #fingerprint_heartbeat_interval: null
+    # Retry/backoff -- smaller max_retries than the frontier's (3) given
+    # fingerprinting's higher per-attempt cost.
+    max_retries: 2
+    base_backoff: 5.0
+    max_backoff: 300.0
+    # Redis-only: reclaim sweep batch size and confirmed_match event
+    # stream trim length.
+    reclaim_batch_size: 200
+    confirmed_match_stream_maxlen: 10000
 search:
   enabled_engines:
     - "duckduckgo"

@@ -23,12 +23,65 @@ def _resolve_path(path: str, base_dir: Path) -> str:
 import yaml
 from pydantic import BaseModel, Field
 
+from storage.media_evidence_store import (
+    DEFAULT_FINGERPRINT_LEASE_TTL,
+    DEFAULT_MAX_OBSERVATIONS_PER_ASSET,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_MAX_VARIANTS_PER_ASSET,
+)
+
 
 class StorageConfig(BaseModel):
     sqlite_path: str = "storage/crawl_state.db"
     media_sqlite_path: str = "storage/media_evidence.db"
     enable_media_evidence: bool = True
     enqueue_media_jobs: bool = True
+
+
+class MediaEvidenceConfig(BaseModel):
+    """Configuration for the media evidence storage/coordination backend.
+
+    Mirrors `FrontierConfig`'s shape (`type: sqlite|redis`, its own Redis
+    connection/namespace settings) but is fully independent -- see
+    docs/architecture/media-evidence-redis-design.md, "Architecture
+    Boundaries": there is no fallback from redis to sqlite, and the two
+    backends never share state. `storage.sqlite_path`/`enable_media_evidence`
+    above are unchanged and still control the SQLite file path and the
+    overall on/off toggle; `type` here only selects which backend is used
+    when media evidence is enabled.
+    """
+
+    type: str = "sqlite"  # 'sqlite' or 'redis'
+    redis_host: str = "localhost"
+    redis_port: int = 6379
+    redis_db: int = 0
+    redis_namespace: str = "evidence"
+
+    # §4/§10: bounded retention -- configurable, not hardcoded throughout
+    # the store implementations.
+    max_observations_per_asset: int = DEFAULT_MAX_OBSERVATIONS_PER_ASSET
+    max_variants_per_asset: int = DEFAULT_MAX_VARIANTS_PER_ASSET
+
+    # Fingerprint job lease/heartbeat (§7) -- an order of magnitude longer
+    # than the frontier's URL-fetch lease_ttl (90s) because fingerprinting
+    # is minutes, not milliseconds. `fingerprint_heartbeat_interval` left
+    # as None auto-derives a safe interval from fingerprint_lease_ttl
+    # (core.claim_heartbeat.default_heartbeat_interval), same convention as
+    # FrontierConfig.heartbeat_interval -- always clamped below the lease
+    # regardless of what's configured here.
+    fingerprint_lease_ttl: float = DEFAULT_FINGERPRINT_LEASE_TTL
+    fingerprint_heartbeat_interval: Optional[float] = None
+
+    # §8: retry/backoff, deliberately a smaller default budget than the
+    # frontier's (3) given fingerprinting's higher per-attempt cost.
+    max_retries: int = DEFAULT_MAX_RETRIES
+    base_backoff: float = 5.0
+    max_backoff: float = 300.0
+
+    # Redis-only: reclaim sweep batch size (§6) and confirmed_match event
+    # stream trim length (§13/§19). Meaningless for the SQLite backend.
+    reclaim_batch_size: int = 200
+    confirmed_match_stream_maxlen: int = 10000
 
 
 class FrontierConfig(BaseModel):
@@ -131,6 +184,7 @@ class CrawlerConfig(BaseModel):
     ])
     storage: StorageConfig = StorageConfig()
     frontier: FrontierConfig = FrontierConfig()
+    media_evidence: MediaEvidenceConfig = MediaEvidenceConfig()
 
 
 class Config(BaseModel):

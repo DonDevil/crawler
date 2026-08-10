@@ -1,7 +1,7 @@
 """Tests for HLS and DASH manifest expansion and evidence storage."""
 
 from parsers.streaming_manifest_parser import StreamingManifestParser
-from storage.media_evidence_database import MediaEvidenceDatabase
+from storage.sqlite_media_evidence_store import SQLiteMediaEvidenceStore
 
 
 def test_hls_manifest_parser_extracts_variant_streams():
@@ -52,19 +52,19 @@ def test_dash_manifest_parser_extracts_representations():
     assert result["variants"][1]["bandwidth"] == 2800000
 
 
-def test_media_evidence_database_stores_manifest_variants(tmp_path):
+def test_media_evidence_store_stores_manifest_variants(tmp_path):
     db_path = tmp_path / "media_evidence.db"
-    database = MediaEvidenceDatabase(path=str(db_path))
+    store = SQLiteMediaEvidenceStore(path=str(db_path))
 
     try:
-        asset_id = database.record_media_link(
+        asset_id = store.record_media_link(
             url="https://cdn.example/master.m3u8",
             source_page="https://piracy.example/watch/film",
             discovered_by="playwright",
             discovery_method="network-response",
             media_type="stream-manifest",
         )
-        database.record_manifest_variants(
+        store.record_manifest_variants(
             asset_id,
             [
                 {"url": "https://cdn.example/low/playlist.m3u8", "bandwidth": 1280000, "resolution": "640x360"},
@@ -72,9 +72,9 @@ def test_media_evidence_database_stores_manifest_variants(tmp_path):
             ],
         )
 
-        variants = database.list_manifest_variants(asset_id)
+        variants = store.list_manifest_variants(asset_id)
         assert len(variants) == 2
         assert variants[0]["variant_url"] == "https://cdn.example/low/playlist.m3u8"
         assert variants[1]["bandwidth"] == 2560000
     finally:
-        database.close()
+        store.close()

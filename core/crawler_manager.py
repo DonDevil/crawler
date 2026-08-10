@@ -24,7 +24,9 @@ from discovery.piracy_site_seeds import load_seeds
 from discovery.search_engine_discovery import discover_urls_from_queries_with_report, get_engine_names_for_scope
 from parsers.html_link_extractor import HTMLLinkExtractor
 from storage.domain_database import DomainDatabase
-from storage.media_evidence_database import MediaEvidenceDatabase
+from storage.media_evidence_store import MediaEvidenceStore
+from storage.redis_media_evidence_store import RedisMediaEvidenceStore
+from storage.sqlite_media_evidence_store import SQLiteMediaEvidenceStore
 from storage.url_database import URLDatabase
 from utils.logger import configure_logging
 from utils.url_utils import URLUtils
@@ -48,6 +50,59 @@ _SEED_ADD_RETRY_DELAY_SECONDS = 0.5
 _SEED_ADD_CIRCUIT_BREAKER_THRESHOLD = 3
 
 
+def build_media_evidence_store(config: Config) -> Optional[MediaEvidenceStore]:
+    """Construct the configured media evidence backend, or `None` if media
+    evidence is disabled entirely.
+
+    Module-level (not a `CrawlerManager` method) so `main.py`'s CLI stub
+    (`--claim-fingerprint-job`/`--complete-fingerprint-job`) can select the
+    same backend without constructing a full `CrawlerManager` (crawler
+    engine, discovery, frontier, ...).
+
+    Deliberately does NOT mirror the frontier's redis-unavailable ->
+    sqlite fallback: a production Redis outage for media evidence must be
+    visible as a startup failure, not silently degrade to a different
+    backend (docs/architecture/media-evidence-step1.md, "Backend
+    selection"). If `media_evidence.type` is "redis" and Redis is
+    unreachable, this raises and the caller's construction fails.
+    """
+    if not config.crawler.storage.enable_media_evidence:
+        return None
+
+    media_evidence_config = config.crawler.media_evidence
+    if media_evidence_config.type.lower() == "redis":
+        store: MediaEvidenceStore = RedisMediaEvidenceStore(
+            redis_host=media_evidence_config.redis_host,
+            redis_port=media_evidence_config.redis_port,
+            redis_db=media_evidence_config.redis_db,
+            namespace=media_evidence_config.redis_namespace,
+            max_observations_per_asset=media_evidence_config.max_observations_per_asset,
+            max_variants_per_asset=media_evidence_config.max_variants_per_asset,
+            fingerprint_lease_ttl=media_evidence_config.fingerprint_lease_ttl,
+            max_retries=media_evidence_config.max_retries,
+            base_backoff=media_evidence_config.base_backoff,
+            max_backoff=media_evidence_config.max_backoff,
+            reclaim_batch_size=media_evidence_config.reclaim_batch_size,
+            confirmed_match_stream_maxlen=media_evidence_config.confirmed_match_stream_maxlen,
+        )
+        logger.info(
+            f"Using Redis media evidence store at {media_evidence_config.redis_host}:"
+            f"{media_evidence_config.redis_port}/{media_evidence_config.redis_db} "
+            f"ns={media_evidence_config.redis_namespace}"
+        )
+        return store
+
+    store = SQLiteMediaEvidenceStore(
+        path=config.crawler.storage.media_sqlite_path,
+        fingerprint_lease_ttl=media_evidence_config.fingerprint_lease_ttl,
+        max_retries=media_evidence_config.max_retries,
+        base_backoff=media_evidence_config.base_backoff,
+        max_backoff=media_evidence_config.max_backoff,
+    )
+    logger.info(f"Using SQLite media evidence store at {config.crawler.storage.media_sqlite_path}")
+    return store
+
+
 class CrawlerManager:
     """Top-level crawler coordinator."""
 
@@ -68,11 +123,7 @@ class CrawlerManager:
 
         self.url_database = URLDatabase(path=self.config.crawler.storage.sqlite_path)
         self.domain_database = DomainDatabase(path=self.config.crawler.storage.sqlite_path)
-        self.media_database = (
-            MediaEvidenceDatabase(path=self.config.crawler.storage.media_sqlite_path)
-            if self.config.crawler.storage.enable_media_evidence
-            else None
-        )
+        self.media_database: Optional[MediaEvidenceStore] = build_media_evidence_store(self.config)
 
         # Initialize frontier based on config
         frontier_config = self.config.crawler.frontier

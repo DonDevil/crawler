@@ -6,9 +6,9 @@ import argparse
 import asyncio
 import json
 
-from core.crawler_manager import CrawlerManager
-from storage.domain_database import DomainDatabase
-from storage.media_evidence_database import MediaEvidenceDatabase
+from core.config import load_config
+from core.crawler_manager import CrawlerManager, build_media_evidence_store
+from storage.media_evidence_store import FingerprintResult
 
 
 def main() -> None:
@@ -57,29 +57,47 @@ def main() -> None:
         help="Allow crawling domains listed in datasets/domain_blacklist.txt.",
     )
     parser.add_argument(
-        "--claim-sample-job",
+        "--media-backend",
+        choices=["sqlite", "redis"],
+        help="Override config.yaml's crawler.media_evidence.type for this run.",
+    )
+    parser.add_argument(
+        "--claim-fingerprint-job",
         action="store_true",
-        help="Claim the next pending media sample job for the future fingerprinter service.",
+        help="Claim the next queued fingerprint job for the future fingerprinter service "
+        "and print it (including its claim token) as JSON.",
     )
     parser.add_argument(
         "--worker-name",
         default="fingerprinter-worker",
-        help="Worker name to use when claiming a sample job.",
+        help="Worker id to use when claiming a fingerprint job.",
     )
     parser.add_argument(
-        "--mark-match",
-        type=int,
-        help="Mark a media asset ID as matched and increase the source site's priority score.",
+        "--complete-fingerprint-job",
+        dest="complete_asset_id",
+        metavar="ASSET_ID",
+        help="Complete a previously claimed fingerprint job for this asset id "
+        "(requires --claim-token from a prior --claim-fingerprint-job call).",
+    )
+    parser.add_argument(
+        "--claim-token",
+        help="Claim token to present when completing a fingerprint job.",
+    )
+    parser.add_argument(
+        "--decision",
+        choices=["confirmed", "rejected", "uncertain"],
+        default="confirmed",
+        help="Aggregate fingerprint decision to record when completing a job.",
     )
     parser.add_argument(
         "--match-title",
-        help="Human-readable title for the confirmed matched media asset.",
+        help="Human-readable title for a confirmed matched media asset.",
     )
     parser.add_argument(
         "--match-confidence",
         type=float,
         default=1.0,
-        help="Confidence score for a confirmed matched media asset.",
+        help="Confidence score to record when completing a fingerprint job.",
     )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
@@ -106,34 +124,45 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.claim_sample_job or args.mark_match is not None:
-        media_db = MediaEvidenceDatabase()
+    if args.claim_fingerprint_job or args.complete_asset_id is not None:
+        config = load_config()
+        if args.media_backend:
+            config.crawler.media_evidence.type = args.media_backend
+
+        media_store = build_media_evidence_store(config)
+        if media_store is None:
+            parser.error("Media evidence is disabled (crawler.storage.enable_media_evidence: false)")
+
         try:
-            if args.claim_sample_job:
-                job: dict | None = media_db.claim_next_sample_job(worker_name=args.worker_name)
-                print(json.dumps(job or {}, indent=2, sort_keys=True))
+            if args.claim_fingerprint_job:
+                job = media_store.claim_next_fingerprint_job(worker_id=args.worker_name)
+                print(json.dumps(job.__dict__ if job else {}, indent=2, sort_keys=True))
                 return
 
-            if args.mark_match is not None:
-                domain_db = DomainDatabase()
-                try:
-                    domain = media_db.mark_asset_matched(
-                        args.mark_match,
-                        matched_title=args.match_title or "Matched media",
-                        confidence=args.match_confidence,
-                        domain_database=domain_db,
-                        score_increment=2.0,
-                    )
-                    print(json.dumps({
-                        "asset_id": args.mark_match,
-                        "matched_domain": domain,
-                        "confidence": args.match_confidence,
-                    }, indent=2, sort_keys=True))
-                    return
-                finally:
-                    domain_db.close()
+            if args.complete_asset_id is not None:
+                if not args.claim_token:
+                    parser.error("--complete-fingerprint-job requires --claim-token")
+
+                result = FingerprintResult(
+                    aggregate_decision=args.decision,
+                    confidence=args.match_confidence,
+                    matched_title=args.match_title,
+                    worker_id=args.worker_name,
+                )
+                completed = media_store.complete_fingerprint_job(
+                    args.complete_asset_id, args.claim_token, result=result
+                )
+                print(json.dumps({
+                    "asset_id": args.complete_asset_id,
+                    "completed": completed,
+                    "decision": args.decision,
+                    "confidence": args.match_confidence,
+                    "note": "confirmed_match event feedback to domain scoring is a future consumer "
+                    "(docs/architecture/media-evidence-redis-design.md §19) -- not run by this CLI.",
+                }, indent=2, sort_keys=True))
+                return
         finally:
-            media_db.close()
+            media_store.close()
 
     manager = CrawlerManager(
         extra_seed_files=args.seed_files,
