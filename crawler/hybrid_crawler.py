@@ -15,6 +15,7 @@ from core.claim_heartbeat import ClaimLostError, resolve_heartbeat_interval, run
 from core.crawler_router import CrawlerRouter
 from core.frontier import Frontier, FrontierClaim, FrontierUnavailable
 from core.frontier_executor import AsyncFrontier
+from core.media_evidence_executor import AsyncMediaEvidence
 from core.url_frontier import URLFrontier
 from crawler.async_crawler import AsyncCrawler
 from crawler.http_crawler import HTTPCrawler
@@ -62,7 +63,12 @@ class HybridCrawler:
         # See docs/architecture/redis-sqlite-boundary-decision.md: mirroring
         # status into url_database only applies to the local frontier.
         self._sql_mode_mirror = url_database is not None and isinstance(self.frontier.raw, URLFrontier)
-        self.media_database = media_database
+        # Non-blocking boundary for Media Evidence writes made from the
+        # crawl-time hot path -- see core/media_evidence_executor.py and
+        # docs/architecture/fetch-extractor-audit.md §8/§14. `None` stays
+        # `None` so every existing `if not self.media_database` guard is
+        # unaffected.
+        self.media_database = AsyncMediaEvidence(media_database) if media_database is not None else None
         self.scrapling_enabled = scrapling_enabled
         self.router = CrawlerRouter(allow_scrapling=self.scrapling_enabled)
 
@@ -92,10 +98,11 @@ class HybridCrawler:
         self._playwright_semaphore = asyncio.Semaphore(max(1, min(2, self.concurrency)))
         self._selenium_semaphore = asyncio.Semaphore(1)
 
-        # Sub-engines wrap `frontier` themselves (each backend wraps whatever
-        # it's given in its own __init__) -- pass the raw object here, not
-        # self.frontier, so it isn't wrapped twice. AsyncFrontier is
-        # idempotent if this ever changes, but staying explicit is clearer.
+        # Sub-engines wrap `frontier`/`media_database` themselves (each
+        # backend wraps whatever it's given in its own __init__) -- pass the
+        # raw objects here, not self.frontier/self.media_database, so
+        # neither is wrapped twice. Both adapters are idempotent if this
+        # ever changes, but staying explicit is clearer.
         common_args = {
             "frontier": frontier,
             "parser": self.parser,
@@ -105,7 +112,7 @@ class HybridCrawler:
             "max_pages": self.max_pages,
             "user_agent": self.user_agent,
             "url_database": self.url_database,
-            "media_database": self.media_database,
+            "media_database": media_database,
             "heartbeat_interval": self.heartbeat_interval,
         }
         self._async_engine = AsyncCrawler(**common_args)
@@ -311,7 +318,7 @@ class HybridCrawler:
                         if not self.media_database:
                             continue
                         try:
-                            self.media_database.record_media_link(
+                            await self.media_database.record_media_link(
                                 url=media["url"],
                                 source_page=url,
                                 referrer_url=url,

@@ -11,6 +11,7 @@ from loguru import logger
 from core.claim_heartbeat import ClaimLostError, resolve_heartbeat_interval, run_with_heartbeat
 from core.frontier import Frontier, FrontierClaim, FrontierUnavailable
 from core.frontier_executor import AsyncFrontier
+from core.media_evidence_executor import AsyncMediaEvidence
 from core.url_frontier import URLFrontier
 from parsers.streaming_manifest_parser import StreamingManifestParser
 from storage.url_database import URLDatabase
@@ -48,7 +49,10 @@ class HTTPCrawler:
 		# See docs/architecture/redis-sqlite-boundary-decision.md: mirroring
 		# status into url_database only applies to the local frontier.
 		self._sql_mode_mirror = url_database is not None and isinstance(self.frontier.raw, URLFrontier)
-		self.media_database = media_database
+		# Non-blocking boundary for Media Evidence writes -- see
+		# core/media_evidence_executor.py and
+		# docs/architecture/fetch-extractor-audit.md §8/§14.
+		self.media_database = AsyncMediaEvidence(media_database) if media_database is not None else None
 		self._manifest_parser = StreamingManifestParser()
 
 		self.queue: asyncio.Queue[FrontierClaim] = asyncio.Queue()
@@ -90,7 +94,7 @@ class HTTPCrawler:
 						or URLUtils.is_media_file(final_url)
 					):
 						body_text = response.text
-						asset_id = self.media_database.record_media_link(
+						asset_id = await self.media_database.record_media_link(
 							url=final_url,
 							source_page=url,
 							referrer_url=url,
@@ -103,7 +107,7 @@ class HTTPCrawler:
 						)
 						if URLUtils.classify_media_url(final_url, content_type) == "stream-manifest":
 							parsed = self._manifest_parser.parse_manifest(body_text, manifest_url=final_url)
-							self.media_database.record_manifest_variants(asset_id, parsed.get("variants", []))
+							await self.media_database.record_manifest_variants(asset_id, parsed.get("variants", []))
 						return "", None
 					return None, f"Unsupported content type: {content_type}"
 
@@ -155,7 +159,7 @@ class HTTPCrawler:
 						if not self.media_database:
 							continue
 						try:
-							self.media_database.record_media_link(
+							await self.media_database.record_media_link(
 								url=media["url"],
 								source_page=url,
 								referrer_url=url,

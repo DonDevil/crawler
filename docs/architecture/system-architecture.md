@@ -6,7 +6,10 @@
 > design vocabulary, see [`frontier-adr.md`](frontier-adr.md). For the
 > detailed Media Evidence design, see
 > [`media-evidence-redis-design.md`](media-evidence-redis-design.md) and its
-> implementation record, [`media-evidence-step1.md`](media-evidence-step1.md).
+> implementation records, [`media-evidence-step1.md`](media-evidence-step1.md)
+> (storage/coordination) and
+> [`history/media-evidence-step2.md`](history/media-evidence-step2.md) (async
+> execution boundary).
 
 Every capability below is tagged:
 
@@ -437,7 +440,10 @@ coding-conventions section.
 
 **IMPLEMENTED** (Phase 1 — storage and coordination only). Full design:
 [`media-evidence-redis-design.md`](media-evidence-redis-design.md). Full
-implementation record: [`media-evidence-step1.md`](media-evidence-step1.md).
+implementation record: [`media-evidence-step1.md`](media-evidence-step1.md)
+(storage/coordination layer) and
+[`media-evidence-step2.md`](history/media-evidence-step2.md) (the async
+execution boundary described in [§19](#19-crawler--media-evidence-boundary)).
 
 Three files in `storage/`:
 
@@ -530,6 +536,18 @@ finds a media URL on a crawled page — plus `record_manifest_variants(...)`
 when a streaming manifest is parsed. The crawler never claims, completes,
 or otherwise touches the fingerprint-job queue during a normal crawl; that
 queue exists to be consumed by a different process.
+
+`AsyncMediaEvidence` (`core/media_evidence_executor.py`) wraps whichever
+`MediaEvidenceStore` backend is active and is what every crawler engine
+actually holds a reference to as `self.media_database`: both calls above
+are offloaded via `asyncio.to_thread`, so neither the synchronous
+`redis-py` client (`RedisMediaEvidenceStore`) nor `sqlite3`
+(`SQLiteMediaEvidenceStore`) ever blocks the event loop — unlike
+`AsyncFrontier` ([§7](#7-frontier-architecture)), which skips the offload
+for the local frontier backend, `AsyncMediaEvidence` always offloads, since
+neither Media Evidence backend is guaranteed non-blocking. See
+[`history/media-evidence-step2.md`](history/media-evidence-step2.md) for
+the motivating finding and full implementation record.
 
 ## 20. Media Evidence → future Fingerprinter boundary
 
