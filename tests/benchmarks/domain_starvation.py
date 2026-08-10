@@ -115,6 +115,11 @@ def compute_fairness(claim_log: list[dict], domain_meta: dict[str, dict]) -> dic
     return stats
 
 
+def _seed_fixed_domain(frontier, domain: str, priority: int, count: int) -> None:
+    for i in range(count):
+        frontier.add_url(f"https://{domain}/p{i}", priority=priority)
+
+
 def _claim_to_log_entry(claim: FrontierClaim, t_start: float) -> dict:
     return {
         "t_offset_s": round(time.time() - t_start, 4),
@@ -123,6 +128,36 @@ def _claim_to_log_entry(claim: FrontierClaim, t_start: float) -> dict:
         "priority": claim.priority,
         "attempt": claim.attempt,
     }
+
+
+def _run_bounded_claim_loop(
+    frontier,
+    num_claims: int,
+    max_idle_polls: int,
+    poll_interval: float,
+    on_claim,
+) -> list[dict]:
+    """Claim up to `num_claims` times, polling a bounded number of times
+    when the frontier is momentarily empty. `on_claim(claim)` handles
+    completion and any per-claim side effects (e.g. replenishing a domain);
+    it returns `True` to stop the loop early. Deterministic: never runs for
+    an unbounded amount of wall time or an unbounded number of claims."""
+    claim_log: list[dict] = []
+    t_start = time.time()
+    idle_polls = 0
+    while len(claim_log) < num_claims:
+        claim = frontier.get_next_url()
+        if claim is None:
+            idle_polls += 1
+            if idle_polls > max_idle_polls:
+                break
+            time.sleep(poll_interval)
+            continue
+        idle_polls = 0
+        claim_log.append(_claim_to_log_entry(claim, t_start))
+        if on_claim(claim):
+            break
+    return claim_log
 
 
 # ---------------------------------------------------------------------------
@@ -141,10 +176,8 @@ def scenario_finite(frontier, run_id: str, high_count: int, low_count: int,
         low_domain: {"priority": low_priority, "seeded": low_count},
     }
 
-    for i in range(high_count):
-        frontier.add_url(f"https://{high_domain}/p{i}", priority=high_priority)
-    for i in range(low_count):
-        frontier.add_url(f"https://{low_domain}/p{i}", priority=low_priority)
+    _seed_fixed_domain(frontier, high_domain, high_priority, high_count)
+    _seed_fixed_domain(frontier, low_domain, low_priority, low_count)
 
     claim_log = []
     t_start = time.time()
@@ -225,31 +258,22 @@ def scenario_replenish(frontier, run_id: str, num_claims: int, low_count: int,
             seq += 1
 
     top_up()
-    for i in range(low_count):
-        frontier.add_url(f"https://{low}/p{i}", priority=low_priority)
+    _seed_fixed_domain(frontier, low, low_priority, low_count)
 
-    claim_log = []
-    t_start = time.time()
-    idle_polls = 0
-    while len(claim_log) < num_claims:
-        claim = frontier.get_next_url()
-        if claim is None:
-            idle_polls += 1
-            if idle_polls > max_idle_polls:
-                break
-            time.sleep(poll_interval)
-            continue
-        idle_polls = 0
-        claim_log.append(_claim_to_log_entry(claim, t_start))
+    def on_claim(claim: FrontierClaim) -> bool:
         frontier.mark_visited(claim)
         if claim.domain == high:
             top_up()
+        return False
+
+    claim_log = _run_bounded_claim_loop(frontier, num_claims, max_idle_polls, poll_interval, on_claim)
 
     fairness = compute_fairness(claim_log, domain_meta)
+    preview = claim_log if len(claim_log) <= 100 else claim_log[:50] + ["...truncated..."] + claim_log[-50:]
     return {
         "scenario": "replenish",
         "domain_meta": domain_meta,
-        "claim_log": claim_log[:50] + (["...truncated..."] if len(claim_log) > 100 else []) + claim_log[-50:] if len(claim_log) > 100 else claim_log,
+        "claim_log": preview,
         "total_claims_made": len(claim_log),
         "fairness": fairness,
         "low_priority_domain_starved": fairness.get(low, {}).get("claims", 0) == 0,
@@ -285,25 +309,15 @@ def scenario_scan_limit_window(frontier, run_id: str, domain_count: int,
                 seq += 1
 
     top_up()
-    for i in range(5):
-        frontier.add_url(f"https://{victim}/p{i}", priority=100)
+    _seed_fixed_domain(frontier, victim, 100, 5)
 
-    claim_log = []
-    t_start = time.time()
-    idle_polls = 0
-    while len(claim_log) < num_claims:
-        claim = frontier.get_next_url()
-        if claim is None:
-            idle_polls += 1
-            if idle_polls > max_idle_polls:
-                break
-            time.sleep(poll_interval)
-            continue
-        idle_polls = 0
-        claim_log.append(_claim_to_log_entry(claim, t_start))
+    def on_claim(claim: FrontierClaim) -> bool:
         frontier.mark_visited(claim)
         if claim.domain != victim:
             top_up()
+        return False
+
+    claim_log = _run_bounded_claim_loop(frontier, num_claims, max_idle_polls, poll_interval, on_claim)
 
     fairness = compute_fairness(claim_log, domain_meta)
     return {
@@ -335,30 +349,17 @@ def scenario_retries(frontier, run_id: str, high_priority: int, low_priority: in
         low: {"priority": low_priority, "seeded": low_count},
     }
 
-    for i in range(3):
-        frontier.add_url(f"https://{high}/p{i}", priority=high_priority)
-    for i in range(low_count):
-        frontier.add_url(f"https://{low}/p{i}", priority=low_priority)
+    _seed_fixed_domain(frontier, high, high_priority, 3)
+    _seed_fixed_domain(frontier, low, low_priority, low_count)
 
-    claim_log = []
-    t_start = time.time()
-    idle_polls = 0
-    while len(claim_log) < num_claims:
-        claim = frontier.get_next_url()
-        if claim is None:
-            idle_polls += 1
-            if idle_polls > max_idle_polls:
-                break
-            time.sleep(poll_interval)
-            continue
-        idle_polls = 0
-        claim_log.append(_claim_to_log_entry(claim, t_start))
+    def on_claim(claim: FrontierClaim) -> bool:
         if claim.domain == high:
             frontier.mark_failed(claim, "synthetic failure")
         else:
             frontier.mark_visited(claim)
-        if not frontier.has_pending():
-            break
+        return not frontier.has_pending()
+
+    claim_log = _run_bounded_claim_loop(frontier, num_claims, max_idle_polls, poll_interval, on_claim)
 
     fairness = compute_fairness(claim_log, domain_meta)
     return {
@@ -373,6 +374,46 @@ def scenario_retries(frontier, run_id: str, high_priority: int, low_priority: in
 # ---------------------------------------------------------------------------
 # Scenario -- multi-worker concurrent claiming
 # ---------------------------------------------------------------------------
+
+def _claim_loop_thread(frontier, claim_log: list[dict], log_lock: threading.Lock, t_start: float) -> None:
+    while True:
+        claim = frontier.get_next_url()
+        if claim is None:
+            if not frontier.has_pending():
+                return
+            time.sleep(0.02)
+            continue
+        with log_lock:
+            claim_log.append(_claim_to_log_entry(claim, t_start))
+        frontier.mark_visited(claim)
+
+
+def _run_multi_worker_once(frontier, workers: int, high_count: int, low_count: int,
+                            high: str, low: str, domain_meta: dict) -> dict:
+    _seed_fixed_domain(frontier, high, domain_meta[high]["priority"], high_count)
+    _seed_fixed_domain(frontier, low, domain_meta[low]["priority"], low_count)
+
+    claim_log: list[dict] = []
+    log_lock = threading.Lock()
+    t_start = time.time()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_claim_loop_thread, frontier, claim_log, log_lock, t_start) for _ in range(workers)]
+        for f in futures:
+            f.result(timeout=60)
+
+    claim_log.sort(key=lambda e: e["t_offset_s"])
+    urls_seen = [e["url"] for e in claim_log]
+    fairness = compute_fairness(claim_log, domain_meta)
+    return {
+        "total_claims": len(claim_log),
+        "duplicate_claims": len(urls_seen) - len(set(urls_seen)),
+        "fairness": fairness,
+        "both_domains_fully_drained": (
+            fairness[high]["claims"] == high_count and fairness[low]["claims"] == low_count
+        ),
+    }
+
 
 def scenario_multi_worker(frontier, run_id: str, worker_counts: list[int],
                            high_count: int, low_count: int,
@@ -390,50 +431,39 @@ def scenario_multi_worker(frontier, run_id: str, worker_counts: list[int],
             high: {"priority": high_priority, "seeded": high_count},
             low: {"priority": low_priority, "seeded": low_count},
         }
-        for i in range(high_count):
-            frontier.add_url(f"https://{high}/p{i}", priority=high_priority)
-        for i in range(low_count):
-            frontier.add_url(f"https://{low}/p{i}", priority=low_priority)
-
-        claim_log: list[dict] = []
-        log_lock = threading.Lock()
-        t_start = time.time()
-
-        def claim_loop() -> None:
-            while True:
-                claim = frontier.get_next_url()
-                if claim is None:
-                    if not frontier.has_pending():
-                        return
-                    time.sleep(0.02)
-                    continue
-                with log_lock:
-                    claim_log.append(_claim_to_log_entry(claim, t_start))
-                frontier.mark_visited(claim)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(claim_loop) for _ in range(workers)]
-            for f in futures:
-                f.result(timeout=60)
-
-        claim_log.sort(key=lambda e: e["t_offset_s"])
-        urls_seen = [e["url"] for e in claim_log]
-        duplicates = len(urls_seen) - len(set(urls_seen))
-        fairness = compute_fairness(claim_log, domain_meta)
-        results[workers] = {
-            "total_claims": len(claim_log),
-            "duplicate_claims": duplicates,
-            "fairness": fairness,
-            "both_domains_fully_drained": (
-                fairness[high]["claims"] == high_count and fairness[low]["claims"] == low_count
-            ),
-        }
+        results[workers] = _run_multi_worker_once(frontier, workers, high_count, low_count, high, low, domain_meta)
     return {"scenario": "multi_worker", "by_worker_count": results}
 
 
 # ---------------------------------------------------------------------------
 # Scenario -- recovery/reclaim (Redis only)
 # ---------------------------------------------------------------------------
+
+def _recovery_cycles(frontier, low: str, cycles: int, claim_log: list[dict], t_start: float) -> list[dict]:
+    """Repeatedly claim (leaving high-priority claims to expire, simulating
+    a crashed worker) and sweep `reclaim_and_promote` after each lease
+    window elapses. Low-priority claims are completed immediately."""
+    reclaim_events = []
+    for cycle in range(cycles):
+        claim = frontier.get_next_url()
+        if claim is not None:
+            claim_log.append(_claim_to_log_entry(claim, t_start))
+            if claim.domain == low:
+                frontier.mark_visited(claim)
+        time.sleep(frontier.lease_ttl + 0.2)
+        reclaimed, requeued = frontier.reclaim_and_promote()
+        reclaim_events.append({"cycle": cycle, "reclaimed": reclaimed, "requeued": requeued})
+    return reclaim_events
+
+
+def _drain_remaining(frontier, claim_log: list[dict], t_start: float) -> None:
+    while True:
+        claim = frontier.get_next_url()
+        if claim is None:
+            return
+        claim_log.append(_claim_to_log_entry(claim, t_start))
+        frontier.mark_visited(claim)
+
 
 def scenario_recovery(frontier, run_id: str, low_priority: int, low_count: int,
                        high_priority: int, cycles: int) -> dict:
@@ -450,28 +480,12 @@ def scenario_recovery(frontier, run_id: str, low_priority: int, low_count: int,
     }
 
     frontier.add_url(f"https://{high}/p0", priority=high_priority)
-    for i in range(low_count):
-        frontier.add_url(f"https://{low}/p{i}", priority=low_priority)
+    _seed_fixed_domain(frontier, low, low_priority, low_count)
 
-    claim_log = []
+    claim_log: list[dict] = []
     t_start = time.time()
-    reclaim_events = []
-    for cycle in range(cycles):
-        claim = frontier.get_next_url()
-        if claim is not None:
-            claim_log.append(_claim_to_log_entry(claim, t_start))
-            if claim.domain == low:
-                frontier.mark_visited(claim)
-        time.sleep(frontier.lease_ttl + 0.2)
-        reclaimed, requeued = frontier.reclaim_and_promote()
-        reclaim_events.append({"cycle": cycle, "reclaimed": reclaimed, "requeued": requeued})
-
-    while True:
-        claim = frontier.get_next_url()
-        if claim is None:
-            break
-        claim_log.append(_claim_to_log_entry(claim, t_start))
-        frontier.mark_visited(claim)
+    reclaim_events = _recovery_cycles(frontier, low, cycles, claim_log, t_start)
+    _drain_remaining(frontier, claim_log, t_start)
 
     fairness = compute_fairness(claim_log, domain_meta)
     return {
@@ -522,6 +536,33 @@ def build(args: argparse.Namespace):
     return frontier
 
 
+def dispatch(args: argparse.Namespace, frontier, run_id: str) -> dict:
+    if args.scenario == "finite":
+        return scenario_finite(frontier, run_id, args.high_count, args.low_count,
+                                args.high_priority, args.low_priority)
+    if args.scenario == "rate-limit-skip":
+        return scenario_rate_limit_skip(frontier, run_id)
+    if args.scenario == "replenish":
+        return scenario_replenish(frontier, run_id, args.num_claims, args.low_count,
+                                   args.high_priority, args.low_priority,
+                                   args.replenish_batch, args.max_idle_polls, args.poll_interval)
+    if args.scenario == "scan-limit-window":
+        return scenario_scan_limit_window(frontier, run_id, args.domain_count,
+                                           args.domain_scan_limit, args.num_claims,
+                                           args.replenish_batch, args.max_idle_polls, args.poll_interval)
+    if args.scenario == "retries":
+        return scenario_retries(frontier, run_id, args.high_priority, args.low_priority,
+                                 args.low_count, args.num_claims, args.max_idle_polls, args.poll_interval)
+    if args.scenario == "multi-worker":
+        worker_counts = [int(x) for x in args.worker_counts.split(",")]
+        return scenario_multi_worker(frontier, run_id, worker_counts, args.high_count,
+                                      args.low_count, args.high_priority, args.low_priority)
+    if args.scenario == "recovery":
+        return scenario_recovery(frontier, run_id, args.low_priority, args.low_count,
+                                  args.high_priority, args.recovery_cycles)
+    raise ValueError(f"unhandled scenario {args.scenario!r}")
+
+
 def main() -> None:
     args = parse_args()
     if args.scenario in {"scan-limit-window", "recovery"} and args.frontier != "redis":
@@ -532,31 +573,7 @@ def main() -> None:
     run_id = f"ds{int(time.time())}"
 
     try:
-        if args.scenario == "finite":
-            result = scenario_finite(frontier, run_id, args.high_count, args.low_count,
-                                      args.high_priority, args.low_priority)
-        elif args.scenario == "rate-limit-skip":
-            result = scenario_rate_limit_skip(frontier, run_id)
-        elif args.scenario == "replenish":
-            result = scenario_replenish(frontier, run_id, args.num_claims, args.low_count,
-                                         args.high_priority, args.low_priority,
-                                         args.replenish_batch, args.max_idle_polls, args.poll_interval)
-        elif args.scenario == "scan-limit-window":
-            result = scenario_scan_limit_window(frontier, run_id, args.domain_count,
-                                                 args.domain_scan_limit, args.num_claims,
-                                                 args.replenish_batch, args.max_idle_polls, args.poll_interval)
-        elif args.scenario == "retries":
-            result = scenario_retries(frontier, run_id, args.high_priority, args.low_priority,
-                                       args.low_count, args.num_claims, args.max_idle_polls, args.poll_interval)
-        elif args.scenario == "multi-worker":
-            worker_counts = [int(x) for x in args.worker_counts.split(",")]
-            result = scenario_multi_worker(frontier, run_id, worker_counts, args.high_count,
-                                            args.low_count, args.high_priority, args.low_priority)
-        elif args.scenario == "recovery":
-            result = scenario_recovery(frontier, run_id, args.low_priority, args.low_count,
-                                        args.high_priority, args.recovery_cycles)
-        else:
-            raise ValueError(f"unhandled scenario {args.scenario!r}")
+        result = dispatch(args, frontier, run_id)
     finally:
         frontier.clear()
         frontier.close()
