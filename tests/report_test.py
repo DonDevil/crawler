@@ -341,6 +341,105 @@ def test_throughput_zero_duration_protection():
         assert throughput["note"] is not None
 
 
+# ---------------------------------------------------------------------------
+# 11b. Terminal-state invariant: visited/failed_permanent/skipped must not
+# exceed discovered_total. Reproduces the real overnight Redis run where
+# visited=14868 + failed_permanent=38503 > discovered_total=38550.
+# ---------------------------------------------------------------------------
+
+def test_invariant_violation_nulls_lifetime_percentages_not_fabricated():
+    snapshot = {
+        "discovered_total": 38550,
+        "visited": 14868,
+        "failed_permanent": 38503,
+        "skipped": 0,
+        "queued": 0,
+        "inflight": 1,
+        "retry_scheduled": 0,
+    }
+
+    assert report_lib.terminal_states_are_consistent(snapshot) is False
+
+    counts = report_lib.counts_with_percentages(snapshot)
+    assert counts["percentages"]["visited_pct"] is None
+    assert counts["percentages"]["failed_pct"] is None
+    assert counts["percentages"]["skipped_pct"] is None
+    assert counts["invariant_violation"] is not None
+
+    throughput = report_lib.compute_throughput(snapshot, duration_seconds=18576.18, worker_count=25)
+    assert throughput["completed_per_sec"] is None
+    # Individually-reliable per-set rates must still be reported.
+    assert throughput["visited_per_sec"] == pytest.approx(14868 / 18576.18)
+
+
+def test_invariant_holds_reports_real_percentages():
+    snapshot = {
+        "discovered_total": 1000,
+        "visited": 500,
+        "failed_permanent": 50,
+        "skipped": 10,
+        "queued": 440,
+        "inflight": 0,
+        "retry_scheduled": 0,
+    }
+
+    assert report_lib.terminal_states_are_consistent(snapshot) is True
+
+    counts = report_lib.counts_with_percentages(snapshot)
+    assert counts["percentages"]["visited_pct"] == pytest.approx(50.0)
+    assert counts["invariant_violation"] is None
+
+
+# ---------------------------------------------------------------------------
+# 11c. Run-scoped counts (this_run): isolates this run's activity from a
+# backend that accumulates state across runs (never reset between runs).
+# ---------------------------------------------------------------------------
+
+def test_this_run_deltas_isolate_run_from_lifetime_contamination():
+    # Simulates the overnight run's actual contaminated lifetime state: the
+    # pre-run snapshot already carries a visited/failed_permanent overlap
+    # from prior runs/schema versions, but this run only adds clean,
+    # mutually-exclusive activity on top of it.
+    pre_run_snapshot = {
+        "available": True,
+        "discovered_total": 30000,
+        "visited": 14868,
+        "failed_permanent": 30000,  # already >= discovered_total: pre-existing contamination
+        "skipped": 0,
+        "queued": 0,
+        "inflight": 0,
+        "retry_scheduled": 0,
+    }
+    post_run_snapshot = {
+        "available": True,
+        "discovered_total": 38550,
+        "visited": 14868,  # unchanged this run
+        "failed_permanent": 38503,
+        "skipped": 0,
+        "queued": 0,
+        "inflight": 1,
+        "retry_scheduled": 0,
+    }
+
+    this_run = report_lib.build_this_run(pre_run_snapshot, post_run_snapshot, duration_seconds=18576.18, worker_count=25)
+
+    assert this_run["discovered_unique"] == 8550
+    assert this_run["visited_unique"] == 0
+    assert this_run["failed_permanent_unique"] == 8503
+    assert this_run["skipped_unique"] == 0
+    assert this_run["queued_current"] == 0
+    assert this_run["inflight_current"] == 1
+    # This run's own deltas are mutually exclusive (0 + 8503 + 0 <= 8550).
+    assert this_run["invariant_violation"] is None
+    assert this_run["attempted_unique"] == 8503
+    assert this_run["completion_pct"] == pytest.approx(8503 / 8550 * 100)
+
+
+def test_this_run_none_without_pre_run_snapshot():
+    post_run_snapshot = {"available": True, "discovered_total": 100, "visited": 50, "failed_permanent": 0, "skipped": 0}
+    assert report_lib.build_this_run(None, post_run_snapshot, duration_seconds=10.0) is None
+
+
 def test_safe_rate_and_safe_pct_guard_zero_and_none():
     assert report_lib.safe_rate(10, 0) is None
     assert report_lib.safe_rate(10, -1) is None

@@ -358,11 +358,56 @@ def redis_piracy_stats(host: str, port: int, db: int, namespace: str, piracy_sit
 # Counts / throughput / failures assembly (backend-agnostic)
 # ---------------------------------------------------------------------------
 
+def terminal_states_are_consistent(snapshot: dict) -> Optional[bool]:
+    """Whether `visited`/`failed_permanent`/`skipped` can validly be treated
+    as mutually-exclusive unique-URL terminal states of `discovered_total`.
+
+    Each of those four counters is individually a real unique-URL SCARD (see
+    `RedisURLFrontier.get_status_counts`/`_complete_claim_script` -- every
+    terminal set is only ever added to via a token-CAS'd, exactly-once
+    completion), but nothing about the keyspace *proves* the three terminal
+    sets are disjoint and contained in `known` -- e.g. a Redis namespace/db
+    that has accumulated state across multiple historical runs or crawler
+    schema versions without ever being cleared can leave a URL a member of
+    more than one terminal set. `visited + failed_permanent + skipped >
+    discovered_total` is the observable symptom (a unique-URL count can
+    never legitimately exceed the pool it was drawn from) -- see
+    docs/architecture/history/test-analysis.md for a real run where this was
+    caught. Returns `None` (not `True`) if any operand is unavailable.
+    """
+    total = snapshot.get("discovered_total")
+    visited = snapshot.get("visited")
+    failed = snapshot.get("failed_permanent")
+    skipped = snapshot.get("skipped")
+    if total is None or visited is None or failed is None or skipped is None:
+        return None
+    return (visited + failed + skipped) <= total
+
+
+_INVARIANT_VIOLATION_NOTE = (
+    "visited + failed_permanent + skipped exceeds discovered_total, which is impossible if those "
+    "are truly mutually-exclusive unique-URL terminal states -- so that assumption does not hold for "
+    "this snapshot. Percentages/derived totals that depend on it are reported as null rather than a "
+    "misleading number (e.g. a percentage that can exceed 100%). Most often caused by a Redis "
+    "namespace/SQLite db that accumulates state across multiple runs or crawler-schema versions "
+    "without being reset -- see the 'this_run' section for counts scoped to this process's "
+    "execution, which are not affected by pre-existing cumulative/contaminated state."
+)
+
+
 def counts_with_percentages(snapshot: dict) -> dict:
     total = snapshot.get("discovered_total")
     visited = snapshot.get("visited")
     failed = snapshot.get("failed_permanent")
     skipped = snapshot.get("skipped")
+
+    consistent = terminal_states_are_consistent(snapshot)
+
+    percentages = {
+        "visited_pct": safe_pct(visited, total) if consistent else None,
+        "failed_pct": safe_pct(failed, total) if consistent else None,
+        "skipped_pct": safe_pct(skipped, total) if consistent else None,
+    }
 
     return {
         "discovered_total": total,
@@ -372,15 +417,14 @@ def counts_with_percentages(snapshot: dict) -> dict:
         "retry_scheduled": snapshot.get("retry_scheduled"),
         "failed_permanent": failed,
         "skipped": skipped,
-        "percentages": {
-            "visited_pct": safe_pct(visited, total),
-            "failed_pct": safe_pct(failed, total),
-            "skipped_pct": safe_pct(skipped, total),
-        },
+        "percentages": percentages,
+        "invariant_violation": None if consistent or consistent is None else _INVARIANT_VIOLATION_NOTE,
         "note": (
-            "'discovered_total' is cumulative (every URL ever added, including ones now terminal); "
-            "'queued' is current-state (URLs not yet attempted right now). They are not comparable "
-            "1:1 and are never double-counted against each other."
+            "'discovered_total'/'visited'/'failed_permanent'/'skipped' are lifetime-cumulative for "
+            "this Redis namespace / SQLite db (every URL ever added/resolved, not just this run's -- "
+            "see 'this_run' for run-scoped counts). 'queued'/'inflight'/'retry_scheduled' are "
+            "current-state (right now), not cumulative. They are not comparable 1:1 and are never "
+            "double-counted against each other."
         ),
     }
 
@@ -388,11 +432,13 @@ def counts_with_percentages(snapshot: dict) -> dict:
 def compute_throughput(snapshot: dict, duration_seconds, worker_count=None) -> dict:
     discovered = snapshot.get("discovered_total")
     visited = snapshot.get("visited")
-    failed = snapshot.get("failed_permanent") or 0
-    skipped = snapshot.get("skipped") or 0
+    failed = snapshot.get("failed_permanent")
+    skipped = snapshot.get("skipped")
+    consistent = terminal_states_are_consistent(snapshot)
+
     completed = None
-    if visited is not None:
-        completed = visited + failed + skipped
+    if consistent and visited is not None:
+        completed = visited + (failed or 0) + (skipped or 0)
 
     discovered_per_sec = safe_rate(discovered, duration_seconds)
     visited_per_sec = safe_rate(visited, duration_seconds)
@@ -434,6 +480,96 @@ def build_failures(snapshot: dict) -> dict:
             "The crawler records aggregate visited/failed/skipped outcomes only; it does not "
             "categorize failures by HTTP-status vs. fetch-exception vs. extraction-error, so those "
             "subcategory breakdowns are unavailable (reporting fabricated subcategories was ruled out)."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Run-scoped counts (this run only, as opposed to the backend's lifetime-
+# cumulative state -- see counts_with_percentages's 'note').
+# ---------------------------------------------------------------------------
+
+def _delta_or_none(post, pre) -> Optional[int]:
+    """`post - pre`, or `None` if either is unavailable or the result is
+    negative (impossible for these monotonically-growing counters -- a
+    negative delta means the two snapshots aren't comparable, e.g. the
+    backend/namespace changed mid-run or was cleared, so report unavailable
+    rather than a nonsense negative count)."""
+    if post is None or pre is None:
+        return None
+    delta = post - pre
+    return delta if delta >= 0 else None
+
+
+def build_this_run(
+    pre_run_snapshot: Optional[dict], post_run_snapshot: dict, duration_seconds, worker_count=None
+) -> Optional[dict]:
+    """Counts scoped to this run only, as (end-of-run snapshot - start-of-run
+    snapshot) for each monotonically-growing counter.
+
+    The Redis namespace / SQLite db backing the frontier is intentionally
+    *not* reset between runs (so a run can resume unfinished work), which
+    means `counts_with_percentages`'s 'discovered_total'/'visited'/
+    'failed_permanent'/'skipped' are lifetime-cumulative across every run
+    that has ever used that namespace/db -- not scoped to this run. Every
+    counter here only ever grows within a run (`urls:known`/`urls:visited`/
+    `urls:failed_permanent`/`urls:skipped` are SADD-only; nothing SREMs from
+    them -- see core/redis_frontier.py), so a same-backend delta isolates
+    this run's activity even when the lifetime state itself already
+    contains pre-existing cross-run/cross-schema-version contamination
+    (that contamination is present in both snapshots equally and cancels
+    out in the subtraction).
+
+    Returns `None` if no pre-run snapshot was captured (e.g. an older run
+    report, or the backend was unavailable at startup) -- never a
+    fabricated run-scoped count derived only from the lifetime totals.
+    """
+    if pre_run_snapshot is None or not pre_run_snapshot.get("available", True):
+        return None
+    if not post_run_snapshot.get("available", True):
+        return None
+
+    discovered = _delta_or_none(post_run_snapshot.get("discovered_total"), pre_run_snapshot.get("discovered_total"))
+    visited = _delta_or_none(post_run_snapshot.get("visited"), pre_run_snapshot.get("visited"))
+    failed = _delta_or_none(post_run_snapshot.get("failed_permanent"), pre_run_snapshot.get("failed_permanent"))
+    skipped = _delta_or_none(post_run_snapshot.get("skipped"), pre_run_snapshot.get("skipped"))
+
+    terminal_sum = None
+    if visited is not None and failed is not None and skipped is not None:
+        terminal_sum = visited + failed + skipped
+    consistent = terminal_sum is not None and discovered is not None and terminal_sum <= discovered
+
+    attempted = terminal_sum if consistent else None
+    completion_pct = safe_pct(attempted, discovered) if consistent else None
+    success_rate_pct = safe_pct(visited, attempted) if consistent and attempted else None
+
+    return {
+        "discovered_unique": discovered,
+        "visited_unique": visited,
+        "failed_permanent_unique": failed,
+        "skipped_unique": skipped,
+        "queued_current": post_run_snapshot.get("queued"),
+        "inflight_current": post_run_snapshot.get("inflight"),
+        "retry_scheduled_current": post_run_snapshot.get("retry_scheduled"),
+        "attempted_unique": attempted,
+        "completion_pct": completion_pct,
+        "success_rate_pct": success_rate_pct,
+        "throughput": {
+            "discovered_unique_per_sec": safe_rate(discovered, duration_seconds),
+            "visited_unique_per_sec": safe_rate(visited, duration_seconds),
+        },
+        "invariant_violation": None if consistent else (
+            f"This run's terminal-state deltas (visited_unique={visited} + failed_permanent_unique="
+            f"{failed} + skipped_unique={skipped} = {terminal_sum}) exceed discovered_unique "
+            f"({discovered}); attempted_unique/completion_pct/success_rate_pct are unavailable "
+            "rather than fabricated."
+        ),
+        "note": (
+            "Scoped to this run only: (end-of-run snapshot - start-of-run snapshot) per counter, "
+            "not the backend's lifetime-cumulative state (see counts.note). "
+            "attempted_unique/completion_pct/success_rate_pct are only populated when "
+            "visited_unique + failed_permanent_unique + skipped_unique <= discovered_unique for "
+            "this run's deltas -- see 'invariant_violation' otherwise."
         ),
     }
 
@@ -504,15 +640,17 @@ def build_redis_resource_report(samples: list[dict], interval: float) -> Optiona
 # ---------------------------------------------------------------------------
 
 def build_report(*, metadata: dict, timing: dict, snapshot: dict, resources=None,
-                  redis_resources=None, configuration=None) -> dict:
+                  redis_resources=None, configuration=None, pre_run_snapshot: Optional[dict] = None) -> dict:
     counts = counts_with_percentages(snapshot)
     throughput = compute_throughput(snapshot, timing.get("duration_seconds"), metadata.get("worker_count"))
     failures = build_failures(snapshot)
+    this_run = build_this_run(pre_run_snapshot, snapshot, timing.get("duration_seconds"), metadata.get("worker_count"))
 
     return {
         "metadata": metadata,
         "timing": timing,
         "counts": counts,
+        "this_run": this_run,
         "throughput": throughput,
         "failures": failures,
         "resources": resources,
@@ -567,7 +705,7 @@ def render_human_report(report: dict) -> str:
         w(f"                ({timing['note']})")
 
     w("")
-    w("---------------- URL STATE ----------------")
+    w("---------------- URL STATE (lifetime, this namespace/db) ----------------")
     w("")
     w(f"Discovered:        {fmt_val(counts.get('discovered_total'))}")
     w(f"Visited:           {fmt_val(counts.get('visited'))}  ({fmt_pct(counts['percentages'].get('visited_pct'))})")
@@ -576,9 +714,32 @@ def render_human_report(report: dict) -> str:
     w(f"Retry scheduled:   {fmt_val(counts.get('retry_scheduled'))}")
     w(f"Permanently failed:{fmt_val(counts.get('failed_permanent'))}  ({fmt_pct(counts['percentages'].get('failed_pct'))})")
     w(f"Skipped:           {fmt_val(counts.get('skipped'))}  ({fmt_pct(counts['percentages'].get('skipped_pct'))})")
+    if counts.get("invariant_violation"):
+        w(f"WARNING: {counts['invariant_violation']}")
+
+    this_run = report.get("this_run")
+    w("")
+    w("---------------- THIS RUN (run-scoped counts) ----------------")
+    w("")
+    if this_run:
+        w(f"Discovered:         {fmt_val(this_run.get('discovered_unique'))}")
+        w(f"Visited:            {fmt_val(this_run.get('visited_unique'))}")
+        w(f"Permanently failed: {fmt_val(this_run.get('failed_permanent_unique'))}")
+        w(f"Skipped:            {fmt_val(this_run.get('skipped_unique'))}")
+        w(f"Queued (now):       {fmt_val(this_run.get('queued_current'))}")
+        w(f"In-flight (now):    {fmt_val(this_run.get('inflight_current'))}")
+        w(f"Retry sched. (now): {fmt_val(this_run.get('retry_scheduled_current'))}")
+        w(f"Completion:         {fmt_pct(this_run.get('completion_pct'))}")
+        w(f"Success rate:       {fmt_pct(this_run.get('success_rate_pct'))}")
+        w(f"Discovered/sec:     {fmt_num(this_run.get('throughput', {}).get('discovered_unique_per_sec'))}")
+        w(f"Visited/sec:        {fmt_num(this_run.get('throughput', {}).get('visited_unique_per_sec'))}")
+        if this_run.get("invariant_violation"):
+            w(f"WARNING: {this_run['invariant_violation']}")
+    else:
+        w("Unavailable (no pre-run snapshot was captured for this report).")
 
     w("")
-    w("---------------- THROUGHPUT ----------------")
+    w("---------------- THROUGHPUT (lifetime) ----------------")
     w("")
     w(f"Discovered/sec: {fmt_num(throughput.get('discovered_per_sec'))}")
     w(f"Visited/sec:    {fmt_num(throughput.get('visited_per_sec'))}")

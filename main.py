@@ -252,6 +252,20 @@ def main() -> None:
         else None
     )
 
+    import report_lib  # tests/report_lib.py
+
+    # Snapshot frontier state *before* this run adds/claims anything, so the
+    # report can later isolate this run's activity from the frontier's
+    # lifetime-cumulative state (the Redis namespace / SQLite db is not
+    # reset between runs by design -- see report_lib.build_this_run).
+    if backend == "redis":
+        pre_run_snapshot = report_lib.redis_snapshot(
+            frontier_cfg.redis_host, frontier_cfg.redis_port, frontier_cfg.redis_db, frontier_cfg.redis_namespace
+        )
+    else:
+        sqlite_path = manager.config.crawler.storage.sqlite_path
+        pre_run_snapshot = report_lib.sqlite_snapshot(sqlite_path) if os.path.exists(sqlite_path) else None
+
     start_dt = datetime.now(timezone.utc)
     start_monotonic = time.monotonic()
 
@@ -265,8 +279,6 @@ def main() -> None:
 
     end_dt = datetime.now(timezone.utc)
     duration_seconds = max(time.monotonic() - start_monotonic, 0.0)
-
-    import report_lib  # tests/report_lib.py
 
     worker_count = getattr(manager._crawler, "concurrency", manager.config.crawler.concurrency)
     max_pages_effective = getattr(manager._crawler, "max_pages", manager.config.crawler.max_pages)
@@ -337,6 +349,7 @@ def main() -> None:
         resources=resources,
         redis_resources=redis_resources,
         configuration=manager.config.model_dump(),
+        pre_run_snapshot=pre_run_snapshot,
     )
 
     print("\n" + report_lib.render_human_report(report))

@@ -1,0 +1,180 @@
+{
+  "metadata": {
+    "generated_at": "2026-08-11T01:45:41.760435+00:00",
+    "backend": "redis",
+    "redis": {
+      "host": "localhost",
+      "port": 6379,
+      "db": 0,
+      "namespace": "crawler"
+    },
+    "sqlite_path": null,
+    "worker_count": 25,
+    "crawl_engine": "auto",
+    "search_engines": [
+      "duckduckgo",
+      "bing",
+      "brave",
+      "yandex",
+      "ahmia",
+      "torch"
+    ],
+    "query_scope": null,
+    "queries": [
+      "BLAST full movie download"
+    ],
+    "seed_files": [
+      "seeds/piracy_sites.txt",
+      "seeds/torrent_sites.txt",
+      "seeds/streaming_sites.txt",
+      "seeds/darkweb_seeds.txt"
+    ],
+    "crawl_mode": "seeds+query",
+    "max_pages": null,
+    "indefinite_run": true,
+    "rate_limit": 0.3,
+    "note": "backend reflects the frontier actually constructed for this run, which can differ from config.yaml's crawler.frontier.type if Redis was unreachable at startup and the crawler fell back to SQLite -- see core/crawler_manager.py."
+  },
+  "timing": {
+    "start": "2026-08-10T20:36:05.575590+00:00",
+    "end": "2026-08-11T01:45:41.759193+00:00",
+    "duration_seconds": 18576.183608616004,
+    "source": "process-wall-clock",
+    "note": "Actual wall-clock start (immediately before manager.run()) and end (immediately after it returned) of this process -- not derived from URL timestamps."
+  },
+  "counts": {
+    "discovered_total": 38550,
+    "visited": 14868,
+    "queued": 0,
+    "inflight": 1,
+    "retry_scheduled": 0,
+    "failed_permanent": 38503,
+    "skipped": 0,
+    "percentages": {
+      "visited_pct": 38.568093385214006,
+      "failed_pct": 99.8780804150454,
+      "skipped_pct": 0.0
+    },
+    "note": "'discovered_total' is cumulative (every URL ever added, including ones now terminal); 'queued' is current-state (URLs not yet attempted right now). They are not comparable 1:1 and are never double-counted against each other."
+  },
+  "throughput": {
+    "discovered_per_sec": 2.0752378858981424,
+    "visited_per_sec": 0.8003796857985365,
+    "completed_per_sec": 2.873087450279371,
+    "avg_completed_per_sec_per_worker": 0.11492349801117484,
+    "note": null,
+    "per_worker_note": "Simple average (completed/sec \u00f7 worker count); does not imply linear scaling across workers."
+  },
+  "failures": {
+    "successful_visits": 14868,
+    "permanently_failed": 38503,
+    "skipped": 0,
+    "retry_scheduled_current": 0,
+    "extraction_failures": null,
+    "http_failures": null,
+    "fetch_failures": null,
+    "note": "The crawler records aggregate visited/failed/skipped outcomes only; it does not categorize failures by HTTP-status vs. fetch-exception vs. extraction-error, so those subcategory breakdowns are unavailable (reporting fabricated subcategories was ruled out)."
+  },
+  "resources": {
+    "sample_count": 1857,
+    "sample_interval_seconds": 10.0,
+    "process_cpu_percent_avg": 5.538718362950996,
+    "process_cpu_percent_peak": 57.9,
+    "process_rss_mb_avg": 433.8301149367259,
+    "process_rss_mb_peak": 512.05859375,
+    "note": "process_cpu_percent is instantaneous CPU utilization (%) sampled via psutil, not cumulative CPU time. Single crawler process (asyncio concurrency, not multiprocess) -- see metadata.worker_count for the number of concurrent async fetch tasks within it."
+  },
+  "redis": {
+    "sample_count": 1857,
+    "sample_interval_seconds": 10.0,
+    "memory_start_mb": 31.705169677734375,
+    "memory_end_mb": 43.23961639404297,
+    "memory_delta_mb": 11.534446716308594,
+    "memory_peak_sampled_mb": 61.72905731201172,
+    "connected_clients_avg": 5.949919224555735,
+    "connected_clients_peak": 6,
+    "cpu_sys_seconds_delta": 21.064391999999998,
+    "cpu_user_seconds_delta": 30.566242,
+    "note": "memory_peak_sampled_mb is the highest 'used_memory' observed at our sampling interval (not Redis's own lifetime used_memory_peak counter -- see counts.redis_info in a same-run snapshot for that). cpu_sys_seconds_delta/cpu_user_seconds_delta are deltas of Redis INFO's cumulative CPU-TIME counters (seconds consumed), not a CPU percentage -- conflating the two previously mis-attributed a benchmark bottleneck (see docs/benchmarks.md, 'Resource measurements')."
+  },
+  "configuration": {
+    "crawler": {
+      "engine": "auto",
+      "concurrency": 25,
+      "timeout": 15,
+      "max_pages": 200,
+      "rate_limit": 0.3,
+      "user_agent": "AntiPiracyBot/1.0",
+      "scrapling_enabled": true,
+      "scrapling_headless": true,
+      "scrapling_stealth": true,
+      "scrapling_network_idle": true,
+      "seed_files": [
+        "seeds/piracy_sites.txt",
+        "seeds/torrent_sites.txt",
+        "seeds/streaming_sites.txt",
+        "seeds/darkweb_seeds.txt"
+      ],
+      "storage": {
+        "sqlite_path": "/home/darkdevil/Desktop/anti_piracy/crawler/storage/crawl_state.db",
+        "media_sqlite_path": "/home/darkdevil/Desktop/anti_piracy/crawler/storage/media_evidence.db",
+        "enable_media_evidence": true,
+        "enqueue_media_jobs": true
+      },
+      "frontier": {
+        "type": "redis",
+        "redis_host": "localhost",
+        "redis_port": 6379,
+        "redis_db": 0,
+        "redis_namespace": "crawler",
+        "max_retries": 3,
+        "base_backoff": 5.0,
+        "max_backoff": 300.0,
+        "lease_ttl": 90.0,
+        "recovery_enabled": true,
+        "recovery_interval": 30.0,
+        "reclaim_batch_size": 200,
+        "domain_scan_limit": 250,
+        "heartbeat_interval": null
+      },
+      "media_evidence": {
+        "type": "redis",
+        "redis_host": "localhost",
+        "redis_port": 6379,
+        "redis_db": 0,
+        "redis_namespace": "evidence",
+        "max_observations_per_asset": 20,
+        "max_variants_per_asset": 20,
+        "fingerprint_lease_ttl": 900.0,
+        "fingerprint_heartbeat_interval": null,
+        "max_retries": 2,
+        "base_backoff": 5.0,
+        "max_backoff": 300.0,
+        "reclaim_batch_size": 200,
+        "confirmed_match_stream_maxlen": 10000
+      }
+    },
+    "search": {
+      "enabled_engines": [
+        "duckduckgo",
+        "bing",
+        "brave",
+        "yandex",
+        "ahmia",
+        "torch"
+      ],
+      "max_results_per_engine": 20,
+      "timeout": 15,
+      "engine_priorities": {
+        "torch": 0,
+        "ahmia": 2,
+        "brave": 4,
+        "bing": 5,
+        "duckduckgo": 6,
+        "yandex": 7
+      },
+      "onion_priority_boost": 2,
+      "blocked_engine_cooldown_queries": 999
+    }
+  }
+}

@@ -379,3 +379,76 @@ Key Observations:
 - Visited/hour: 1,200+ (original 1,621)
 - Completion rate: 30%+ (original 48% - may be lower due to larger initial queue)
 - Queue pressure: <3x (original 2.08x)
+
+## Redis Overnight Run — 2026-08-10/11
+
+### Configuration
+
+- Backend: Redis
+- Workers: 25 async workers
+- Runtime: 5h 9m 36s
+- Rate limit: 0.3s/domain
+- Search engines: DuckDuckGo, Bing, Brave, Yandex, Ahmia, Torch
+- Crawl mode: seeds + query
+- Query: BLAST full movie download
+- Indefinite run: yes
+- Media evidence: enabled
+
+### Raw Results
+
+- Discovered: 38,550
+- Visited: 14,868
+- Queued at end: 0
+- Inflight at end: 1
+- Reported failed_permanent: 38,503
+
+### Reliable Throughput
+
+- Visited/sec: 0.800
+- Visited/hour: ~2,881
+
+### Resource Usage
+
+- Process CPU average: 5.54%
+- Process CPU peak: 57.9%
+- Process RSS average: 433.8 MB
+- Process RSS peak: 512.1 MB
+
+### Redis Usage
+
+- Memory start: 31.7 MB
+- Memory end: 43.2 MB
+- Sampled memory peak: 61.7 MB
+- Connected clients average: 5.95
+- Connected clients peak: 6
+- Redis CPU time: 51.63 seconds total
+
+### Comparison
+
+- ~1.78x April 20 throughput
+- ~9.62x July 7 throughput
+- Queue drained to effectively zero
+- Redis CPU utilization is negligible
+- Crawler process is not CPU-bound
+
+### Important Reporting Issue
+
+`visited + failed_permanent = 53,371`, exceeding
+`discovered_total = 38,550`.
+
+Therefore `failed_permanent` cannot currently be treated as a
+unique-URL terminal count, and failure rate/completion rate derived
+from these counters are invalid for benchmark comparison.
+
+### Verdict
+
+The Redis-backed crawler demonstrates substantially improved
+throughput and queue control compared with the July regression.
+
+The current bottleneck does not appear to be Redis CPU, Redis memory,
+or crawler CPU. The workload is likely predominantly network/remote
+site latency bound.
+
+Before declaring this the final performance baseline, fix the
+counter semantics and repeat the benchmark under controlled worker
+counts.
