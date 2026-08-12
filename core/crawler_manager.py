@@ -246,14 +246,36 @@ class CrawlerManager:
         logger.info(f"Using crawler engine: {self.crawl_engine}")
 
     def clear_storage(self) -> None:
-        """Clear all persisted crawl state from the SQLite storage."""
+        """Clear all persisted state for the active crawler frontier
+        backend, plus any auxiliary storage that is independently
+        configured (media evidence).
 
-        counts_before = self.url_database.get_status_counts()
-        self.url_database.clear()
-        self.domain_database.clear()
+        `self.frontier` is the actual instantiated backend -- checking its
+        type (rather than re-reading `config.crawler.frontier.type`) also
+        gets this right when construction fell back from Redis to the
+        local SQLite frontier (`__init__` above, Redis-unavailable branch).
+        `url_database`/`domain_database` are the SQLite frontier's own
+        persistence (same `sqlite_path`, no independent backend selection),
+        so they're only cleared when that's the active backend; clearing
+        them unconditionally in Redis mode would silently wipe unrelated
+        state and clearing Redis unconditionally in SQLite mode would be a
+        no-op at best. `media_database` has its own independent backend
+        selection (`config.crawler.media_evidence.type`) so it's cleared
+        either way. See
+        docs/architecture/history/clear-db-backend-semantics.md.
+        """
+
+        if isinstance(self.frontier, RedisURLFrontier):
+            self.frontier.clear()
+            logger.info("Cleared Redis frontier state")
+        else:
+            counts_before = self.url_database.get_status_counts()
+            self.url_database.clear()
+            self.domain_database.clear()
+            logger.info(f"Cleared SQLite crawl storage. Previous counts: {counts_before}")
+
         if self.media_database:
             self.media_database.clear()
-        logger.info(f"Cleared crawl storage. Previous counts: {counts_before}")
 
     def set_max_pages(self, max_pages: int | None) -> None:
         """Override the active crawler page limit, or clear it for autonomous runs."""
@@ -511,11 +533,79 @@ class CrawlerManager:
             await self._sample_domain_scan_telemetry()
             await asyncio.sleep(interval)
 
+    async def _run_startup_recovery(self) -> None:
+        """One-shot Redis recovery sweep that must finish before any worker
+        is allowed to claim a URL (docs/architecture/history/
+        redis-startup-recovery.md, following up on
+        redis-startup-recovery-audit.md). Reconciles whatever a *previous*
+        crawler process (possibly the only one that ever ran, possibly
+        hours ago) left behind -- abandoned inflight claims and due
+        retries -- via repeated `reclaim_and_promote` calls, using the
+        identical gate `_recovery_loop`'s task creation already uses
+        (`recovery_enabled` and the active frontier implements
+        `reclaim_and_promote`). A no-op for the local SQLite frontier: it
+        promotes due retries lazily inside its own `get_next_url()` (ADR
+        §10) and has nothing for a startup sweep to do.
+
+        Bounded by both `startup_recovery_max_passes` and
+        `startup_recovery_max_duration` (whichever is hit first) so a
+        continuously-refreshed backlog -- e.g. other independent systems
+        sharing this Redis namespace still expiring claims during our
+        sweep -- cannot delay this process's startup indefinitely. Safe to
+        run concurrently with any number of other systems' startup sweeps
+        or periodic loops against the same namespace with zero added
+        coordination: `reclaim_and_promote` is one atomic Lua script (audit
+        §B/C), so two callers can never observe or reclaim the same URL.
+
+        A `FrontierUnavailable` raised by `reclaim_and_promote` is
+        deliberately left to propagate rather than caught here: per the
+        existing failure contract (docs/architecture/history/
+        frontier-redis-failure-semantics.md §3), it must never be read as
+        "recovery succeeded" or "nothing to recover" -- unlike
+        `_recovery_loop` (long-running, safely retries on its next tick),
+        a startup sweep that swallowed this would let workers start
+        claiming against state that was never actually reconciled.
+        """
+        frontier_config = self.config.crawler.frontier
+        if not frontier_config.recovery_enabled or not hasattr(self.frontier, "reclaim_and_promote"):
+            return
+
+        batch_size = frontier_config.reclaim_batch_size
+        max_passes = frontier_config.startup_recovery_max_passes
+        max_duration = frontier_config.startup_recovery_max_duration
+
+        total_reclaimed = 0
+        total_requeued = 0
+        passes = 0
+        bound_reached = False
+        start = time.monotonic()
+
+        while passes < max_passes:
+            if time.monotonic() - start >= max_duration:
+                bound_reached = True
+                break
+            reclaimed, requeued = await self.async_frontier.reclaim_and_promote(batch_size)
+            passes += 1
+            total_reclaimed += reclaimed
+            total_requeued += requeued
+            if not reclaimed and not requeued:
+                break
+        else:
+            bound_reached = True
+
+        elapsed = time.monotonic() - start
+        logger.info(
+            f"Redis startup recovery: passes={passes} reclaimed={total_reclaimed} "
+            f"requeued={total_requeued} elapsed={elapsed:.2f}s bound_reached={bound_reached}"
+        )
+
     async def run(self):
         """Run the crawler until it completes or is stopped."""
         self.prepare_frontier()
 
         logger.info("Starting crawler")
+
+        await self._run_startup_recovery()
 
         frontier_config = self.config.crawler.frontier
         self._recovery_task: Optional[asyncio.Task] = None

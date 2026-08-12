@@ -118,6 +118,21 @@ class FrontierConfig(BaseModel):
     recovery_interval: float = 30.0
     reclaim_batch_size: int = 200
 
+    # One-shot startup recovery sweep (docs/architecture/history/
+    # redis-startup-recovery.md): reconciles whatever a *previous* process
+    # left behind (abandoned inflight claims, due retries) before this
+    # process's crawler workers are allowed to start claiming, using the
+    # same `reclaim_and_promote`/`recovery_enabled` gate as the periodic
+    # loop above. Bounded by BOTH knobs together, not either alone, so a
+    # continuously-refreshed backlog (e.g. other independent systems still
+    # expiring claims into the same namespace) can't delay startup
+    # indefinitely: 50 passes covers the worst backlog actually observed
+    # (228 inflight + 73 retries needed 2 passes at the default batch size
+    # of 200) many times over, and 30s is a hard wall-clock ceiling
+    # independent of pass count or Redis latency.
+    startup_recovery_max_passes: int = 50
+    startup_recovery_max_duration: float = 30.0
+
     # Max candidate domains claim_next examines per call (Redis-only `K`
     # bound -- meaningless to the local frontier, which scans unbounded).
     # Raised from 50 to 250 (2026-08-10, see
