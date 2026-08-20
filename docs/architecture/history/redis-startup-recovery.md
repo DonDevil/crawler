@@ -24,8 +24,8 @@ preceding it.
 
 ## New startup ordering
 
-```
-CrawlerManager.run()
+```text
+    CrawlerManager.run()
     |
     prepare_frontier()          (sync, seeds/resumes -- unchanged)
     |
@@ -185,7 +185,7 @@ and continuing here would defeat the sweep's entire purpose.
 One summary line when the sweep finishes (`logger.info`, matching the
 example in the task brief):
 
-```
+```text
 Redis startup recovery: passes=2 reclaimed=228 requeued=73 elapsed=0.04s bound_reached=false
 ```
 
@@ -202,7 +202,7 @@ covered by `tests/redis_frontier_test.py::TestClaimLifecycle` and was not
 re-proven here.
 
 | Test | Proves |
-|---|---|
+| --- | --- |
 | `test_startup_recovery_recovers_expired_claim` | A claim abandoned by a simulated previous process is reconciled (`inflight` -> `queued`) by a fresh `CrawlerManager`'s startup sweep |
 | `test_startup_recovery_does_not_reclaim_live_claim` | A claim whose lease has not expired is left byte-for-byte untouched |
 | `test_startup_recovery_precedes_worker_claiming` | Instruments both `reclaim_and_promote` and the stubbed crawler's first `get_next_url()`; asserts strict ordering |
@@ -216,7 +216,7 @@ re-proven here.
 
 ### Test results
 
-```
+```text
 tests/redis_startup_recovery_test.py                              10 passed
 tests/crawler_manager_recovery_test.py                              5 passed
 tests/redis_frontier_test.py                                       16 passed
