@@ -563,5 +563,155 @@ class TestClaimLifecycle:
         assert calls_small <= 2, f"Expected a single script invocation, got {calls_small} calls"
 
 
+class TestMarkDeferred:
+    """`mark_deferred` (N3, docs/architecture/network-failure-handling-design.md
+    §6) -- attempt-count neutrality, CAS safety under a stale/superseded
+    claim, terminal-set exclusion, and the fixed (non-exponential) requeue
+    delay."""
+
+    def test_claim_then_mark_deferred_leaves_attempt_budget_net_zero(
+        self, redis_frontier: RedisURLFrontier
+    ):
+        """claim -> mark_deferred must undo exactly the increment claim_next
+        made, and never route to failed_permanent -- repeated indefinitely
+        without ever consuming retry budget."""
+        frontier = RedisURLFrontier(
+            redis_host="localhost",
+            redis_port=6379,
+            redis_db=1,
+            namespace="test_crawler_deferred",
+            rate_limit=0,
+            max_retries=1,
+            base_backoff=0,
+            deferred_requeue_delay_seconds=0,
+        )
+        frontier.clear()
+        try:
+            url = "https://outage.example.com/page"
+            frontier.add_url(url, priority=10)
+
+            for i in range(5):
+                claim = frontier.get_next_url()
+                assert claim is not None
+                assert claim.attempt == 1  # never climbs: the increment is always undone
+                frontier.mark_deferred(claim, reason="confirmed local outage")
+                if i < 4:
+                    # retry_scheduled -> domain queue promotion is
+                    # reclaim_and_promote's job (matches production: the
+                    # recovery loop, not get_next_url, promotes due
+                    # retries for the Redis backend). Skip on the last
+                    # iteration so the final state below still has one
+                    # entry sitting in retry_scheduled, unpromoted.
+                    frontier.reclaim_and_promote()
+
+            counts = frontier.get_status_counts()
+            assert counts["failed_permanent"] == 0
+            assert counts["retry_scheduled"] == 1
+            assert frontier.redis_conn.get(frontier._key("attempts", url)) in ("0", None)
+        finally:
+            frontier.clear()
+            frontier.close()
+
+    def test_mark_deferred_uses_fixed_delay_not_exponential_backoff(
+        self, redis_frontier: RedisURLFrontier
+    ):
+        frontier = RedisURLFrontier(
+            redis_host="localhost",
+            redis_port=6379,
+            redis_db=1,
+            namespace="test_crawler_deferred_delay",
+            rate_limit=0,
+            max_retries=5,
+            base_backoff=100,
+            max_backoff=1000,
+            deferred_requeue_delay_seconds=3,
+        )
+        frontier.clear()
+        try:
+            url = "https://outage.example.com/page"
+            frontier.add_url(url, priority=10)
+
+            claim = frontier.get_next_url()
+            before = time.time()
+            frontier.mark_deferred(claim, reason="offline")
+
+            scheduled_at = frontier.redis_conn.zscore(frontier._key("retry_scheduled"), url)
+            assert scheduled_at is not None
+            # Fixed ~3s delay, nowhere near base_backoff (100s) -- proves
+            # the exponential target-failure ladder was not used.
+            assert scheduled_at < before + 100
+            assert scheduled_at >= before + 3 - 1
+        finally:
+            frontier.clear()
+            frontier.close()
+
+    def test_stale_claim_mark_deferred_does_not_corrupt_newer_claim(
+        self, redis_frontier: RedisURLFrontier
+    ):
+        """CRITICAL RACE REQUIREMENT: a stale claim's mark_deferred must not
+        decrement an attempt counter belonging to a newer claim, nor
+        complete/requeue the newer claim's ownership out from under it."""
+        frontier = RedisURLFrontier(
+            redis_host="localhost",
+            redis_port=6379,
+            redis_db=1,
+            namespace="test_crawler_deferred_race",
+            rate_limit=0,
+            max_retries=5,
+            base_backoff=0,
+        )
+        frontier.clear()
+        try:
+            url = "https://racey.example.com/page"
+            frontier.add_url(url, priority=10)
+
+            old_claim = frontier.get_next_url()
+            assert old_claim is not None
+            assert old_claim.attempt == 1
+
+            # Simulate the old worker's claim being abandoned/reclaimed
+            # (e.g. lease-expiry recovery) and a *different* worker
+            # claiming the URL again before the old worker's mark_deferred
+            # call finally lands.
+            _force_expire_lease(frontier, url)
+            reclaimed, requeued = frontier.reclaim_and_promote()
+            assert reclaimed == 1 and requeued == 1
+
+            new_claim = frontier.get_next_url()
+            assert new_claim is not None
+            assert new_claim.token != old_claim.token
+            assert new_claim.attempt == 2
+
+            # The old (stale) worker's mark_deferred call arrives late.
+            frontier.mark_deferred(old_claim, reason="stale/late defer")
+
+            # The newer claim's attempt count and ownership must be
+            # completely untouched by the stale call.
+            assert frontier.redis_conn.get(frontier._key("attempts", url)) == "2"
+            assert frontier.redis_conn.hget(frontier._key("claim", url), "token") == new_claim.token
+            assert frontier.redis_conn.zscore(frontier._key("inflight"), url) is not None
+
+            # The current owner can still complete normally afterwards.
+            frontier.mark_visited(new_claim)
+            counts = frontier.get_status_counts()
+            assert counts["visited"] == 1
+            assert counts["failed_permanent"] == 0
+        finally:
+            frontier.clear()
+            frontier.close()
+
+    def test_mark_deferred_removes_inflight_and_claim(self, redis_frontier: RedisURLFrontier):
+        url = "https://outage.example.com/inflight-check"
+        redis_frontier.add_url(url, priority=10)
+
+        claim = redis_frontier.get_next_url()
+        assert redis_frontier.redis_conn.zscore(redis_frontier._key("inflight"), url) is not None
+
+        redis_frontier.mark_deferred(claim, reason="offline")
+
+        assert redis_frontier.redis_conn.zscore(redis_frontier._key("inflight"), url) is None
+        assert redis_frontier.redis_conn.hget(redis_frontier._key("claim", url), "token") is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

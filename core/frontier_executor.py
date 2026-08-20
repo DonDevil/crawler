@@ -87,6 +87,9 @@ class AsyncFrontier:
     async def mark_failed(self, claim: FrontierClaim, error: str = "") -> None:
         await self._run(self._frontier.mark_failed, claim, error)
 
+    async def mark_deferred(self, claim: FrontierClaim, reason: str = "") -> None:
+        await self._run(self._frontier.mark_deferred, claim, reason)
+
     async def mark_skipped(self, claim: FrontierClaim) -> None:
         await self._run(self._frontier.mark_skipped, claim)
 

@@ -11,6 +11,7 @@ from loguru import logger
 from core.config import Config, load_config
 from core.frontier import FrontierUnavailable
 from core.frontier_executor import AsyncFrontier
+from core.network_health import HealthController, NetworkHealthConfig
 from core.url_frontier import URLFrontier
 from core.redis_frontier import RedisURLFrontier
 from crawler.async_crawler import AsyncCrawler
@@ -127,6 +128,7 @@ class CrawlerManager:
 
         # Initialize frontier based on config
         frontier_config = self.config.crawler.frontier
+        network_health_config = self.config.crawler.network_health
         frontier_type = frontier_config.type.lower()
         if frontier_type == "redis":
             try:
@@ -142,6 +144,7 @@ class CrawlerManager:
                     lease_ttl=frontier_config.lease_ttl,
                     domain_scan_limit=frontier_config.domain_scan_limit,
                     reclaim_batch_size=frontier_config.reclaim_batch_size,
+                    deferred_requeue_delay_seconds=network_health_config.deferred_requeue_delay_seconds,
                 )
                 logger.info(
                     f"Using Redis frontier at {frontier_config.redis_host}:"
@@ -161,6 +164,7 @@ class CrawlerManager:
                     base_backoff=frontier_config.base_backoff,
                     max_backoff=frontier_config.max_backoff,
                     lease_ttl=frontier_config.lease_ttl,
+                    deferred_requeue_delay_seconds=network_health_config.deferred_requeue_delay_seconds,
                 )
         else:
             self.frontier = URLFrontier(
@@ -170,8 +174,27 @@ class CrawlerManager:
                 base_backoff=frontier_config.base_backoff,
                 max_backoff=frontier_config.max_backoff,
                 lease_ttl=frontier_config.lease_ttl,
+                deferred_requeue_delay_seconds=network_health_config.deferred_requeue_delay_seconds,
             )
             logger.info("Using SQLite frontier (single-worker mode)")
+
+        # One HealthController per manager/process (N2 §8, N3 Phase 6):
+        # in-memory only, never written to Redis, so two independent
+        # CrawlerManager processes sharing one Redis namespace never
+        # observe each other's network-health state -- see
+        # docs/architecture/network-failure-handling-design.md.
+        self.health_controller = HealthController(
+            NetworkHealthConfig(
+                enabled=network_health_config.enabled,
+                trigger_threshold=network_health_config.trigger_threshold,
+                probe_timeout_seconds=network_health_config.probe_timeout_seconds,
+                probe_endpoints=tuple(network_health_config.probe_endpoints),
+                confirm_delay_seconds=network_health_config.confirm_delay_seconds,
+                recovery_probe_interval_seconds=network_health_config.recovery_probe_interval_seconds,
+                recovery_confirm_rounds=network_health_config.recovery_confirm_rounds,
+                deferred_requeue_delay_seconds=network_health_config.deferred_requeue_delay_seconds,
+            )
+        )
 
         # Non-blocking boundary for the recovery task below -- see
         # core/frontier_executor.py and docs/architecture/frontier-step4.md.
@@ -202,6 +225,11 @@ class CrawlerManager:
         }
 
         hybrid_args = dict(crawler_args)
+        # Only HybridCrawler consumes network-health state (N3 Phase 5) --
+        # the single-engine crawlers (async/http/tor/playwright/selenium/
+        # scrapling) are out of scope for this phase and don't accept a
+        # `health` constructor argument.
+        hybrid_args["health"] = self.health_controller
 
         basic_crawler_args = {
             key: value for key, value in crawler_args.items()

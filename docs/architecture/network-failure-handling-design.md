@@ -2,7 +2,12 @@
 
 ## Status
 
-DESIGN ONLY — NO CODE IMPLEMENTED
+IMPLEMENTED (Phase N3, 2026-08-20)
+
+See "N3 Implementation Results" at the end of this document for what was
+built, one deliberate deviation from §17's suggested observability call
+site, and known limitations. The design below (§1-§17) is preserved as
+written in N2 and was not rewritten.
 
 This document is Phase N2. Its sole input is
 `docs/architecture/network-failure-handling-audit.md` (Phase N1). Every claim below is tagged:
@@ -560,3 +565,114 @@ tests; failure-classifier unit tests (8 categories); `mark_deferred` Lua-script 
 zero-`failed_permanent`-during-simulated-outage; multi-host isolation test; regression tests
 confirming unchanged behavior for ordinary target failures (categories 1/6/7/8, and 2/3/5 while
 `HEALTHY`).
+
+## N3 Implementation Results
+
+**Status: IMPLEMENTED.** All items in §17's plan were built as specified, with one deliberate
+deviation (observability call site) and one pre-existing architectural constraint discovered
+during implementation (exception-string boundary) that N2 already anticipated and provisioned a
+safe fallback for. Neither required a design change.
+
+### Files changed
+
+- `core/network_health.py` (new) — `HealthController`, `NetworkHealthState`, `NetworkHealthConfig`,
+  `ConnectivityProber`.
+- `core/failure_classifier.py` (new) — `FailureCategory`, `classify_failure`, `is_ambiguous`.
+- `core/frontier.py` — added `mark_deferred` to the `Frontier` protocol.
+- `core/redis_frontier.py` — added `mark_deferred` + its Lua script (CAS-validated,
+  `DECR ns:attempts:<url>`, requeues via `ns:retry_scheduled` with
+  `deferred_requeue_delay_seconds`); added the constructor parameter.
+- `core/url_frontier.py` — added `mark_deferred` (local in-memory equivalent) and the constructor
+  parameter — §17 item 4's SQLite-frontier gap is closed, not just documented.
+- `core/frontier_executor.py` — added `mark_deferred` to the `AsyncFrontier` adapter.
+- `crawler/hybrid_crawler.py` — `HealthController` wired into `worker()` (classify → feed
+  ambiguous counter → `mark_deferred` vs `mark_failed` decided from `health.state` **at completion
+  time**), `_run_engine_plan()` (short-circuits escalation once confirmed `OFFLINE`), and
+  `scheduler()` (pauses new claims while `OFFLINE`, reusing the existing 0.5s idle-poll sleep — no
+  new busy loop). Added the 8-field structured completion log (`_log_completion`).
+- `core/crawler_manager.py` — instantiates exactly one `HealthController` per manager/process;
+  wires it into `HybridCrawler` only.
+- `core/config.py` — added `NetworkHealthConfig` (`network_health.*` block) to `CrawlerConfig`.
+- Tests: `tests/network_health_test.py` (new, 24 tests), `tests/failure_classifier_test.py` (new,
+  54 tests), `tests/frontier_test.py` (+3 `mark_deferred` tests), `tests/redis_frontier_test.py`
+  (+4 tests, including the stale-claim race requirement), `tests/hybrid_crawler_test.py` (+5
+  integration tests).
+
+No file outside this list was modified. In particular, the six crawler engines
+(`crawler/{async,http,tor,playwright,selenium,scrapling}_crawler.py`) are untouched — see
+"Known limitations" below for why that matters.
+
+### Deviation from §17: observability call site
+
+§10/§17 recommended logging the 8-field completion schema at `RedisURLFrontier._complete()`'s
+existing log call site. This implementation instead logs it from `HybridCrawler.worker()`, right
+where the `mark_visited`/`mark_failed`/`mark_deferred` decision is made. Reasoning: `_complete()`
+doesn't know `failure_category` or `network_health_state` (both are only known at the call site),
+so routing them through would have meant adding new parameters to `mark_failed`'s signature purely
+for logging. `worker()` already has every field on hand, including the frontier's *authoritative*
+`max_retries` (via `self.frontier.raw.max_retries`, not `HybridCrawler`'s own copy — see the
+`_log_completion` docstring for why those two can differ). §10 explicitly left the exact
+persistence mechanism undecided ("RECOMMENDATION... not required for the primary guarantee"), so
+this is within the design's stated latitude, not a deviation from a hard requirement.
+
+### Exception-string boundary (discovered, not a contradiction)
+
+Every crawler engine's `fetch()` already collapses its exception to `str(exc)` before returning
+`failure_reason` — the raw exception object never reaches `HybridCrawler`. N2 §5 anticipated this
+class of imprecision explicitly ("prefer structured exception info where available... Unknown
+failures must remain conservative"): `classify_failure()` accepts an optional exception for callers
+that have one, and falls back to string matching otherwise, which is what `hybrid_crawler.py`
+actually exercises. This is documented as a known limitation, not a blocking contradiction: the
+primary guarantee does not depend on precise per-failure classification (only the independent
+probe round decides `OFFLINE`), and a misclassified failure defaults to UNKNOWN — the safe,
+budget-consuming default N2 §5 already specifies for exactly this case.
+
+One real bug this surfaced during testing: aiohttp's `ClientConnectorError.__str__` unconditionally
+formats every connector failure (refused, DNS, timeout — anything) as
+`"Cannot connect to host {h}:{p} ssl:{default|None|True} [{reason}]"`. An initial bare `"ssl"`
+substring check misclassified ordinary aiohttp connection/DNS/timeout failures as `TLS_FAILURE`
+100% of the time (aiohttp is the primary "async" engine). Fixed by requiring a more specific TLS
+signature (`"certificate"`, `"handshake"`, `"[ssl:"`, etc.) — see
+`core/failure_classifier.py`'s `_TLS_SUBSTRINGS` comment.
+
+### Verification against real Redis
+
+`mark_deferred`'s attempt-budget neutrality and stale-claim CAS safety were verified directly
+against a running Redis instance (not just mocked): claim → `mark_deferred` → `reclaim_and_promote`
+→ re-claim shows `attempt` returning to 1 (not climbing), and a stale claim's late `mark_deferred`
+call is rejected without touching a newer claim's attempt count or ownership.
+
+### Test results
+
+Full suite after this phase's additions: 326 collected (excluding `tests/benchmarks`) — typically
+323-324 passed, 2 skipped (pre-existing, environment-gated), 0-2 failed. Two Redis-backed
+concurrency tests are flaky **independent of this phase**, confirmed by running each dozens of
+times against unmodified `main` (`git stash`) before any N3 change:
+
+- `frontier_executor_test.py::TestRedisFrontierIsOffloaded::test_concurrent_redis_calls_use_a_bounded_shared_thread_pool`
+- `redis_frontier_test.py::TestMultiWorkerCoordination::test_get_next_url_no_duplicates`
+  (observed ~10% failure rate on unmodified `main` across 20 runs, "got 8 instead of 9 claims" --
+  looks like a real, pre-existing edge case in the `rate_limit=0` gate's sub-microsecond timestamp
+  comparison in `_claim_next_script`, not a correctness bug in anything this phase touched --
+  `_claim_next_script`/`add_url` are byte-for-byte unmodified by this diff)
+
+Both are real threads racing a real Redis instance under system-load-dependent timing; neither
+exercises `mark_deferred` or any other N3 code path. Zero regressions introduced by this phase.
+
+### Known limitations
+
+- A bare, message-less timeout (`str(exc) == ""`, e.g. a raw `asyncio.TimeoutError()`) is
+  substituted with the generic string `"unknown fetch error"` by the engine before the classifier
+  ever sees it, so it classifies as `UNKNOWN` rather than `TIMEOUT` — it still safely consumes
+  normal retry budget (N2 §5's conservative default) but does not contribute to the ambiguous-
+  failure counter. Fixing this precisely would require changing the six crawler engines' generic
+  exception handlers to preserve the exception type name, which was out of this phase's scope
+  (engines are explicitly not in §17's file list).
+- `probe_endpoints` defaults to three real third-party "connectivity check" endpoints (Google,
+  Microsoft, Apple) chosen for this phase per §4's recommendation, since no specific endpoints were
+  vetted in N2. Fully operator-overridable via config; not written into `config.yaml` itself.
+- Numeric defaults (`trigger_threshold`, `probe_timeout_seconds`, etc.) are provisional, as N2 §11
+  intentionally left them for N3 without real failure-rate telemetry — see each field's comment in
+  `core/config.py`'s `NetworkHealthConfig`.
+- This incident's existing `failed_permanent` set is unchanged, per N2 §9's explicit recommendation
+  against blind automatic recovery.

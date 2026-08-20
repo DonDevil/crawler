@@ -1,5 +1,7 @@
 """Tests for URL frontier behavior."""
 
+import time
+
 from core.url_frontier import URLFrontier
 from storage.url_database import URLDatabase
 from utils.url_utils import URLUtils
@@ -158,3 +160,64 @@ def test_renew_claim_succeeds_for_current_owner_and_fails_after_completion():
 
     frontier.mark_visited(claim)
     assert frontier.renew_claim(claim) is None
+
+
+def test_mark_deferred_leaves_retry_budget_unchanged_and_never_fails_permanent():
+    """N2 §6: claim -> mark_deferred must have zero net effect on the URL's
+    retry budget (attempts += 1 at claim time, -= 1 at defer time), and
+    must never route to failed_permanent regardless of how many times it
+    happens."""
+    frontier = URLFrontier(
+        rate_limit=0, max_retries=1, base_backoff=0, max_backoff=0, deferred_requeue_delay_seconds=0
+    )
+    frontier.add_url("https://example.com/outage")
+
+    for _ in range(5):
+        claim = frontier.get_next_url()
+        assert claim.attempt == 1  # never climbs past 1: the increment is always undone
+        frontier.mark_deferred(claim, reason="confirmed local outage")
+
+    counts = frontier.get_status_counts()
+    assert counts["failed_permanent"] == 0
+    assert counts["retry_scheduled"] == 1  # requeued, waiting to be reclaimed
+    assert frontier.get_next_url() is not None
+
+
+def test_mark_deferred_uses_fixed_delay_not_exponential_backoff():
+    frontier = URLFrontier(rate_limit=0, max_retries=5, base_backoff=100, max_backoff=1000)
+    frontier.add_url("https://example.com/outage")
+
+    claim = frontier.get_next_url()
+    before = time.time()
+    frontier.mark_deferred(claim, reason="offline")
+
+    # The only entry in the retry heap must be scheduled using
+    # deferred_requeue_delay_seconds (default 10s), not base_backoff (100s)
+    # -- this is not a target-failure retry.
+    scheduled_at = frontier._retry_heap[0][0]
+    assert scheduled_at < before + 100
+    assert scheduled_at >= before + frontier.deferred_requeue_delay_seconds - 1
+
+
+def test_mark_deferred_ignores_stale_claim_without_corrupting_newer_claim():
+    frontier = URLFrontier(rate_limit=0, max_retries=3, base_backoff=0, max_backoff=0)
+    frontier.add_url("https://example.com/racey")
+
+    first_claim = frontier.get_next_url()
+    frontier.mark_failed(first_claim, "transient")  # attempt now consumed normally
+
+    second_claim = frontier.get_next_url()
+    assert second_claim.token != first_claim.token
+    assert second_claim.attempt == 2
+
+    # A stale mark_deferred (using the old, already-completed claim) must
+    # be a no-op -- it must not touch second_claim's attempt count or
+    # complete it out from under the newer owner.
+    frontier.mark_deferred(first_claim, reason="late/stale")
+
+    assert frontier._attempts[second_claim.url] == 2
+    assert frontier._is_current_claim(second_claim)
+
+    frontier.mark_visited(second_claim)
+    assert frontier.get_status_counts()["visited"] == 1
+    assert frontier.get_status_counts()["failed_permanent"] == 0

@@ -77,6 +77,7 @@ class RedisURLFrontier:
         domain_scan_limit: int = 250,
         reclaim_batch_size: int = 200,
         terminal_meta_ttl_seconds: Optional[float] = None,
+        deferred_requeue_delay_seconds: float = 10.0,
     ):
         """Initialize Redis frontier.
 
@@ -101,6 +102,12 @@ class RedisURLFrontier:
                 reaches a terminal state; `None`/`0` deletes it immediately
                 (ADR §9's proposed default -- retention policy is a later
                 product decision, not a Step 3 correctness concern)
+            deferred_requeue_delay_seconds: Fixed (non-exponential) delay
+                used by `mark_deferred` -- see
+                docs/architecture/network-failure-handling-design.md §6/§11.
+                Distinct from `base_backoff`/`max_backoff`: a deferred
+                completion is not a target-failure retry, so the
+                target-failure exponential ladder does not apply to it.
         """
         self.redis_host = redis_host
         self.redis_port = redis_port
@@ -115,6 +122,7 @@ class RedisURLFrontier:
         self.domain_scan_limit = domain_scan_limit
         self.reclaim_batch_size = reclaim_batch_size
         self.terminal_meta_ttl_seconds = terminal_meta_ttl_seconds or 0
+        self.deferred_requeue_delay_seconds = deferred_requeue_delay_seconds
 
         try:
             self.redis_conn = redis.Redis(
@@ -313,6 +321,43 @@ class RedisURLFrontier:
                     return 'failed_permanent'
                 end
             end
+            """
+        )
+
+        self._mark_deferred_script = self.redis_conn.register_script(
+            """
+            local url = ARGV[1]
+            local token = ARGV[2]
+            local requeue_delay = tonumber(ARGV[3])
+            local ns = ARGV[4]
+
+            local time_result = redis.call('TIME')
+            local now = tonumber(time_result[1]) + (tonumber(time_result[2]) / 1000000)
+
+            local claim_key = ns .. ':claim:' .. url
+            local current_token = redis.call('HGET', claim_key, 'token')
+
+            if (not current_token) or current_token ~= token then
+                return 'stale'
+            end
+
+            -- CAS validated above: this claim is still the current owner,
+            -- so decrementing here can never touch a newer claim's
+            -- increment (a newer claim would have already overwritten
+            -- 'token', which would have failed the check above and
+            -- returned 'stale' instead of reaching this line).
+            redis.call('ZREM', ns .. ':inflight', url)
+            redis.call('DEL', claim_key)
+            redis.call('DECR', ns .. ':attempts:' .. url)
+
+            -- Not a target-failure retry: fixed delay, not the exponential
+            -- base_backoff*2^(attempt-1) ladder complete_claim_script uses.
+            -- meta:{url} (domain/priority) is left untouched so
+            -- reclaim_and_promote's retry_scheduled -> domain-queue
+            -- promotion step works exactly as it does for ordinary retries.
+            redis.call('ZADD', ns .. ':retry_scheduled', now + requeue_delay, url)
+
+            return 'deferred'
             """
         )
 
@@ -598,6 +643,41 @@ class RedisURLFrontier:
         """Record a failed attempt; frontier decides retry-vs-terminal from
         `claim.attempt` vs. `max_retries`, iff the claim is current."""
         self._complete(claim, "failed", error)
+
+    def mark_deferred(self, claim: FrontierClaim, reason: str = "") -> None:
+        """Complete a claim as deferred: the target was never meaningfully
+        attempted because local connectivity was confirmed unavailable
+        (core/network_health.py's `HealthController.state == OFFLINE`) --
+        see docs/architecture/network-failure-handling-design.md §6.
+
+        Unlike `mark_failed`, this is CAS-validated exactly like every
+        other completion (stale claims are rejected before any mutation),
+        but then undoes the claim-time `INCR ns:attempts:<url>` and
+        requeues via `ns:retry_scheduled` with a fixed
+        `deferred_requeue_delay_seconds` delay instead of the exponential
+        target-failure backoff -- net effect on the URL's retry budget is
+        zero. Never routes to `failed_permanent`.
+
+        Raises `FrontierUnavailable` on a Redis failure, matching every
+        other completion path's error contract (core/frontier.py).
+
+        Round trips: 1 (single Lua script). Complexity: O(1).
+        """
+        try:
+            result = self._mark_deferred_script(
+                args=[claim.url, claim.token, self.deferred_requeue_delay_seconds, self.namespace]
+            )
+        except redis.RedisError as e:
+            logger.error(f"Redis error marking claim deferred: {e}")
+            raise FrontierUnavailable(f"mark_deferred for {claim.url!r}: {e}") from e
+
+        if result == "stale":
+            logger.debug(f"Stale claim ignored (mark_deferred): {claim.url}")
+        else:
+            logger.info(
+                f"Deferred {claim.url} (attempt {claim.attempt}) -- confirmed local "
+                f"network outage, retry budget unaffected: {reason}"
+            )
 
     def mark_skipped(self, claim: FrontierClaim) -> None:
         """Mark a claimed URL as terminally skipped (never retried), iff current."""

@@ -157,6 +157,72 @@ class FrontierConfig(BaseModel):
     heartbeat_interval: Optional[float] = None
 
 
+class NetworkHealthConfig(BaseModel):
+    """Configuration for process-local network-outage detection (N3,
+    docs/architecture/network-failure-handling-design.md §11).
+
+    Every numeric default below is a PROVISIONAL default: N2 §11
+    deliberately left exact tuning values to N3 as "a data-informed tuning
+    decision, not asserted here without evidence," and no real
+    outage-vs-dead-target failure-rate telemetry was available during this
+    implementation phase either (see N1 §12/§13). Defaults here are chosen
+    conservatively (favor not-flapping over fast detection) and are fully
+    operator-overridable; see each field's comment for its specific
+    reasoning.
+    """
+
+    enabled: bool = True
+
+    # HEALTHY -> SUSPECT sensitivity (§3). Must stay well above the
+    # ordinary rate of interleaved single-domain dead-target failures under
+    # concurrency=25 (any *interleaved* success already resets this to
+    # zero, so it only accumulates on an unbroken run of ambiguous
+    # failures) while still reacting within roughly a few seconds to a
+    # minute of a genuine outage.
+    trigger_threshold: int = 10
+
+    # Per-endpoint probe timeout (§4) -- short enough not to stall
+    # detection, long enough that a merely-slow-but-present network isn't
+    # misread as absent. Connectivity-check endpoints normally respond in
+    # well under a second.
+    probe_timeout_seconds: float = 5.0
+
+    # Independent, non-crawl-target endpoints (§4): purpose-built
+    # "is there Internet" connectivity-check endpoints from three
+    # different providers/ASes/DNS zones, chosen so one vendor's own
+    # outage can't masquerade as "the Internet is down." All are
+    # hostname-based (not bare IPs), so DNS resolution is genuinely
+    # exercised, matching §4's reasoning for rejecting bare-TCP probing.
+    probe_endpoints: List[str] = Field(default_factory=lambda: [
+        "https://www.gstatic.com/generate_204",
+        "https://www.msftconnecttest.com/connecttest.txt",
+        "https://captive.apple.com/hotspot-detect.html",
+    ])
+
+    # Debounce between the first and second failed probe round before
+    # declaring OFFLINE (§3) -- exists specifically to reject sub-second
+    # blips (Wi-Fi reassociation, a brief DNS hiccup) without waiting so
+    # long that a real outage goes undetected for an unreasonable time.
+    confirm_delay_seconds: float = 5.0
+
+    # Cadence of re-probing while OFFLINE (§3) -- the only periodic
+    # probing in this design. Frequent enough to detect recovery
+    # reasonably fast; trivial load against high-uptime endpoints even at
+    # this cadence.
+    recovery_probe_interval_seconds: float = 15.0
+
+    # Consecutive successful probe rounds required before OFFLINE ->
+    # HEALTHY (§3) -- more than one, so a single flaky success right as
+    # connectivity is half-restored doesn't immediately dump every worker
+    # back into claiming against a still-unstable link.
+    recovery_confirm_rounds: int = 2
+
+    # Fixed (non-exponential) delay used by mark_deferred (§6) -- must be
+    # nonzero to avoid a tight reclaim loop hammering Redis while still
+    # offline (§14), but small since this isn't a target-failure backoff.
+    deferred_requeue_delay_seconds: float = 10.0
+
+
 class SearchConfig(BaseModel):
     enabled_engines: List[str] = Field(default_factory=lambda: [
         "duckduckgo",
@@ -200,6 +266,7 @@ class CrawlerConfig(BaseModel):
     storage: StorageConfig = StorageConfig()
     frontier: FrontierConfig = FrontierConfig()
     media_evidence: MediaEvidenceConfig = MediaEvidenceConfig()
+    network_health: NetworkHealthConfig = NetworkHealthConfig()
 
 
 class Config(BaseModel):

@@ -33,6 +33,7 @@ class URLFrontier:
         base_backoff: float = 5.0,
         max_backoff: float = 300.0,
         lease_ttl: float = 90.0,
+        deferred_requeue_delay_seconds: float = 10.0,
     ):
         self.visited: set[str] = set()
         self._known: set[str] = set()
@@ -51,6 +52,7 @@ class URLFrontier:
         self.base_backoff = base_backoff
         self.max_backoff = max_backoff
         self.lease_ttl = lease_ttl
+        self.deferred_requeue_delay_seconds = deferred_requeue_delay_seconds
         self._attempts: dict[str, int] = {}
         self._active_claims: dict[str, str] = {}
         self._retry_heap: list[tuple[float, int, int, str]] = []
@@ -238,6 +240,35 @@ class URLFrontier:
             self._attempts.pop(claim.url, None)
             self._failed_permanent.add(claim.url)
             logger.info(f"{claim.url} failed permanently after {claim.attempt} attempts: {error}")
+
+    def mark_deferred(self, claim: FrontierClaim, reason: str = "") -> None:
+        """Complete a claim as deferred: the target was never meaningfully
+        attempted because local connectivity was confirmed unavailable
+        (core/network_health.py) -- see
+        docs/architecture/network-failure-handling-design.md §6.
+
+        Unlike `mark_failed`, this undoes the claim-time attempt increment
+        and requeues after a fixed `deferred_requeue_delay_seconds` instead
+        of the exponential target-failure backoff -- net effect on the
+        URL's retry budget is zero. Never routes to `failed_permanent`.
+        """
+
+        if not self._is_current_claim(claim):
+            logger.debug(f"Stale claim ignored (mark_deferred): {claim.url}")
+            return
+
+        self._active_claims.pop(claim.url, None)
+        self._attempts[claim.url] = self._attempts.get(claim.url, claim.attempt) - 1
+
+        self._sequence += 1
+        heapq.heappush(
+            self._retry_heap,
+            (time.time() + self.deferred_requeue_delay_seconds, claim.priority, self._sequence, claim.url),
+        )
+        logger.info(
+            f"Deferred {claim.url} (attempt {claim.attempt}) -- confirmed local "
+            f"network outage, retry budget unaffected: {reason}"
+        )
 
     def has_pending(self) -> bool:
         """Return True when the frontier still has queued, in-flight, or retry-pending work."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import Counter
 from typing import Optional
 
@@ -13,9 +14,11 @@ from loguru import logger
 
 from core.claim_heartbeat import ClaimLostError, resolve_heartbeat_interval, run_with_heartbeat
 from core.crawler_router import CrawlerRouter
+from core.failure_classifier import classify_failure, is_ambiguous
 from core.frontier import Frontier, FrontierClaim, FrontierUnavailable
 from core.frontier_executor import AsyncFrontier
 from core.media_evidence_executor import AsyncMediaEvidence
+from core.network_health import HealthController, NetworkHealthState
 from core.url_frontier import URLFrontier
 from crawler.async_crawler import AsyncCrawler
 from crawler.http_crawler import HTTPCrawler
@@ -48,8 +51,14 @@ class HybridCrawler:
         scrapling_stealth: bool = True,
         scrapling_network_idle: bool = True,
         heartbeat_interval: Optional[float] = None,
+        health: Optional[HealthController] = None,
     ):
         self.frontier = AsyncFrontier(frontier)
+        # Process-local network-health detection (N2/N3, core/network_health.py).
+        # `None` (default) means every health-integration branch below is a
+        # no-op -- existing behavior is unchanged for any caller that
+        # doesn't pass one (see docs/architecture/network-failure-handling-design.md).
+        self.health = health
         self.parser = parser
         self.concurrency = max(1, min(concurrency, max_pages)) if max_pages else max(1, concurrency)
         self.timeout = timeout
@@ -266,6 +275,18 @@ class HybridCrawler:
                     continue
                 break
 
+            if self.health is not None and self.health.state == NetworkHealthState.OFFLINE:
+                # N2 §7: once local connectivity is probe-confirmed OFFLINE,
+                # further engine attempts (Playwright/Selenium/etc.) are
+                # guaranteed-wasted work -- no new signal is learned by
+                # trying another engine while the host has no route at all.
+                # Stop escalating; the worker completes this claim via
+                # mark_deferred instead of mark_failed.
+                logger.info(
+                    f"Short-circuiting engine escalation for {url}: network_health is OFFLINE"
+                )
+                break
+
             plan = self._prepend_unique(
                 plan,
                 self.router.get_engine_plan(
@@ -279,6 +300,49 @@ class HybridCrawler:
                 logger.info(f"Escalating {url} from {engine_used} to {plan[0]}: {failure_reason}")
 
         return html, failure_reason, attempt_chain, engine_used
+
+    def _log_completion(
+        self,
+        claim: FrontierClaim,
+        url: str,
+        category,
+        final_outcome: Optional[str] = None,
+        status: str = "visited",
+    ) -> None:
+        """Structured per-completion observability line (N2 §10): extends
+        the existing loguru-based logging already used throughout this
+        module -- no new metrics backend/subsystem.
+
+        `final_outcome` is precomputed by the caller when it's already
+        known unambiguously (deferred, skipped); otherwise it's inferred
+        here from `claim.attempt` vs. the frontier's own authoritative
+        `max_retries` (not `self.max_retries`, which can differ -- see
+        `core/crawler_manager.py`), mirroring exactly the same comparison
+        `_complete_claim_script`/`URLFrontier.mark_failed` use internally.
+        """
+        if final_outcome is None:
+            if status == "visited":
+                final_outcome = "visited"
+            elif status == "skipped":
+                final_outcome = "skipped"
+            else:
+                effective_max_retries = getattr(self.frontier.raw, "max_retries", self.max_retries)
+                final_outcome = "retry_scheduled" if claim.attempt < effective_max_retries else "failed_permanent"
+
+        consumed_retry_budget = final_outcome in ("retry_scheduled", "failed_permanent")
+
+        logger.info(
+            "completion url={} attempt={} failure_category={} consumed_retry_budget={} "
+            "network_health_state={} host_identity={} timestamp={} final_outcome={}",
+            url,
+            claim.attempt,
+            category.name if category is not None else "success",
+            consumed_retry_budget,
+            self.health.state.value if self.health is not None else "disabled",
+            self.health.host_identity if self.health is not None else "unknown",
+            time.time(),
+            final_outcome,
+        )
 
     async def worker(self):
         while not self._stop_event.is_set():
@@ -295,6 +359,7 @@ class HybridCrawler:
                     await self.frontier.mark_skipped(claim)
                     if self._sql_mode_mirror:
                         self.url_database.update_status(url, "skipped")
+                    self._log_completion(claim, url, category=None, final_outcome="skipped")
                     continue
 
                 if self._sql_mode_mirror:
@@ -338,12 +403,48 @@ class HybridCrawler:
                     self._pages_failed += 1
                     logger.warning(f"Failed to crawl {url}: {failure_reason}")
 
+                failure_category = None
                 if status == "failed":
+                    failure_category = classify_failure(failure_reason)
+                    if self.health is not None and is_ambiguous(failure_category):
+                        # Categories 2/3/5 only feed the trigger counter --
+                        # they never by themselves exempt this (or any)
+                        # claim's retry budget (N2 §5/§14). Whether *this*
+                        # claim is exempt is decided below, purely from
+                        # `self.health.state` read at completion time.
+                        await self.health.record_ambiguous_failure()
+                elif self.health is not None:
+                    self.health.record_success()
+
+                # N2 §6: the OFFLINE check is made at completion time, not
+                # claim time -- a claim taken while HEALTHY can still
+                # legitimately complete after the network dropped mid-fetch.
+                offline_at_completion = (
+                    status == "failed"
+                    and self.health is not None
+                    and self.health.state == NetworkHealthState.OFFLINE
+                )
+
+                if offline_at_completion:
+                    await self.frontier.mark_deferred(claim, failure_reason or "")
+                    if self._sql_mode_mirror:
+                        self.url_database.update_status(url, "queued")
+                elif status == "failed":
                     await self.frontier.mark_failed(claim, failure_reason or "")
+                    if self._sql_mode_mirror:
+                        self.url_database.update_status(url, status)
                 else:
                     await self.frontier.mark_visited(claim)
-                if self._sql_mode_mirror:
-                    self.url_database.update_status(url, status)
+                    if self._sql_mode_mirror:
+                        self.url_database.update_status(url, status)
+
+                self._log_completion(
+                    claim,
+                    url,
+                    category=failure_category,
+                    final_outcome="deferred" if offline_at_completion else None,
+                    status=status,
+                )
 
                 self._pages_crawled += 1
                 self._engine_counts[engine_used] += 1
@@ -394,6 +495,16 @@ class HybridCrawler:
         idle_loops = 0
 
         while not self._stop_event.is_set():
+            if self.health is not None and self.health.state == NetworkHealthState.OFFLINE:
+                # N2 §7: pause new claims while confirmed OFFLINE -- skip
+                # get_next_url entirely, and don't let the pause be
+                # mistaken for "no more work" by the idle-shutdown check
+                # below. Reuses the same 0.5s idle-poll sleep already used
+                # elsewhere in this loop, so pausing is never a busy loop.
+                idle_loops = 0
+                await asyncio.sleep(0.5)
+                continue
+
             try:
                 claim = await self.frontier.get_next_url()
             except FrontierUnavailable as e:
@@ -460,6 +571,9 @@ class HybridCrawler:
 
                 if self._playwright_ready:
                     await self._playwright_engine._stop_browser()
+
+                if self.health is not None:
+                    await self.health.aclose()
 
                 logger.info(
                     "Hybrid crawler finished: processed={} failed={} pending_frontier={} engine_usage={}",
