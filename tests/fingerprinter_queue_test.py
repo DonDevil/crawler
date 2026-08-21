@@ -128,6 +128,36 @@ def test_stale_token_cannot_complete_a_reclaimed_job(tmp_path):
         store.close()
 
 
+def test_mark_fingerprint_job_forwarded_sqlite_parity(tmp_path):
+    """SQLite-backend parity with RedisMediaEvidenceStore's identical
+    method (docs/architecture/phase-4-crawler-fingerprinter-bridge.md) --
+    a job successfully forwarded to the fingerprinter leaves `claimed`
+    without ever being reported as a fingerprint verdict."""
+    store = SQLiteMediaEvidenceStore(path=str(tmp_path / "media_evidence.db"))
+
+    try:
+        asset_id = store.record_media_link(url="https://cdn.example/movie.mp4", media_type="video")
+        job = store.claim_next_fingerprint_job(worker_id="bridge-1")
+        assert job is not None
+
+        assert store.mark_fingerprint_job_forwarded(asset_id, job.token, fingerprint_job_id="fp-job-1") is True
+
+        jobs = store.get_fingerprint_jobs()
+        assert jobs[0]["status"] == "forwarded"
+        assert jobs[0]["fingerprint_job_id"] == "fp-job-1"
+
+        asset = store.list_media_assets()[0]
+        assert asset["status"] == "forwarded"
+        assert asset["match_confidence"] is None
+        assert asset["matched_title"] is None
+
+        # A stale token (already reclaimed/completed by someone else) must
+        # not be accepted.
+        assert store.mark_fingerprint_job_forwarded(asset_id, "not-the-token", fingerprint_job_id="x") is False
+    finally:
+        store.close()
+
+
 def test_retryable_failure_then_permanent_failure(tmp_path):
     store = SQLiteMediaEvidenceStore(
         path=str(tmp_path / "media_evidence.db"), max_retries=2, base_backoff=0.0, max_backoff=0.0

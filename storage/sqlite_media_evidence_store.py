@@ -40,6 +40,7 @@ from storage.media_evidence_store import (
     InvalidMediaURLError,
     JOB_CLAIMED,
     JOB_COMPLETED,
+    JOB_FORWARDED,
     JOB_PERMANENT_FAILURE,
     JOB_QUEUED,
     JOB_RETRY_SCHEDULED,
@@ -140,6 +141,7 @@ class SQLiteMediaEvidenceStore:
                 updated_at TIMESTAMP,
                 target_id TEXT,
                 target_version TEXT,
+                fingerprint_job_id TEXT,
                 FOREIGN KEY(asset_id) REFERENCES media_assets(id) ON DELETE CASCADE
             )"""
         )
@@ -490,6 +492,25 @@ class SQLiteMediaEvidenceStore:
                        WHERE asset_id = ?""",
                     (JOB_PERMANENT_FAILURE, new_retry_count, error_class, last_error, now, aid),
                 )
+            return True
+
+    def mark_fingerprint_job_forwarded(self, asset_id: str, token: str, *, fingerprint_job_id: str) -> bool:
+        """SQLite-backend parity with `RedisMediaEvidenceStore`'s identical
+        method -- see `JOB_FORWARDED`'s docstring (storage/media_evidence_
+        store.py) for why this is distinct from `complete_fingerprint_job`."""
+        aid = int(asset_id)
+        with self._lock:
+            claim = self._current_claim(aid)
+            if claim is None or claim["status"] != JOB_CLAIMED or claim["claim_token"] != token:
+                return False
+
+            now = self._now()
+            self._writer.execute(
+                """UPDATE fingerprint_jobs
+                   SET status = ?, claim_token = NULL, fingerprint_job_id = ?, updated_at = ?
+                   WHERE asset_id = ?""",
+                (JOB_FORWARDED, fingerprint_job_id, now, aid),
+            )
             return True
 
     def reclaim_expired_jobs(self, batch_size: int = 200) -> tuple[int, int]:

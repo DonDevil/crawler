@@ -32,7 +32,29 @@ JOB_COMPLETED = "completed"
 JOB_RETRY_SCHEDULED = "retry_scheduled"
 JOB_PERMANENT_FAILURE = "permanent_failure"
 
-JOB_STATUSES = (JOB_QUEUED, JOB_CLAIMED, JOB_COMPLETED, JOB_RETRY_SCHEDULED, JOB_PERMANENT_FAILURE)
+# Phase 4 (docs/architecture/phase-4-crawler-fingerprinter-bridge.md):
+# terminal state for a job the crawler->fingerprinter bridge successfully
+# handed off to the fingerprinter's own job stream. Deliberately NOT
+# `JOB_COMPLETED` -- `complete_fingerprint_job()` records an actual
+# `FingerprintResult` *verdict* (confirmed/rejected/uncertain), which the
+# bridge never has at hand-off time and must never fabricate (a fake
+# "uncertain" decision would be indistinguishable from a real one to any
+# reader of `list_media_assets()`/`get_fingerprint_jobs()`). `forwarded`
+# means exactly "the fingerprinter now owns this unit of work"; the actual
+# verdict, once one exists, is still recorded via the unchanged
+# `complete_fingerprint_job()` path by whatever future consumer reads the
+# fingerprinter's result contract (out of this phase's scope, see the
+# phase-4 doc's "Deferred work").
+JOB_FORWARDED = "forwarded"
+
+JOB_STATUSES = (
+    JOB_QUEUED,
+    JOB_CLAIMED,
+    JOB_COMPLETED,
+    JOB_RETRY_SCHEDULED,
+    JOB_PERMANENT_FAILURE,
+    JOB_FORWARDED,
+)
 
 # FingerprintResult.aggregate_decision values (§9).
 DECISION_CONFIRMED = "confirmed"
@@ -287,6 +309,17 @@ class MediaEvidenceStore(Protocol):
         `max_retries`, after which -- like any exhausted or non-retryable
         failure -- the job becomes `permanent_failure`. Returns `False` for
         a stale/unknown claim."""
+        ...
+
+    def mark_fingerprint_job_forwarded(self, asset_id: str, token: str, *, fingerprint_job_id: str) -> bool:
+        """Terminal transition for a job the crawler->fingerprinter bridge
+        successfully handed off to the fingerprinter's own job stream, iff
+        `token` is still the current owner. Distinct from
+        `complete_fingerprint_job` -- see `JOB_FORWARDED`'s docstring for
+        why. `fingerprint_job_id` is the fingerprinter's own deterministic
+        job identity (docs/architecture/phase-4-crawler-fingerprinter-
+        bridge.md), recorded for correlation only. Returns `False` for a
+        stale/unknown claim -- the caller must not treat this as success."""
         ...
 
     def reclaim_expired_jobs(self, batch_size: int = 200) -> tuple[int, int]:

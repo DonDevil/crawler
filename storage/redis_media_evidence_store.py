@@ -38,6 +38,7 @@ from storage.media_evidence_store import (
     InvalidMediaURLError,
     JOB_CLAIMED,
     JOB_COMPLETED,
+    JOB_FORWARDED,
     JOB_PERMANENT_FAILURE,
     JOB_QUEUED,
     JOB_RETRY_SCHEDULED,
@@ -448,6 +449,42 @@ class RedisMediaEvidenceStore:
             """
         )
 
+        self._mark_forwarded_script = self.redis_conn.register_script(
+            """
+            -- Phase 4 (docs/architecture/phase-4-crawler-fingerprinter-
+            -- bridge.md): token CAS, then transition straight to the
+            -- `forwarded` terminal state -- no result hash, no
+            -- confirmed_match event (there is no verdict yet, only a
+            -- successful hand-off). Mirrors _complete_script's/_fail_
+            -- script's CAS shape exactly.
+            local aid = ARGV[1]
+            local token = ARGV[2]
+            local fingerprint_job_id = ARGV[3]
+            local ns = ARGV[4]
+
+            local time_result = redis.call('TIME')
+            local now = tonumber(time_result[1]) + (tonumber(time_result[2]) / 1000000)
+
+            local claim_key = ns .. ':jobs:claim:' .. aid
+            local current_token = redis.call('HGET', claim_key, 'token')
+            if (not current_token) or current_token ~= token then
+                return 'stale'
+            end
+
+            redis.call('ZREM', ns .. ':jobs:inflight', aid)
+            redis.call('DEL', claim_key)
+
+            local job_key = ns .. ':job:' .. aid
+            redis.call('HSET', job_key,
+                'status', 'forwarded',
+                'fingerprint_job_id', fingerprint_job_id,
+                'updated_at', tostring(now))
+            redis.call('INCR', ns .. ':jobs:forwarded_total')
+
+            return 'ok'
+            """
+        )
+
         self._reclaim_script = self.redis_conn.register_script(
             """
             -- Two bounded-batch phases in one round trip, mirroring
@@ -727,6 +764,7 @@ class RedisMediaEvidenceStore:
             "updated_at": _to_optional_float(job_hash.get("updated_at")),
             "target_id": job_hash.get("target_id") or None,
             "target_version": job_hash.get("target_version") or None,
+            "fingerprint_job_id": job_hash.get("fingerprint_job_id") or None,
         }
 
     def get_fingerprint_jobs(self, statuses: Optional[Sequence[str]] = None) -> list[dict]:
@@ -893,6 +931,24 @@ class RedisMediaEvidenceStore:
             return False
         return True
 
+    def mark_fingerprint_job_forwarded(self, asset_id: str, token: str, *, fingerprint_job_id: str) -> bool:
+        """Round trips: 1 (single Lua script -- token CAS, clear claim/
+        inflight, transition to the `forwarded` terminal state). Complexity:
+        O(1). See `JOB_FORWARDED`'s docstring (storage/media_evidence_store.py)
+        for why this is distinct from `complete_fingerprint_job`. Returns
+        `False` for a stale/unknown claim -- the caller must not treat this
+        as success (the job may already be owned by a different claimer)."""
+        try:
+            outcome = self._mark_forwarded_script(args=[asset_id, token, fingerprint_job_id, self.namespace])
+        except redis.RedisError as e:
+            logger.error(f"Redis error marking fingerprint job forwarded: {e}")
+            raise MediaEvidenceUnavailable(f"mark_fingerprint_job_forwarded({asset_id!r}): {e}") from e
+
+        if outcome == "stale":
+            logger.debug(f"Stale fingerprint job forward-ack ignored: {asset_id}")
+            return False
+        return True
+
     def reclaim_expired_jobs(self, batch_size: int = 200) -> tuple[int, int]:
         """Not run automatically by this class -- a caller (mirroring
         `CrawlerManager._recovery_loop`'s use of `reclaim_and_promote`)
@@ -924,7 +980,8 @@ class RedisMediaEvidenceStore:
             pipe.zcard(self._key("jobs", "retry_scheduled"))
             pipe.scard(self._key("jobs", "permanent_failure"))
             pipe.get(self._key("jobs", "completed_total"))
-            queued, claimed, retry_scheduled, permanent_failure, completed_total = pipe.execute()
+            pipe.get(self._key("jobs", "forwarded_total"))
+            queued, claimed, retry_scheduled, permanent_failure, completed_total, forwarded_total = pipe.execute()
         except redis.RedisError as e:
             logger.error(f"Redis error getting status counts: {e}")
             raise MediaEvidenceUnavailable(f"get_status_counts: {e}") from e
@@ -935,6 +992,7 @@ class RedisMediaEvidenceStore:
             JOB_RETRY_SCHEDULED: retry_scheduled,
             JOB_PERMANENT_FAILURE: permanent_failure,
             JOB_COMPLETED: int(completed_total) if completed_total else 0,
+            JOB_FORWARDED: int(forwarded_total) if forwarded_total else 0,
         }
 
     def read_confirmed_match_events(self, count: int = 100) -> list[dict]:

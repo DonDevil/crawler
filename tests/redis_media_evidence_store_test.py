@@ -276,6 +276,70 @@ class TestFailAndRetry:
         ) is False
 
 
+class TestMarkForwarded:
+    """`mark_fingerprint_job_forwarded` (docs/architecture/
+    phase-4-crawler-fingerprinter-bridge.md) -- the bridge's terminal
+    transition for a job it successfully handed off to the fingerprinter,
+    distinct from `complete_fingerprint_job` (which records an actual
+    verdict the bridge never has)."""
+
+    def test_forwarded_job_leaves_claimed_state_and_records_job_id(self, evidence_store: RedisMediaEvidenceStore):
+        aid = evidence_store.record_media_link(url="https://cdn.example/movie.mp4", media_type="video")
+        job = evidence_store.claim_next_fingerprint_job("worker-1")
+        assert job is not None
+
+        assert evidence_store.mark_fingerprint_job_forwarded(
+            aid, job.token, fingerprint_job_id="deadbeef" * 4
+        ) is True
+
+        counts = evidence_store.get_status_counts()
+        assert counts["claimed"] == 0
+        assert counts["forwarded"] == 1
+
+        jobs = evidence_store.get_fingerprint_jobs()
+        assert jobs == []  # no index for `forwarded`, mirroring `completed`'s precedent
+
+    def test_forwarded_status_is_not_reported_as_a_fingerprint_verdict(self, evidence_store: RedisMediaEvidenceStore):
+        """A forwarded-but-not-yet-fingerprinted asset must never look like
+        a confirmed/rejected/uncertain verdict to a reader of
+        `list_media_assets()` -- fabricating a decision would be worse than
+        not forwarding at all (brief, rule 12)."""
+        aid = evidence_store.record_media_link(url="https://cdn.example/movie.mp4", media_type="video")
+        job = evidence_store.claim_next_fingerprint_job("worker-1")
+        assert job is not None
+        evidence_store.mark_fingerprint_job_forwarded(aid, job.token, fingerprint_job_id="abc123")
+
+        asset = evidence_store.list_media_assets()[0]
+        assert asset["status"] == "forwarded"
+        assert asset["status"] not in ("confirmed", "rejected", "uncertain")
+        assert asset["match_confidence"] is None
+        assert asset["matched_title"] is None
+
+    def test_wrong_token_cannot_mark_forwarded(self, evidence_store: RedisMediaEvidenceStore):
+        aid = evidence_store.record_media_link(url="https://cdn.example/movie.mp4", media_type="video")
+        job = evidence_store.claim_next_fingerprint_job("worker-1")
+        assert job is not None
+
+        assert evidence_store.mark_fingerprint_job_forwarded(aid, "not-the-token", fingerprint_job_id="x") is False
+
+        counts = evidence_store.get_status_counts()
+        assert counts["claimed"] == 1
+        assert counts["forwarded"] == 0
+
+    def test_stale_claim_cannot_be_marked_forwarded_after_reclaim(self, evidence_store: RedisMediaEvidenceStore):
+        aid = evidence_store.record_media_link(url="https://cdn.example/movie.mp4", media_type="video")
+        stale_job = evidence_store.claim_next_fingerprint_job("worker-a")
+        assert stale_job is not None
+
+        _force_expire_lease(evidence_store, aid)
+        evidence_store.reclaim_expired_jobs()
+        evidence_store.reclaim_expired_jobs()
+
+        assert evidence_store.mark_fingerprint_job_forwarded(
+            aid, stale_job.token, fingerprint_job_id="x"
+        ) is False
+
+
 class TestConfirmedMatchEvent:
     def test_confirmed_decision_emits_event(self, evidence_store: RedisMediaEvidenceStore):
         aid = evidence_store.record_media_link(

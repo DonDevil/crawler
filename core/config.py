@@ -95,6 +95,55 @@ class MediaEvidenceConfig(BaseModel):
     target_version: Optional[str] = None
 
 
+class BridgeConfig(BaseModel):
+    """Configuration for the Phase 4 crawler->fingerprinter bridge
+    (docs/architecture/phase-4-crawler-fingerprinter-bridge.md) -- the
+    process that forwards `evidence:jobs:queue` entries onto the
+    fingerprinter's own `fingerprint:jobs:stream:{priority}` contract.
+
+    `max_outstanding_jobs`/`submission_marker_ttl_s` mirror the
+    fingerprinter's own `integration.backpressure.DEFAULT_MAX_OUTSTANDING_JOBS`
+    / `integration.submission.DEFAULT_SUBMISSION_MARKER_TTL_S` defaults
+    (both PROVISIONAL there, restated here for the same reason -- see that
+    repo's phase-12 doc §11/§25) -- kept numerically identical so a bridge
+    run with defaults behaves exactly like the fingerprinter's own
+    in-process `FingerprintJobSubmitter` would, without this repo importing
+    that class.
+    """
+
+    max_outstanding_jobs: int = 500
+    submission_marker_ttl_s: int = 24 * 60 * 60
+
+    # Crawler priority -> fingerprinter priority band (docs/architecture/
+    # phase-4-crawler-fingerprinter-bridge.md, "Priority propagation").
+    # PROVISIONAL, uncalibrated (no threshold mapping exists anywhere in
+    # either repo prior to this phase -- see the fingerprinter's own
+    # phase-12 doc §12, which explicitly declined to invent one and named
+    # "a future bridge component" as the place it belongs). Crawler
+    # priority is a plain int, lower = more urgent, conventional default
+    # 10 (storage/media_evidence_store.py): priority <= priority_high_max
+    # maps to the fingerprinter's HIGH stream, priority >= priority_low_min
+    # maps to LOW, everything in between (including the default, 10) maps
+    # to NORMAL. Operator-tunable; not load-tested.
+    priority_high_max: int = 5
+    priority_low_min: int = 15
+
+    # FingerprintCandidate.max_attempts' default (fingerprinter repo,
+    # integration/candidate.py) -- the bridge has no per-candidate signal
+    # to vary this, so every forwarded job gets the same value.
+    max_attempts: int = 3
+
+    # How long the bridge sleeps after finding the evidence queue empty
+    # before polling again.
+    poll_idle_sleep_seconds: float = 2.0
+
+    # Cadence of the bridge's own reclaim_expired_jobs() sweep, mirroring
+    # CrawlerManager._recovery_loop's use of the frontier's equivalent
+    # sweep (core/crawler_manager.py) -- reuses the evidence store's own
+    # existing recovery mechanism, not a new one.
+    reclaim_interval_seconds: float = 60.0
+
+
 class FrontierConfig(BaseModel):
     """Configuration for URL frontier backend.
 
@@ -278,6 +327,7 @@ class CrawlerConfig(BaseModel):
     frontier: FrontierConfig = FrontierConfig()
     media_evidence: MediaEvidenceConfig = MediaEvidenceConfig()
     network_health: NetworkHealthConfig = NetworkHealthConfig()
+    bridge: BridgeConfig = BridgeConfig()
 
 
 class Config(BaseModel):
