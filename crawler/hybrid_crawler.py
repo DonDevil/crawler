@@ -81,7 +81,7 @@ class HybridCrawler:
         self.scrapling_enabled = scrapling_enabled
         self.router = CrawlerRouter(allow_scrapling=self.scrapling_enabled)
 
-        self.queue: asyncio.Queue[FrontierClaim] = asyncio.Queue()
+        self.queue: asyncio.Queue[FrontierClaim] = asyncio.Queue(maxsize=self.concurrency)
         self._stop_event = asyncio.Event()
         self._pages_crawled = 0
         self._pages_failed = 0

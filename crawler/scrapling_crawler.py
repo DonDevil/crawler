@@ -63,7 +63,7 @@ class ScraplingCrawler:
         self.use_stealth = use_stealth
         self.network_idle = network_idle
 
-        self.queue: asyncio.Queue[FrontierClaim] = asyncio.Queue()
+        self.queue: asyncio.Queue[FrontierClaim] = asyncio.Queue(maxsize=self.concurrency)
         self._stop_event = asyncio.Event()
         self._pages_crawled = 0
         self._pages_failed = 0

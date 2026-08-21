@@ -60,7 +60,7 @@ class PlaywrightCrawler:
 		self.media_database = AsyncMediaEvidence(media_database) if media_database is not None else None
 		self._manifest_parser = StreamingManifestParser()
 
-		self.queue: asyncio.Queue[FrontierClaim] = asyncio.Queue()
+		self.queue: asyncio.Queue[FrontierClaim] = asyncio.Queue(maxsize=self.concurrency)
 		self._stop_event = asyncio.Event()
 		self._pages_crawled = 0
 		self._pages_failed = 0

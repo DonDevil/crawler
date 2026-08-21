@@ -60,7 +60,7 @@ class AsyncCrawler:
         self._manifest_parser = StreamingManifestParser()
         self.tor_proxy = tor_proxy or get_default_tor_proxy()
 
-        self.queue: asyncio.Queue[FrontierClaim] = asyncio.Queue()
+        self.queue: asyncio.Queue[FrontierClaim] = asyncio.Queue(maxsize=self.concurrency)
         self._stop_event = asyncio.Event()
         self._pages_crawled = 0
         self._pages_failed = 0
