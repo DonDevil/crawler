@@ -71,6 +71,18 @@ def main() -> None:
         help="Override config.yaml's crawler.media_evidence.type for this run.",
     )
     parser.add_argument(
+        "--target-id",
+        help="Scope this crawl run's fingerprint jobs to an already-registered fingerprinter "
+        "target (see the sibling fingerprinter repo's scripts/register_target.py). Must be "
+        "given together with --target-version; the crawler validates the target is actually "
+        "registered before crawling starts and fails clearly if it is not. "
+        "See docs/architecture/phase-3-target-registration-and-scoping.md.",
+    )
+    parser.add_argument(
+        "--target-version",
+        help="The registered target's version, required together with --target-id.",
+    )
+    parser.add_argument(
         "--claim-fingerprint-job",
         action="store_true",
         help="Claim the next queued fingerprint job for the future fingerprinter service "
@@ -202,6 +214,8 @@ def main() -> None:
         query_scope="surface-web" if args.surface_web else "dark-web" if args.dark_web else None,
         crawl_engine=args.crawler_engine,
         ignore_blacklist=args.ignore_blacklist,
+        target_id=args.target_id,
+        target_version=args.target_version,
     )
 
     if args.clear_db:

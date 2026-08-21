@@ -13,6 +13,7 @@ from core.frontier import Frontier, FrontierClaim, FrontierUnavailable
 from core.frontier_executor import AsyncFrontier
 from core.media_evidence_executor import AsyncMediaEvidence
 from core.url_frontier import URLFrontier
+from storage.media_evidence_store import MediaEvidenceUnavailable
 from storage.url_database import URLDatabase
 from utils.url_utils import URLUtils
 
@@ -192,6 +193,8 @@ class SeleniumCrawler:
 								mime_type=media.get("mime_type"),
 								priority=max(0, URLUtils.get_link_priority(url, media["url"]) - 2),
 							)
+						except MediaEvidenceUnavailable as exc:
+							logger.warning(f"Media evidence store unavailable, dropping candidate {media['url']}: {exc}")
 						except Exception as exc:
 							logger.debug(f"Skipping media evidence capture for {url}: {exc}")
 					for link in links:

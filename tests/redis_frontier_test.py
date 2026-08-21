@@ -16,6 +16,7 @@ import redis
 
 from core.redis_frontier import RedisURLFrontier
 from storage.url_database import URLDatabase
+from utils.url_utils import URLUtils
 
 
 @pytest.fixture
@@ -711,6 +712,68 @@ class TestMarkDeferred:
 
         assert redis_frontier.redis_conn.zscore(redis_frontier._key("inflight"), url) is None
         assert redis_frontier.redis_conn.hget(redis_frontier._key("claim", url), "token") is None
+
+
+class TestBlacklistSemantics:
+    """Blacklist correctness through the frontier -- see moviesdatamil.co incident.
+
+    Auto-blacklisting must still stop unwanted infrastructure (requirement 4)
+    while never taking down a legitimate piracy/target domain that happens to
+    share a registered domain with an ad/tracker subdomain discovered on the
+    same site (requirement 5).
+    """
+
+    def test_blacklisted_infra_domain_is_skipped_by_get_next_url(
+        self, redis_frontier: RedisURLFrontier, tmp_path
+    ):
+        blacklist_path = tmp_path / "domain_blacklist.txt"
+        blacklist_path.write_text("", encoding="utf-8")
+
+        original_path = URLUtils._blacklist_path
+        original_enabled = URLUtils._blacklist_enabled
+
+        try:
+            URLUtils.set_blacklist_path(str(blacklist_path))
+            URLUtils.set_blacklist_enabled(True)
+
+            redis_frontier.add_url("https://ad-infra.example/pixel")
+
+            # Domain becomes blacklisted only after it was already queued --
+            # get_next_url() must still catch and skip it.
+            blacklist_path.write_text("ad-infra.example\n", encoding="utf-8")
+
+            assert redis_frontier.get_next_url() is None
+        finally:
+            URLUtils.set_blacklist_path(str(original_path))
+            URLUtils.set_blacklist_enabled(original_enabled)
+
+    def test_piracy_domain_url_remains_crawlable_despite_self_hosted_tracker_subdomain(
+        self, redis_frontier: RedisURLFrontier, tmp_path
+    ):
+        blacklist_path = tmp_path / "domain_blacklist.txt"
+        blacklist_path.write_text("", encoding="utf-8")
+
+        original_path = URLUtils._blacklist_path
+        original_enabled = URLUtils._blacklist_enabled
+
+        try:
+            URLUtils.set_blacklist_path(str(blacklist_path))
+            URLUtils.set_blacklist_enabled(True)
+
+            # The site's own ad/redirect subdomain is legitimately auto-blacklisted...
+            assert URLUtils.is_blacklisted("https://click.piracy-target.example/out") is True
+
+            # ...but the real content page on the same registered domain must
+            # remain reachable end-to-end through the frontier.
+            content_url = "https://piracy-target.example/movie/full-download"
+            assert redis_frontier.add_url(content_url) is True
+
+            claim = redis_frontier.get_next_url()
+            assert claim is not None
+            assert claim.url == content_url
+        finally:
+            URLUtils.set_blacklist_path(str(original_path))
+            URLUtils.set_blacklist_enabled(original_enabled)
 
 
 if __name__ == "__main__":

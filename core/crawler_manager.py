@@ -12,6 +12,7 @@ from core.config import Config, load_config
 from core.frontier import FrontierUnavailable
 from core.frontier_executor import AsyncFrontier
 from core.network_health import HealthController, NetworkHealthConfig
+from core.target_scope import TargetNotRegisteredError, TargetScopeError, resolve_target_scope, verify_target_registered
 from core.url_frontier import URLFrontier
 from core.redis_frontier import RedisURLFrontier
 from crawler.async_crawler import AsyncCrawler
@@ -66,11 +67,22 @@ def build_media_evidence_store(config: Config) -> Optional[MediaEvidenceStore]:
     backend (docs/architecture/media-evidence-step1.md, "Backend
     selection"). If `media_evidence.type` is "redis" and Redis is
     unreachable, this raises and the caller's construction fails.
+
+    Also resolves and validates this run's target scope (docs/architecture/
+    phase-3-target-registration-and-scoping.md) -- raises `TargetScopeError`
+    for a malformed scope (exactly one of target_id/target_version set, or
+    a scope configured against the SQLite backend, which has no
+    fingerprinter TargetRegistry to validate against) and
+    `TargetNotRegisteredError` for a well-formed scope that names a target
+    nothing has registered. Both are startup failures, deliberately not
+    caught here or by any caller -- see that module's docstring.
     """
     if not config.crawler.storage.enable_media_evidence:
         return None
 
     media_evidence_config = config.crawler.media_evidence
+    target_scope = resolve_target_scope(media_evidence_config.target_id, media_evidence_config.target_version)
+
     if media_evidence_config.type.lower() == "redis":
         store: MediaEvidenceStore = RedisMediaEvidenceStore(
             redis_host=media_evidence_config.redis_host,
@@ -85,13 +97,32 @@ def build_media_evidence_store(config: Config) -> Optional[MediaEvidenceStore]:
             max_backoff=media_evidence_config.max_backoff,
             reclaim_batch_size=media_evidence_config.reclaim_batch_size,
             confirmed_match_stream_maxlen=media_evidence_config.confirmed_match_stream_maxlen,
+            target_scope=target_scope,
         )
         logger.info(
             f"Using Redis media evidence store at {media_evidence_config.redis_host}:"
             f"{media_evidence_config.redis_port}/{media_evidence_config.redis_db} "
             f"ns={media_evidence_config.redis_namespace}"
         )
+        if target_scope is not None:
+            if not verify_target_registered(store.redis_conn, target_scope):
+                store.close()
+                raise TargetNotRegisteredError(
+                    f"Target {target_scope.target_id!r} version {target_scope.target_version!r} is not "
+                    "registered in the fingerprinter's TargetRegistry. Register it first (see the sibling "
+                    "fingerprinter repo's scripts/register_target.py) before scoping a crawler run to it."
+                )
+            logger.info(
+                f"Crawler run scoped to fingerprinter target {target_scope.target_id!r} "
+                f"version {target_scope.target_version!r}"
+            )
         return store
+
+    if target_scope is not None:
+        raise TargetScopeError(
+            "target_id/target_version scoping requires the Redis media evidence backend -- the "
+            f"fingerprinter's TargetRegistry only exists in Redis; got media_evidence.type={media_evidence_config.type!r}"
+        )
 
     store = SQLiteMediaEvidenceStore(
         path=config.crawler.storage.media_sqlite_path,
@@ -99,6 +130,7 @@ def build_media_evidence_store(config: Config) -> Optional[MediaEvidenceStore]:
         max_retries=media_evidence_config.max_retries,
         base_backoff=media_evidence_config.base_backoff,
         max_backoff=media_evidence_config.max_backoff,
+        target_scope=target_scope,
     )
     logger.info(f"Using SQLite media evidence store at {config.crawler.storage.media_sqlite_path}")
     return store
@@ -117,10 +149,23 @@ class CrawlerManager:
         query_scope: str | None = None,
         crawl_engine: str | None = None,
         ignore_blacklist: bool = False,
+        target_id: str | None = None,
+        target_version: str | None = None,
     ):
         self.config = config or load_config()
         configure_logging("INFO")
         URLUtils.set_blacklist_enabled(not ignore_blacklist)
+
+        # CLI-level target scope override (docs/architecture/
+        # phase-3-target-registration-and-scoping.md), applied before
+        # `build_media_evidence_store` resolves/validates it below --
+        # mirrors how `crawl_engine` overrides `config.crawler.engine`
+        # elsewhere in this constructor. `None` (the default) leaves
+        # whatever config.yaml already specifies untouched.
+        if target_id is not None:
+            self.config.crawler.media_evidence.target_id = target_id
+        if target_version is not None:
+            self.config.crawler.media_evidence.target_version = target_version
 
         self.url_database = URLDatabase(path=self.config.crawler.storage.sqlite_path)
         self.domain_database = DomainDatabase(path=self.config.crawler.storage.sqlite_path)

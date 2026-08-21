@@ -5,6 +5,8 @@ import re
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urldefrag, unquote, urlparse, urlunparse
 
+from loguru import logger
+
 try:
     import tldextract
     _TLD_EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=None)
@@ -320,14 +322,37 @@ class URLUtils:
         cls._reload_blacklist_if_needed()
 
     @classmethod
-    def add_to_blacklist(cls, url_or_domain: str) -> bool:
+    def add_to_blacklist(
+        cls,
+        url_or_domain: str,
+        *,
+        exact_host: bool = False,
+        reason: str = "unspecified",
+        source: str = "",
+    ) -> bool:
+        """Persist a domain to the auto-blacklist file.
+
+        By default the *registered* (eTLD+1) domain is blacklisted -- correct
+        for domains that are wholesale non-target infrastructure (known ad
+        networks, reference/social sites, adult content). Pass
+        exact_host=True to blacklist only the specific hostname that matched
+        (e.g. an ad/tracker subdomain such as "track.example.com") without
+        also condemning the rest of that registered domain. This matters
+        when the matched hostname is a subdomain of an otherwise-legitimate
+        crawl target (e.g. a piracy site that self-hosts a tracking/redirect
+        subdomain): blacklisting must not propagate up to the parent domain.
+        """
         if not cls._blacklist_enabled:
             return False
 
         cls._ensure_blacklist_file_exists()
         cls._reload_blacklist_if_needed()
 
-        domain = cls._extract_registered_domain(url_or_domain)
+        if exact_host:
+            domain = (cls.extract_domain(url_or_domain) or "").strip().strip(".") or None
+        else:
+            domain = cls._extract_registered_domain(url_or_domain)
+
         if not domain or domain in cls._blacklist_domains:
             return False
 
@@ -339,6 +364,14 @@ class URLUtils:
 
         cls._blacklist_mtime_ns = None
         cls._reload_blacklist_if_needed()
+        logger.info(
+            "Auto-blacklist decision: domain={} reason={} scope={} source={} url={}",
+            domain,
+            reason,
+            "exact-host" if exact_host else "registered-domain",
+            source or "add_to_blacklist",
+            url_or_domain,
+        )
         return True
 
     @classmethod
@@ -357,21 +390,44 @@ class URLUtils:
         return any(hint in haystack for hint in ADULT_SUBSTRING_HINTS)
 
     @classmethod
-    def should_auto_blacklist(cls, url: str) -> bool:
+    def classify_auto_blacklist(cls, url: str) -> tuple[bool, str]:
+        """Decide whether `url` should be auto-blacklisted, and why.
+
+        Reasons, in priority order:
+          - "adult_content": adult-content domain -- the whole registered
+            domain is unwanted.
+          - "known_non_target_domain": reference/social/ad-network domain
+            listed in AUTO_BLACKLIST_DEFAULTS or matched by
+            AUTO_BLACKLIST_HINTS -- the whole registered domain is unwanted.
+          - "ad_infra_hostname_pattern": the hostname itself looks like
+            ad/tracker/redirect infrastructure (AD_HOST_HINT_PATTERNS). This
+            only condemns the exact hostname that matched -- callers must
+            NOT escalate it to the registered domain, since piracy/target
+            sites commonly self-host tracking or redirect subdomains (e.g.
+            "track.example.com") on an otherwise-crawlable domain.
+        """
         hostname = cls.extract_domain(url) or ""
         registered = cls._extract_registered_domain(url) or hostname
         haystack = f"{hostname} {registered}".lower()
 
         if cls.is_adult_content_url(url):
-            return True
+            return True, "adult_content"
 
         if registered in AUTO_BLACKLIST_DEFAULTS or hostname in AUTO_BLACKLIST_DEFAULTS:
-            return True
+            return True, "known_non_target_domain"
 
-        if cls.is_probable_ad_domain(url):
-            return True
+        if any(token in haystack for token in AUTO_BLACKLIST_HINTS):
+            return True, "known_non_target_domain"
 
-        return any(token in haystack for token in AUTO_BLACKLIST_HINTS)
+        if any(pattern.search(hostname) for pattern in AD_HOST_HINT_PATTERNS):
+            return True, "ad_infra_hostname_pattern"
+
+        return False, ""
+
+    @classmethod
+    def should_auto_blacklist(cls, url: str) -> bool:
+        should_blacklist, _reason = cls.classify_auto_blacklist(url)
+        return should_blacklist
 
     @classmethod
     def same_registered_domain(cls, left: str, right: str) -> bool:
@@ -518,8 +574,14 @@ class URLUtils:
             return False
 
         cls.ensure_blacklist_seeded()
-        if cls.should_auto_blacklist(url):
-            cls.add_to_blacklist(url)
+        should_blacklist, reason = cls.classify_auto_blacklist(url)
+        if should_blacklist:
+            cls.add_to_blacklist(
+                url,
+                exact_host=(reason == "ad_infra_hostname_pattern"),
+                reason=reason,
+                source="is_blacklisted",
+            )
 
         cls._reload_blacklist_if_needed()
         if not cls._blacklist_domains:
@@ -726,7 +788,7 @@ class URLUtils:
 
         if URLUtils.is_adult_content_url(url):
             if apply_blacklist and URLUtils._blacklist_enabled:
-                URLUtils.add_to_blacklist(url)
+                URLUtils.add_to_blacklist(url, reason="adult_content", source="clean_url")
             return None
 
         if apply_blacklist and URLUtils.is_blacklisted(url):

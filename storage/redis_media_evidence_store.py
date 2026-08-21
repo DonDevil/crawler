@@ -27,6 +27,7 @@ from typing import Optional, Sequence
 import redis
 from loguru import logger
 
+from core.target_scope import TargetScope
 from storage.media_evidence_store import (
     DEFAULT_FINGERPRINT_LEASE_TTL,
     DEFAULT_MAX_OBSERVATIONS_PER_ASSET,
@@ -95,6 +96,7 @@ class RedisMediaEvidenceStore:
         max_backoff: float = 300.0,
         reclaim_batch_size: int = 200,
         confirmed_match_stream_maxlen: int = 10000,
+        target_scope: Optional[TargetScope] = None,
     ):
         """Connect and register Lua scripts. Raises `redis.ConnectionError`
         if the server is unreachable -- callers (e.g. `CrawlerManager`) must
@@ -111,6 +113,11 @@ class RedisMediaEvidenceStore:
         self.max_backoff = max_backoff
         self.reclaim_batch_size = reclaim_batch_size
         self.confirmed_match_stream_maxlen = confirmed_match_stream_maxlen
+        # docs/architecture/phase-3-target-registration-and-scoping.md:
+        # which already-registered fingerprinter target this run's jobs are
+        # associated with, or `None` for an unscoped run (jobs get no
+        # target association, exactly this store's pre-Phase-3 behavior).
+        self.target_scope = target_scope
 
         self.redis_conn = redis.Redis(
             host=redis_host,
@@ -157,6 +164,8 @@ class RedisMediaEvidenceStore:
             local priority = tonumber(ARGV[11])
             local max_observations = tonumber(ARGV[12])
             local ns = ARGV[13]
+            local target_id = ARGV[14]
+            local target_version = ARGV[15]
 
             local time_result = redis.call('TIME')
             local now = tonumber(time_result[1]) + (tonumber(time_result[2]) / 1000000)
@@ -213,7 +222,9 @@ class RedisMediaEvidenceStore:
                     'error_class', '',
                     'last_error', '',
                     'created_at', tostring(now),
-                    'updated_at', tostring(now))
+                    'updated_at', tostring(now),
+                    'target_id', target_id,
+                    'target_version', target_version)
                 local seq = redis.call('INCR', ns .. ':jobs:seq')
                 local score = priority * %(scale)d + seq
                 redis.call('ZADD', ns .. ':jobs:queue', score, aid)
@@ -300,8 +311,11 @@ class RedisMediaEvidenceStore:
             local media_type = redis.call('HGET', asset_key, 'media_type') or ''
             local priority = redis.call('HGET', job_key, 'priority') or '0'
             local retry_count = redis.call('HGET', job_key, 'retry_count') or '0'
+            local target_id = redis.call('HGET', job_key, 'target_id') or ''
+            local target_version = redis.call('HGET', job_key, 'target_version') or ''
 
-            return {aid, canonical_url, media_type, priority, retry_count, tostring(now + lease_ttl)}
+            return {aid, canonical_url, media_type, priority, retry_count, tostring(now + lease_ttl),
+                    target_id, target_version}
             """
         )
 
@@ -558,6 +572,8 @@ class RedisMediaEvidenceStore:
                     int(priority),
                     self.max_observations_per_asset,
                     self.namespace,
+                    self.target_scope.target_id if self.target_scope else "",
+                    self.target_scope.target_version if self.target_scope else "",
                 ]
             )
         except redis.RedisError as e:
@@ -709,6 +725,8 @@ class RedisMediaEvidenceStore:
             "claimed_by": job_hash.get("claimed_by") or None,
             "created_at": _to_optional_float(job_hash.get("created_at")),
             "updated_at": _to_optional_float(job_hash.get("updated_at")),
+            "target_id": job_hash.get("target_id") or None,
+            "target_version": job_hash.get("target_version") or None,
         }
 
     def get_fingerprint_jobs(self, statuses: Optional[Sequence[str]] = None) -> list[dict]:
@@ -770,7 +788,7 @@ class RedisMediaEvidenceStore:
         if not result:
             return None
 
-        aid, canonical_url, media_type, priority, retry_count, lease_expires_at = result
+        aid, canonical_url, media_type, priority, retry_count, lease_expires_at, target_id, target_version = result
         return FingerprintJob(
             asset_id=aid,
             token=token,
@@ -779,6 +797,8 @@ class RedisMediaEvidenceStore:
             priority=int(priority),
             retry_count=int(retry_count),
             lease_expires_at=float(lease_expires_at),
+            target_id=target_id or None,
+            target_version=target_version or None,
         )
 
     def renew_job_lease(self, asset_id: str, token: str) -> bool:

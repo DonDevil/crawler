@@ -3,11 +3,13 @@
 import asyncio
 
 import pytest
+import redis
 from aiohttp import web
 
 from core.network_health import HealthController, NetworkHealthConfig, NetworkHealthState
 from core.url_frontier import URLFrontier
 from parsers.html_link_extractor import HTMLLinkExtractor
+from storage.redis_media_evidence_store import RedisMediaEvidenceStore
 
 _PROBE_ENDPOINTS = ("https://probe-a.example/check", "https://probe-b.example/check")
 
@@ -109,6 +111,75 @@ async def test_hybrid_crawler_processes_clearweb_pages():
         assert base_url in frontier.visited
     finally:
         await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_hybrid_crawler_discovers_media_and_submits_exactly_one_fingerprint_job():
+    """End-to-end proof of the crawler -> media evidence -> fingerprint job
+    path this phase audited (docs/architecture/
+    phase-2-crawler-fingerprint-job-trace.md): a page with one media link,
+    crawled through the real `HybridCrawler` worker loop and the real HTML
+    parser, must produce exactly one queued fingerprint job in a real
+    (test-namespaced) Redis media evidence store -- not a stub/mock of
+    `record_media_link`, and not the SQLite backend, which is not what
+    production is configured to use (config.yaml: media_evidence.type:
+    redis)."""
+    from crawler.hybrid_crawler import HybridCrawler
+
+    try:
+        store = RedisMediaEvidenceStore(
+            redis_host="localhost",
+            redis_port=6379,
+            redis_db=1,  # crawler test-isolation DB, never production DB 0
+            namespace="test_evidence_e2e",
+        )
+        store.clear()
+    except redis.ConnectionError:
+        pytest.skip("Redis not available on localhost:6379")
+
+    async def run_server():
+        app = web.Application()
+
+        async def handler_root(request):
+            return web.Response(
+                text='<html><body><a href="/movie.mp4">download</a></body></html>',
+                content_type="text/html",
+            )
+
+        app.router.add_get("/", handler_root)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = next(iter(site._server.sockets)).getsockname()[1]
+        return runner, f"http://127.0.0.1:{port}/"
+
+    runner, base_url = await run_server()
+    try:
+        frontier = URLFrontier(rate_limit=0)
+        frontier.add_url(base_url)
+
+        crawler = HybridCrawler(
+            frontier=frontier,
+            parser=HTMLLinkExtractor(),
+            concurrency=1,
+            max_pages=1,
+            timeout=5,
+            max_retries=1,
+            media_database=store,
+        )
+
+        await crawler.run()
+
+        jobs = store.get_fingerprint_jobs()
+        assert len(jobs) == 1
+        assets = store.list_media_assets()
+        assert len(assets) == 1
+        assert assets[0]["url"].endswith("/movie.mp4")
+    finally:
+        await runner.cleanup()
+        store.clear()
+        store.close()
 
 
 @pytest.mark.asyncio

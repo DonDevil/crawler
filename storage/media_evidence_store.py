@@ -109,6 +109,16 @@ class FingerprintJob:
     priority: int
     retry_count: int
     lease_expires_at: float
+    # Which fingerprinter TargetRegistry (target_id, target_version) this
+    # job's asset should eventually be checked against -- `None` for a
+    # crawler run with no target scope configured (docs/architecture/
+    # phase-3-target-registration-and-scoping.md). Fixed at job-creation
+    # time, like every other field this dataclass carries; never rewritten
+    # by rediscovery of the same asset under a different scope (mirrors the
+    # "one job per asset, for its whole lifetime" invariant the store
+    # already enforces for `priority`/`media_type`).
+    target_id: Optional[str] = None
+    target_version: Optional[str] = None
 
 
 @dataclass(frozen=True)

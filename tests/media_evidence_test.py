@@ -1,8 +1,42 @@
 """Tests for media evidence storage and fingerprint job queue preparation."""
 
+from core.target_scope import TargetScope
 from parsers.html_link_extractor import HTMLLinkExtractor
 from storage.media_evidence_store import JOB_QUEUED
 from storage.sqlite_media_evidence_store import SQLiteMediaEvidenceStore
+
+
+def test_target_scope_is_associated_with_new_jobs(tmp_path):
+    """SQLite-backend parity with RedisMediaEvidenceStore's identical
+    behavior (tests/redis_media_evidence_store_test.py::
+    TestTargetScopeAssociation) -- see docs/architecture/
+    phase-3-target-registration-and-scoping.md."""
+    store = SQLiteMediaEvidenceStore(
+        path=str(tmp_path / "media_evidence.db"),
+        target_scope=TargetScope(target_id="test-target", target_version="v1"),
+    )
+    try:
+        store.record_media_link(url="https://cdn.example/movie.mp4", media_type="video")
+        job = store.claim_next_fingerprint_job("worker-1")
+
+        assert job is not None
+        assert job.target_id == "test-target"
+        assert job.target_version == "v1"
+    finally:
+        store.close()
+
+
+def test_unscoped_store_creates_jobs_with_no_target_association(tmp_path):
+    store = SQLiteMediaEvidenceStore(path=str(tmp_path / "media_evidence.db"))
+    try:
+        store.record_media_link(url="https://cdn.example/movie.mp4", media_type="video")
+        job = store.claim_next_fingerprint_job("worker-1")
+
+        assert job is not None
+        assert job.target_id is None
+        assert job.target_version is None
+    finally:
+        store.close()
 
 
 def test_media_evidence_store_records_observations_and_fingerprint_jobs(tmp_path):

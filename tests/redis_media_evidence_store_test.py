@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 import redis
 
+from core.target_scope import TargetScope
 from storage.media_evidence_store import FingerprintResult, JOB_PERMANENT_FAILURE, JOB_QUEUED, JOB_RETRY_SCHEDULED
 from storage.redis_media_evidence_store import RedisMediaEvidenceStore
 
@@ -322,3 +323,87 @@ class TestStatusCounts:
         counts = evidence_store.get_status_counts()
         assert counts["completed"] == 1
         assert counts["claimed"] == 0
+
+
+@pytest.fixture
+def scoped_evidence_store() -> RedisMediaEvidenceStore:
+    """Same isolated test keyspace as `evidence_store`, but constructed with
+    an explicit target scope (docs/architecture/
+    phase-3-target-registration-and-scoping.md) -- covers what a
+    target-scoped crawler run does differently."""
+    try:
+        store = RedisMediaEvidenceStore(
+            redis_host="localhost",
+            redis_port=6379,
+            redis_db=1,
+            namespace="test_evidence",
+            fingerprint_lease_ttl=5.0,
+            max_retries=2,
+            base_backoff=0.0,
+            max_backoff=0.0,
+            target_scope=TargetScope(target_id="test-target", target_version="v1"),
+        )
+        store.clear()
+        yield store
+        store.clear()
+        store.close()
+    except redis.ConnectionError:
+        pytest.skip("Redis not available on localhost:6379")
+
+
+class TestTargetScopeAssociation:
+    """Covers Phase 3's requirement that "target identity survives through
+    the relevant crawler/evidence path that the future bridge will
+    consume" -- via `claim_next_fingerprint_job`, the one place a future
+    bridge would actually read it from."""
+
+    def test_scoped_run_associates_target_with_new_jobs(self, scoped_evidence_store: RedisMediaEvidenceStore):
+        scoped_evidence_store.record_media_link(url="https://cdn.example/movie.mp4", media_type="video")
+
+        job = scoped_evidence_store.claim_next_fingerprint_job("worker-1")
+
+        assert job is not None
+        assert job.target_id == "test-target"
+        assert job.target_version == "v1"
+
+    def test_target_association_appears_in_job_introspection(self, scoped_evidence_store: RedisMediaEvidenceStore):
+        scoped_evidence_store.record_media_link(url="https://cdn.example/movie.mp4", media_type="video")
+
+        jobs = scoped_evidence_store.get_fingerprint_jobs()
+
+        assert len(jobs) == 1
+        assert jobs[0]["target_id"] == "test-target"
+        assert jobs[0]["target_version"] == "v1"
+
+    def test_unscoped_run_creates_jobs_with_no_target_association(self, evidence_store: RedisMediaEvidenceStore):
+        """Existing (pre-Phase-3) behavior is unchanged when no target
+        scope is configured -- no implicit/default target is ever
+        substituted (brief: "Do not create an implicit default target")."""
+        evidence_store.record_media_link(url="https://cdn.example/movie.mp4", media_type="video")
+
+        job = evidence_store.claim_next_fingerprint_job("worker-1")
+
+        assert job is not None
+        assert job.target_id is None
+        assert job.target_version is None
+
+    def test_target_is_never_inferred_from_discovery_metadata(self, scoped_evidence_store: RedisMediaEvidenceStore):
+        """A job's target association comes only from the store's own
+        configured scope, never from the URL, source page, or discovery
+        method a candidate happens to carry -- discovery metadata that
+        looks like a movie title must not leak into target identity
+        (brief: "Do not infer target scope from search queries" /
+        "filenames or seed URLs")."""
+        scoped_evidence_store.record_media_link(
+            url="https://cdn.example/Blast.Full.Movie.Download.1080p.mp4",
+            source_page="https://example.com/search?q=Blast+full+movie+download",
+            discovered_by="search-query",
+            media_type="video",
+        )
+
+        job = scoped_evidence_store.claim_next_fingerprint_job("worker-1")
+
+        # Still the store's configured scope ("test-target"/"v1"), not
+        # anything derived from the URL/query text above.
+        assert job.target_id == "test-target"
+        assert job.target_version == "v1"

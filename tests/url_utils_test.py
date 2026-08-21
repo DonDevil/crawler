@@ -206,6 +206,85 @@ def test_repeated_is_blacklisted_calls_do_not_force_file_reload(tmp_path, monkey
         URLUtils.set_blacklist_enabled(original_enabled)
 
 
+def test_ad_tracking_hostname_pattern_is_still_auto_blacklisted(tmp_path):
+    """Requirement 1: legitimate ad/tracking infrastructure must still be
+    auto-blacklisted by hostname pattern, not just by the static defaults list."""
+    blacklist_path = tmp_path / "domain_blacklist.txt"
+    blacklist_path.write_text("", encoding="utf-8")
+
+    original_path = URLUtils._blacklist_path
+    original_enabled = URLUtils._blacklist_enabled
+
+    try:
+        URLUtils.set_blacklist_path(str(blacklist_path))
+        URLUtils.set_blacklist_enabled(True)
+
+        tracker_url = "https://ad-tracker-network.example/pixel.gif"
+
+        should_blacklist, reason = URLUtils.classify_auto_blacklist(tracker_url)
+        assert should_blacklist is True
+        assert reason == "ad_infra_hostname_pattern"
+
+        assert URLUtils.is_blacklisted(tracker_url) is True
+        assert "ad-tracker-network.example" in blacklist_path.read_text(encoding="utf-8")
+    finally:
+        URLUtils.set_blacklist_path(str(original_path))
+        URLUtils.set_blacklist_enabled(original_enabled)
+
+
+def test_piracy_target_domain_is_not_auto_blacklisted_for_being_piracy_content(tmp_path):
+    """Requirement 2: a domain must not be auto-blacklisted merely because it
+    looks like a piracy/media target (movie, watch, download, pirate, ...)."""
+    blacklist_path = tmp_path / "domain_blacklist.txt"
+    blacklist_path.write_text("", encoding="utf-8")
+
+    original_path = URLUtils._blacklist_path
+    original_enabled = URLUtils._blacklist_enabled
+
+    try:
+        URLUtils.set_blacklist_path(str(blacklist_path))
+        URLUtils.set_blacklist_enabled(True)
+
+        piracy_url = "https://best-movies-download.example/pirate/watch/full-movie"
+
+        assert URLUtils.should_auto_blacklist(piracy_url) is False
+        assert URLUtils.is_blacklisted(piracy_url) is False
+        assert "best-movies-download.example" not in blacklist_path.read_text(encoding="utf-8")
+    finally:
+        URLUtils.set_blacklist_path(str(original_path))
+        URLUtils.set_blacklist_enabled(original_enabled)
+
+
+def test_self_hosted_ad_redirect_subdomain_does_not_blacklist_piracy_root_domain(tmp_path):
+    """Requirement 3 / regression test for the moviesdatamil.co incident:
+    an ad/redirect subdomain discovered on a piracy site's own domain (e.g.
+    "click.<site>" used for outbound ad redirects) must be blacklisted by its
+    exact hostname only -- it must never propagate up to the registered
+    domain and take the whole (otherwise legitimate) target site down with it."""
+    blacklist_path = tmp_path / "domain_blacklist.txt"
+    blacklist_path.write_text("", encoding="utf-8")
+
+    original_path = URLUtils._blacklist_path
+    original_enabled = URLUtils._blacklist_enabled
+
+    try:
+        URLUtils.set_blacklist_path(str(blacklist_path))
+        URLUtils.set_blacklist_enabled(True)
+
+        tracker_url = "https://click.piracy-target.example/out?to=movie"
+        content_url = "https://piracy-target.example/movie/full-download"
+
+        assert URLUtils.is_blacklisted(tracker_url) is True
+        assert URLUtils.is_blacklisted(content_url) is False
+
+        lines = {line.strip() for line in blacklist_path.read_text(encoding="utf-8").splitlines()}
+        assert "click.piracy-target.example" in lines
+        assert "piracy-target.example" not in lines
+    finally:
+        URLUtils.set_blacklist_path(str(original_path))
+        URLUtils.set_blacklist_enabled(original_enabled)
+
+
 def test_actual_blacklist_file_modification_is_detected_and_reloaded(tmp_path):
     blacklist_path = tmp_path / "domain_blacklist.txt"
     blacklist_path.write_text("", encoding="utf-8")

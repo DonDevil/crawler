@@ -83,6 +83,17 @@ class MediaEvidenceConfig(BaseModel):
     reclaim_batch_size: int = 200
     confirmed_match_stream_maxlen: int = 10000
 
+    # Which already-registered fingerprinter TargetRegistry (target_id,
+    # target_version) this crawler run is protecting -- both must be set
+    # together, or both left unset (docs/architecture/
+    # phase-3-target-registration-and-scoping.md). `None`/`None` (the
+    # default) is a crawler run with no target scope: fingerprint jobs are
+    # still created exactly as before, with no target association --
+    # unchanged, pre-Phase-3 behavior. Never a default/fabricated value --
+    # see core/target_scope.py.
+    target_id: Optional[str] = None
+    target_version: Optional[str] = None
+
 
 class FrontierConfig(BaseModel):
     """Configuration for URL frontier backend.

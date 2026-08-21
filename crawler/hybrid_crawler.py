@@ -26,6 +26,7 @@ from crawler.playwright_crawler import PlaywrightCrawler
 from crawler.scrapling_crawler import ScraplingCrawler
 from crawler.selenium_crawler import SeleniumCrawler
 from crawler.tor_crawler import TorCrawler
+from storage.media_evidence_store import MediaEvidenceUnavailable
 from storage.url_database import URLDatabase
 from tor.proxy_config import get_default_tor_proxy
 from utils.request_headers import get_default_headers
@@ -393,6 +394,8 @@ class HybridCrawler:
                                 mime_type=media.get("mime_type"),
                                 priority=max(0, URLUtils.get_link_priority(url, media["url"]) - 2),
                             )
+                        except MediaEvidenceUnavailable as exc:
+                            logger.warning(f"Media evidence store unavailable, dropping candidate {media['url']}: {exc}")
                         except Exception as exc:
                             logger.debug(f"Skipping media evidence capture for {url}: {exc}")
 

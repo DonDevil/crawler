@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
 
+from core.target_scope import TargetScope
 from storage.async_database_writer import BatchedDatabaseWriter
 from storage.media_evidence_store import (
     DEFAULT_FINGERPRINT_LEASE_TTL,
@@ -62,6 +63,7 @@ class SQLiteMediaEvidenceStore:
         max_retries: int = DEFAULT_MAX_RETRIES,
         base_backoff: float = 5.0,
         max_backoff: float = 300.0,
+        target_scope: Optional[TargetScope] = None,
     ):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -78,6 +80,9 @@ class SQLiteMediaEvidenceStore:
         self._max_retries = max_retries
         self._base_backoff = base_backoff
         self._max_backoff = max_backoff
+        # docs/architecture/phase-3-target-registration-and-scoping.md --
+        # see RedisMediaEvidenceStore's identical attribute.
+        self.target_scope = target_scope
         # Guards asset/job creation and every job-state transition. Cheap
         # and sufficient for this backend's dev/test scope (§22 explicitly
         # scopes multi-process distributed-claim-safety testing to Redis
@@ -133,6 +138,8 @@ class SQLiteMediaEvidenceStore:
                 retry_eligible_at REAL,
                 created_at TIMESTAMP,
                 updated_at TIMESTAMP,
+                target_id TEXT,
+                target_version TEXT,
                 FOREIGN KEY(asset_id) REFERENCES media_assets(id) ON DELETE CASCADE
             )"""
         )
@@ -243,14 +250,17 @@ class SQLiteMediaEvidenceStore:
                 (asset_id, source_page, referrer_url, discovered_by, discovery_method, mime_type, content_length, now),
             )
 
+            target_id = self.target_scope.target_id if self.target_scope else None
+            target_version = self.target_scope.target_version if self.target_scope else None
             self._writer.execute(
                 """INSERT INTO fingerprint_jobs (
-                    asset_id, status, priority, retry_count, created_at, updated_at
-                ) VALUES (?, 'queued', ?, 0, ?, ?)
+                    asset_id, status, priority, retry_count, created_at, updated_at,
+                    target_id, target_version
+                ) VALUES (?, 'queued', ?, 0, ?, ?, ?, ?)
                 ON CONFLICT(asset_id) DO UPDATE SET
                     priority = MIN(fingerprint_jobs.priority, excluded.priority),
                     updated_at = excluded.updated_at""",
-                (asset_id, priority, now, now),
+                (asset_id, priority, now, now, target_id, target_version),
             )
 
         return str(asset_id)
@@ -344,7 +354,7 @@ class SQLiteMediaEvidenceStore:
         scope."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT asset_id, priority, retry_count FROM fingerprint_jobs "
+                "SELECT asset_id, priority, retry_count, target_id, target_version FROM fingerprint_jobs "
                 "WHERE status = ? ORDER BY priority ASC, updated_at ASC LIMIT 1",
                 (JOB_QUEUED,),
             ).fetchone()
@@ -375,6 +385,8 @@ class SQLiteMediaEvidenceStore:
                 priority=int(row["priority"]),
                 retry_count=int(row["retry_count"]),
                 lease_expires_at=lease_expires_at,
+                target_id=row["target_id"],
+                target_version=row["target_version"],
             )
 
     def _current_claim(self, aid: int) -> Optional[sqlite3.Row]:
