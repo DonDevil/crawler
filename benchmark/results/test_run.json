@@ -1,6 +1,6 @@
 {
   "metadata": {
-    "generated_at": "2026-08-26T02:51:06.249694+00:00",
+    "generated_at": "2026-08-26T18:43:48.361538+00:00",
     "backend": "redis",
     "redis": {
       "host": "localhost",
@@ -21,7 +21,7 @@
     ],
     "query_scope": null,
     "queries": [
-      "blast full movie download"
+      "Blast full movie download"
     ],
     "seed_files": [
       "seeds/piracy_sites.txt",
@@ -30,64 +30,64 @@
       "seeds/darkweb_seeds.txt"
     ],
     "crawl_mode": "seeds+query",
-    "max_pages": 10000,
-    "indefinite_run": false,
+    "max_pages": null,
+    "indefinite_run": true,
     "rate_limit": 0.3,
     "note": "backend reflects the frontier actually constructed for this run, which can differ from config.yaml's crawler.frontier.type if Redis was unreachable at startup and the crawler fell back to SQLite -- see core/crawler_manager.py."
   },
   "timing": {
-    "start": "2026-08-25T21:15:27.317655+00:00",
-    "end": "2026-08-26T02:51:06.249680+00:00",
-    "duration_seconds": 20138.932026975002,
+    "start": "2026-08-26T17:21:20.860497+00:00",
+    "end": "2026-08-26T18:43:48.361524+00:00",
+    "duration_seconds": 4947.501028832,
     "source": "process-wall-clock",
     "note": "Actual wall-clock start (immediately before manager.run()) and end (immediately after it returned) of this process -- not derived from URL timestamps."
   },
   "counts": {
-    "discovered_total": 60519,
-    "visited": 6761,
-    "queued": 43955,
+    "discovered_total": 9815,
+    "visited": 1065,
+    "queued": 7573,
     "inflight": 26,
     "retry_scheduled": 25,
-    "failed_permanent": 17,
-    "skipped": 9735,
+    "failed_permanent": 8,
+    "skipped": 1118,
     "percentages": {
-      "visited_pct": 11.171698144384408,
-      "failed_pct": 0.028090351790346833,
-      "skipped_pct": 16.08585733406038
+      "visited_pct": 10.850738665308201,
+      "failed_pct": 0.0815078960774325,
+      "skipped_pct": 11.390728476821192
     },
     "invariant_violation": null,
     "note": "'discovered_total'/'visited'/'failed_permanent'/'skipped' are lifetime-cumulative for this Redis namespace / SQLite db (every URL ever added/resolved, not just this run's -- see 'this_run' for run-scoped counts). 'queued'/'inflight'/'retry_scheduled' are current-state (right now), not cumulative. They are not comparable 1:1 and are never double-counted against each other."
   },
   "this_run": {
-    "discovered_unique": 60519,
-    "visited_unique": 6761,
-    "failed_permanent_unique": 17,
-    "skipped_unique": 9735,
-    "queued_current": 43955,
+    "discovered_unique": 9325,
+    "visited_unique": 1045,
+    "failed_permanent_unique": 8,
+    "skipped_unique": 1118,
+    "queued_current": 7573,
     "inflight_current": 26,
     "retry_scheduled_current": 25,
-    "attempted_unique": 16513,
-    "completion_pct": 27.285645830235133,
-    "success_rate_pct": 40.943499061345605,
+    "attempted_unique": 2171,
+    "completion_pct": 23.281501340482574,
+    "success_rate_pct": 48.13450023030861,
     "throughput": {
-      "discovered_unique_per_sec": 3.0050749423523597,
-      "visited_unique_per_sec": 0.33571790157213943
+      "discovered_unique_per_sec": 1.884789906188546,
+      "visited_unique_per_sec": 0.21121774283828745
     },
     "invariant_violation": null,
     "note": "Scoped to this run only: (end-of-run snapshot - start-of-run snapshot) per counter, not the backend's lifetime-cumulative state (see counts.note). attempted_unique/completion_pct/success_rate_pct are only populated when visited_unique + failed_permanent_unique + skipped_unique <= discovered_unique for this run's deltas -- see 'invariant_violation' otherwise."
   },
   "throughput": {
-    "discovered_per_sec": 3.0050749423523597,
-    "visited_per_sec": 0.33571790157213943,
-    "completed_per_sec": 0.8199541057034075,
-    "avg_completed_per_sec_per_worker": 0.0327981642281363,
+    "discovered_per_sec": 1.983829804744298,
+    "visited_per_sec": 0.21526018767729774,
+    "completed_per_sec": 0.44284983211357687,
+    "avg_completed_per_sec_per_worker": 0.017713993284543074,
     "note": null,
     "per_worker_note": "Simple average (completed/sec \u00f7 worker count); does not imply linear scaling across workers."
   },
   "failures": {
-    "successful_visits": 6761,
-    "permanently_failed": 17,
-    "skipped": 9735,
+    "successful_visits": 1065,
+    "permanently_failed": 8,
+    "skipped": 1118,
     "retry_scheduled_current": 25,
     "extraction_failures": null,
     "http_failures": null,
@@ -95,7 +95,7 @@
     "note": "The crawler records aggregate visited/failed/skipped outcomes only; it does not categorize failures by HTTP-status vs. fetch-exception vs. extraction-error, so those subcategory breakdowns are unavailable (reporting fabricated subcategories was ruled out)."
   },
   "resources": {
-    "sample_count": 2015,
+    "sample_count": 496,
     "sample_interval_seconds": 10.0,
     "process_cpu_percent_avg": null,
     "process_cpu_percent_peak": null,
@@ -104,16 +104,16 @@
     "note": "process_cpu_percent is instantaneous CPU utilization (%) sampled via psutil, not cumulative CPU time. Single crawler process (asyncio concurrency, not multiprocess) -- see metadata.worker_count for the number of concurrent async fetch tasks within it."
   },
   "redis": {
-    "sample_count": 2015,
+    "sample_count": 496,
     "sample_interval_seconds": 10.0,
-    "memory_start_mb": 2.1818695068359375,
-    "memory_end_mb": 27.52130889892578,
-    "memory_delta_mb": 25.339439392089844,
-    "memory_peak_sampled_mb": 28.766098022460938,
-    "connected_clients_avg": 9.206947890818858,
-    "connected_clients_peak": 10,
-    "cpu_sys_seconds_delta": 17.428687999999998,
-    "cpu_user_seconds_delta": 20.793512,
+    "memory_start_mb": 2.0537872314453125,
+    "memory_end_mb": 6.775886535644531,
+    "memory_delta_mb": 4.722099304199219,
+    "memory_peak_sampled_mb": 6.809516906738281,
+    "connected_clients_avg": 5.973790322580645,
+    "connected_clients_peak": 6,
+    "cpu_sys_seconds_delta": 3.487674,
+    "cpu_user_seconds_delta": 4.1534130000000005,
     "note": "memory_peak_sampled_mb is the highest 'used_memory' observed at our sampling interval (not Redis's own lifetime used_memory_peak counter -- see counts.redis_info in a same-run snapshot for that). cpu_sys_seconds_delta/cpu_user_seconds_delta are deltas of Redis INFO's cumulative CPU-TIME counters (seconds consumed), not a CPU percentage -- conflating the two previously mis-attributed a benchmark bottleneck (see docs/benchmarks.md, 'Resource measurements')."
   },
   "configuration": {
@@ -173,8 +173,8 @@
         "max_backoff": 300.0,
         "reclaim_batch_size": 200,
         "confirmed_match_stream_maxlen": 10000,
-        "target_id": null,
-        "target_version": null
+        "target_id": "blast",
+        "target_version": "v1"
       },
       "network_health": {
         "enabled": true,

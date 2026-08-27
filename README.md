@@ -119,6 +119,29 @@ python main.py --indefinite-run
 Every CLI flag, verified against the current `argparse` definition, with
 working examples: [`docs/installation.md`](docs/installation.md#running).
 
+### Forwarding evidence to the fingerprinter
+
+`python main.py` only populates `evidence:jobs:queue`. For the sibling
+`fingerprinter` project to actually claim and process those jobs, the
+crawler→fingerprinter bridge must also be running, as its own long-lived
+process (not started by `main.py`):
+
+```bash
+# Run continuously, forwarding evidence:jobs:queue onto the
+# fingerprinter's fingerprint:jobs:stream:{priority} contract
+python3 -m bridge.main
+
+# Process at most one job then exit (debugging/one-shot use)
+python3 -m bridge.main --once
+```
+
+See [`docs/architecture/phase-4-crawler-fingerprinter-bridge.md`](docs/architecture/phase-4-crawler-fingerprinter-bridge.md)
+for the full design. In short: this repo's crawler process, this bridge
+process, and the fingerprinter's own `python -m worker.main` are three
+independent processes that must all be running (against the same Redis
+instance/DB) for a job to go from discovered evidence to a completed
+fingerprint match.
+
 ## Testing
 
 ```bash
