@@ -145,9 +145,9 @@ class FingerprintJob:
 
 @dataclass(frozen=True)
 class FingerprintResult:
-    """Durable fingerprint evidence produced by the (not-yet-built)
-    fingerprinter (§9). Never carries large binary data -- embeddings,
-    frames, or media bytes belong outside Media Evidence entirely.
+    """Durable fingerprint evidence produced by the fingerprinter (§9).
+    Never carries large binary data -- embeddings, frames, or media bytes
+    belong outside Media Evidence entirely.
     """
 
     aggregate_decision: str
@@ -160,6 +160,16 @@ class FingerprintResult:
     worker_id: str = ""
     matched_title: Optional[str] = None
     processed_at: Optional[str] = None
+    # Verbatim JSON passthrough of the fingerprinter's own per-technique
+    # match evidence (matched_segment_count, coverage counts, similarity
+    # scores, temporal offset, ...) -- see `work_queue.results.Result.
+    # evidence` in the sibling fingerprinter repo. Additive/optional so
+    # every existing caller (CLI, tests) that never set it is unaffected;
+    # populated by the fingerprint-result consumer (bridge/
+    # fingerprint_result_consumer.py) so a reader of this store alone,
+    # with no access to the fingerprinter's own Redis namespace, still has
+    # the full matching evidence for a confirmed match.
+    evidence: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.aggregate_decision not in AGGREGATE_DECISIONS:
@@ -320,6 +330,31 @@ class MediaEvidenceStore(Protocol):
         job identity (docs/architecture/phase-4-crawler-fingerprinter-
         bridge.md), recorded for correlation only. Returns `False` for a
         stale/unknown claim -- the caller must not treat this as success."""
+        ...
+
+    def complete_forwarded_fingerprint_job(
+        self, asset_id: str, *, fingerprint_job_id: str, result: FingerprintResult
+    ) -> bool:
+        """Record the fingerprinter's terminal verdict for a job this store
+        previously marked `forwarded` (bridge/fingerprint_result_consumer.py).
+
+        Distinct from `complete_fingerprint_job`: that method is gated by
+        the *original crawler-side claim token*, which `mark_fingerprint_
+        job_forwarded` deliberately deletes at hand-off time (ownership
+        moved to the fingerprinter) -- so no token can ever legitimately
+        exist to present here. This method is instead gated on the fact
+        `mark_fingerprint_job_forwarded` itself durably recorded: the job's
+        status must still be `forwarded`, and `fingerprint_job_id` must
+        match the one recorded at hand-off. That second check is the
+        integrity guarantee -- a result event correlated to the wrong
+        asset (a bug, or a stale/misrouted event) can never overwrite this
+        asset's evidence. That first check is what makes this idempotent:
+        once a result has been recorded, status is no longer `forwarded`,
+        so a redelivered/duplicate result event is a safe no-op.
+
+        Returns `False` (and writes nothing) if the job is not currently
+        `forwarded`, or is `forwarded` under a different `fingerprint_job_id`
+        -- the caller must not treat this as success."""
         ...
 
     def reclaim_expired_jobs(self, batch_size: int = 200) -> tuple[int, int]:

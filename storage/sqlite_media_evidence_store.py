@@ -158,6 +158,7 @@ class SQLiteMediaEvidenceStore:
                 worker_id TEXT,
                 matched_title TEXT,
                 processed_at TIMESTAMP,
+                evidence TEXT,
                 FOREIGN KEY(asset_id) REFERENCES media_assets(id) ON DELETE CASCADE
             )"""
         )
@@ -426,8 +427,9 @@ class SQLiteMediaEvidenceStore:
             self._writer.execute(
                 """INSERT INTO fingerprint_results (
                     asset_id, dinov2_similarity, phash_score, audio_score, temporal_verified,
-                    aggregate_decision, confidence, algorithm_versions, worker_id, matched_title, processed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    aggregate_decision, confidence, algorithm_versions, worker_id, matched_title,
+                    processed_at, evidence
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(asset_id) DO UPDATE SET
                     dinov2_similarity = excluded.dinov2_similarity,
                     phash_score = excluded.phash_score,
@@ -438,7 +440,8 @@ class SQLiteMediaEvidenceStore:
                     algorithm_versions = excluded.algorithm_versions,
                     worker_id = excluded.worker_id,
                     matched_title = excluded.matched_title,
-                    processed_at = excluded.processed_at""",
+                    processed_at = excluded.processed_at,
+                    evidence = excluded.evidence""",
                 (
                     aid,
                     result.dinov2_similarity,
@@ -451,6 +454,63 @@ class SQLiteMediaEvidenceStore:
                     result.worker_id,
                     truncate_metadata(result.matched_title),
                     result.processed_at or now,
+                    result.evidence,
+                ),
+            )
+            return True
+
+    def complete_forwarded_fingerprint_job(
+        self, asset_id: str, *, fingerprint_job_id: str, result: FingerprintResult
+    ) -> bool:
+        """SQLite-backend parity with `RedisMediaEvidenceStore`'s identical
+        method -- see `MediaEvidenceStore.complete_forwarded_fingerprint_job`'s
+        docstring for why this uses a different CAS (status=='forwarded' AND
+        fingerprint_job_id match) than `complete_fingerprint_job`'s claim
+        token."""
+        aid = int(asset_id)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status, fingerprint_job_id FROM fingerprint_jobs WHERE asset_id = ?", (aid,)
+            ).fetchone()
+            if row is None or row["status"] != JOB_FORWARDED or row["fingerprint_job_id"] != fingerprint_job_id:
+                return False
+
+            now = self._now()
+            self._writer.execute(
+                "UPDATE fingerprint_jobs SET status = ?, updated_at = ? WHERE asset_id = ?",
+                (JOB_COMPLETED, now, aid),
+            )
+            self._writer.execute(
+                """INSERT INTO fingerprint_results (
+                    asset_id, dinov2_similarity, phash_score, audio_score, temporal_verified,
+                    aggregate_decision, confidence, algorithm_versions, worker_id, matched_title,
+                    processed_at, evidence
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(asset_id) DO UPDATE SET
+                    dinov2_similarity = excluded.dinov2_similarity,
+                    phash_score = excluded.phash_score,
+                    audio_score = excluded.audio_score,
+                    temporal_verified = excluded.temporal_verified,
+                    aggregate_decision = excluded.aggregate_decision,
+                    confidence = excluded.confidence,
+                    algorithm_versions = excluded.algorithm_versions,
+                    worker_id = excluded.worker_id,
+                    matched_title = excluded.matched_title,
+                    processed_at = excluded.processed_at,
+                    evidence = excluded.evidence""",
+                (
+                    aid,
+                    result.dinov2_similarity,
+                    result.phash_score,
+                    result.audio_score,
+                    None if result.temporal_verified is None else int(result.temporal_verified),
+                    result.aggregate_decision,
+                    result.confidence,
+                    json.dumps(result.algorithm_versions) if result.algorithm_versions else None,
+                    result.worker_id,
+                    truncate_metadata(result.matched_title),
+                    result.processed_at or now,
+                    result.evidence,
                 ),
             )
             return True

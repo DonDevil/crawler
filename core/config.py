@@ -144,6 +144,31 @@ class BridgeConfig(BaseModel):
     reclaim_interval_seconds: float = 60.0
 
 
+class ResultConsumerConfig(BaseModel):
+    """Configuration for the fingerprint-result consumer -- the reverse-
+    direction half of the crawler<->fingerprinter bridge (bridge/
+    fingerprint_result_consumer.py): consumes `fingerprint:results:stream:
+    {priority}` and completes the corresponding crawler-side forwarded job
+    with the terminal verdict via `complete_forwarded_fingerprint_job`.
+
+    `priorities` defaults to `["default"]` because that's the only stream
+    the fingerprinter's own production `worker/main.py` currently consumes
+    from (it never passes a non-default `priority` to `Worker()`) --
+    consuming a priority stream no worker ever writes results onto would
+    just block forever on an empty read. Configurable, not hardcoded, so a
+    future fix to that (out of scope here) doesn't also require a crawler
+    code change.
+    """
+
+    consumer_group: str = "crawler-evidence-consumers"
+    priorities: List[str] = Field(default_factory=lambda: ["default"])
+    block_ms: int = 5000
+    lease_ms: int = 30_000
+    reclaim_batch_size: int = 10
+    reclaim_interval_seconds: float = 60.0
+    idle_sleep_seconds: float = 2.0
+
+
 class FrontierConfig(BaseModel):
     """Configuration for URL frontier backend.
 
@@ -328,6 +353,7 @@ class CrawlerConfig(BaseModel):
     media_evidence: MediaEvidenceConfig = MediaEvidenceConfig()
     network_health: NetworkHealthConfig = NetworkHealthConfig()
     bridge: BridgeConfig = BridgeConfig()
+    result_consumer: ResultConsumerConfig = ResultConsumerConfig()
 
 
 class Config(BaseModel):

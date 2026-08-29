@@ -562,16 +562,27 @@ and does not download or process media content.
 
 ## 21. Confirmed-match event boundary
 
-**IMPLEMENTED** (the emission side); **FUTURE** (the consumption side).
-When `complete_fingerprint_job` is called with
+**IMPLEMENTED** (the emission side, and — as of Phase 5 — the crawler-side
+completion side). Full record: [`phase-5-fingerprint-result-consumer.md`]
+(phase-5-fingerprint-result-consumer.md). When `complete_fingerprint_job`
+*or* the new `complete_forwarded_fingerprint_job` is called with
 `aggregate_decision="confirmed"`, an event is appended to the
 `{ns}:events:confirmed_match` Redis stream. `main.py`'s
-`--complete-fingerprint-job` path prints an explicit note that consuming
-this stream for domain-score feedback is a future consumer, not something
-this CLI does. No process in this repository reads that stream today
-beyond a small operational test helper
-(`RedisMediaEvidenceStore.read_confirmed_match_events`) that exists only
-to make the emission side verifiable.
+`--complete-fingerprint-job` path (the manual, claim-token-gated CLI path)
+still prints its own note that domain-score feedback is a separate,
+still-undecided future consumer of this stream — that remains true and
+unchanged. What changed in Phase 5: a *fingerprint result*, once the
+fingerprinter commits one for a job the Phase 4 bridge forwarded, now
+reaches this stream automatically, through `bridge/
+fingerprint_result_consumer.py` (a real Redis Streams consumer of the
+fingerprinter's own `fingerprint:results:stream:{priority}`) →
+`RedisMediaEvidenceStore.complete_forwarded_fingerprint_job` — not just
+through the manual CLI path. **FUTURE** still applies to one thing only:
+nothing in this repository reads `{ns}:events:confirmed_match` *onward*
+for domain-score feedback yet (§26's item on this remains open); the
+operational test helper (`read_confirmed_match_events`) is no longer the
+stream's only production-reachable writer path, but the stream still has
+no downstream consumer of its own.
 
 ## 22. Failure semantics
 

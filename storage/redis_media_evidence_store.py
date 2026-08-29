@@ -449,6 +449,62 @@ class RedisMediaEvidenceStore:
             """
         )
 
+        self._complete_forwarded_script = self.redis_conn.register_script(
+            """
+            -- complete_forwarded_fingerprint_job: same shape as
+            -- _complete_script (write the result hash, conditionally
+            -- emit+trim the confirmed_match stream), but the CAS gate is
+            -- job.status=='forwarded' AND job.fingerprint_job_id==the
+            -- given id, instead of a claim token -- the claim token (and
+            -- claim record) no longer exists once a job is forwarded, by
+            -- design (see _mark_forwarded_script). This is the only write
+            -- path a fingerprint-result consumer may use to complete a
+            -- forwarded job.
+            local aid = ARGV[1]
+            local fingerprint_job_id = ARGV[2]
+            local result_json = ARGV[3]
+            local confirmed_maxlen = ARGV[4]
+            local ns = ARGV[5]
+
+            local time_result = redis.call('TIME')
+            local now = tonumber(time_result[1]) + (tonumber(time_result[2]) / 1000000)
+
+            local job_key = ns .. ':job:' .. aid
+            local current_status = redis.call('HGET', job_key, 'status')
+            local current_fingerprint_job_id = redis.call('HGET', job_key, 'fingerprint_job_id')
+            if current_status ~= 'forwarded' or current_fingerprint_job_id ~= fingerprint_job_id then
+                return 'stale'
+            end
+
+            redis.call('HSET', job_key, 'status', 'completed', 'updated_at', tostring(now))
+            redis.call('INCR', ns .. ':jobs:completed_total')
+
+            local result = cjson.decode(result_json)
+            local args = {}
+            for k, v in pairs(result) do
+                table.insert(args, k)
+                table.insert(args, tostring(v))
+            end
+            table.insert(args, 'processed_at')
+            table.insert(args, tostring(now))
+            redis.call('HSET', ns .. ':result:' .. aid, unpack(args))
+
+            if result.aggregate_decision == 'confirmed' then
+                local source_domain = redis.call('HGET', ns .. ':asset:' .. aid, 'source_domain') or ''
+                local stream_key = ns .. ':events:confirmed_match'
+                redis.call('XADD', stream_key, '*',
+                    'asset_id', aid,
+                    'source_domain', source_domain,
+                    'matched_title', result.matched_title or '',
+                    'confidence', tostring(result.confidence or ''),
+                    'processed_at', tostring(now))
+                redis.call('XTRIM', stream_key, 'MAXLEN', '~', confirmed_maxlen)
+            end
+
+            return 'ok'
+            """
+        )
+
         self._mark_forwarded_script = self.redis_conn.register_script(
             """
             -- Phase 4 (docs/architecture/phase-4-crawler-fingerprinter-
@@ -872,6 +928,8 @@ class RedisMediaEvidenceStore:
         matched_title = truncate_metadata(result.matched_title)
         if matched_title:
             fields["matched_title"] = matched_title
+        if result.evidence:
+            fields["evidence"] = result.evidence
         return json.dumps(fields)
 
     def complete_fingerprint_job(self, asset_id: str, token: str, *, result: FingerprintResult) -> bool:
@@ -891,6 +949,32 @@ class RedisMediaEvidenceStore:
 
         if outcome == "stale":
             logger.debug(f"Stale fingerprint job completion ignored: {asset_id}")
+            return False
+        return True
+
+    def complete_forwarded_fingerprint_job(
+        self, asset_id: str, *, fingerprint_job_id: str, result: FingerprintResult
+    ) -> bool:
+        """Round trips: 1 (single Lua script -- CAS on job status=='forwarded'
+        AND fingerprint_job_id match, write the result hash, conditionally
+        emit+trim the confirmed_match stream). Complexity: O(1). See
+        `MediaEvidenceStore.complete_forwarded_fingerprint_job`'s docstring
+        for why this uses a different CAS than `complete_fingerprint_job`.
+        Returns `False` for a stale/unknown/mismatched job -- the caller
+        must not treat this as success (the job may already be completed,
+        may never have been forwarded, or `fingerprint_job_id` may not
+        match what this asset was actually forwarded as)."""
+        payload = self._encode_result_fields(result)
+        try:
+            outcome = self._complete_forwarded_script(
+                args=[asset_id, fingerprint_job_id, payload, self.confirmed_match_stream_maxlen, self.namespace]
+            )
+        except redis.RedisError as e:
+            logger.error(f"Redis error completing forwarded fingerprint job: {e}")
+            raise MediaEvidenceUnavailable(f"complete_forwarded_fingerprint_job({asset_id!r}): {e}") from e
+
+        if outcome == "stale":
+            logger.debug(f"Stale/duplicate/mismatched forwarded-job completion ignored: {asset_id}")
             return False
         return True
 

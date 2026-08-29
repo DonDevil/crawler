@@ -340,6 +340,134 @@ class TestMarkForwarded:
         ) is False
 
 
+class TestCompleteForwardedFingerprintJob:
+    """`complete_forwarded_fingerprint_job` -- the fingerprint-result
+    consumer's write path for a job's terminal verdict, gated on
+    status=='forwarded' AND a matching `fingerprint_job_id` instead of the
+    (by then deleted) original claim token."""
+
+    def _forward(self, evidence_store: RedisMediaEvidenceStore, url: str = "https://cdn.example/movie.mp4", **kwargs):
+        aid = evidence_store.record_media_link(url=url, media_type="video", **kwargs)
+        job = evidence_store.claim_next_fingerprint_job("worker-1")
+        assert job is not None
+        assert evidence_store.mark_fingerprint_job_forwarded(aid, job.token, fingerprint_job_id="fpjob-1") is True
+        return aid
+
+    def test_matching_fingerprint_job_id_completes_the_job(self, evidence_store: RedisMediaEvidenceStore):
+        aid = self._forward(evidence_store)
+
+        result = FingerprintResult(
+            aggregate_decision="confirmed", confidence=0.9366, matched_title="Blast",
+            evidence='[{"technique": "dinov2", "matched": true}]',
+        )
+        assert evidence_store.complete_forwarded_fingerprint_job(
+            aid, fingerprint_job_id="fpjob-1", result=result
+        ) is True
+
+        # `forwarded`/`completed` in get_status_counts() are lifetime totals
+        # (never decremented), same convention `completed_total` already
+        # uses -- the *current* state is `list_media_assets()`'s `status`.
+        counts = evidence_store.get_status_counts()
+        assert counts["forwarded"] == 1
+        assert counts["completed"] == 1
+
+        asset = evidence_store.list_media_assets()[0]
+        assert asset["status"] == "confirmed"
+        assert asset["match_confidence"] == pytest.approx(0.9366)
+        assert asset["matched_title"] == "Blast"
+
+        raw_result = evidence_store.redis_conn.hgetall(f"{evidence_store.namespace}:result:{aid}")
+        assert raw_result["evidence"] == '[{"technique": "dinov2", "matched": true}]'
+
+    def test_confirmed_result_emits_confirmed_match_event(self, evidence_store: RedisMediaEvidenceStore):
+        aid = self._forward(evidence_store, source_page="https://piracy.example/watch/1")
+
+        evidence_store.complete_forwarded_fingerprint_job(
+            aid, fingerprint_job_id="fpjob-1",
+            result=FingerprintResult(aggregate_decision="confirmed", confidence=0.9),
+        )
+
+        events = evidence_store.read_confirmed_match_events()
+        assert len(events) == 1
+        assert events[0]["asset_id"] == aid
+        assert events[0]["source_domain"] == "piracy.example"
+
+    def test_rejected_result_does_not_emit_confirmed_match_event(self, evidence_store: RedisMediaEvidenceStore):
+        aid = self._forward(evidence_store)
+
+        evidence_store.complete_forwarded_fingerprint_job(
+            aid, fingerprint_job_id="fpjob-1", result=FingerprintResult(aggregate_decision="rejected")
+        )
+
+        assert evidence_store.read_confirmed_match_events() == []
+        asset = evidence_store.list_media_assets()[0]
+        assert asset["status"] == "rejected"
+
+    def test_uncertain_result_is_recorded_without_confirmed_match_event(self, evidence_store: RedisMediaEvidenceStore):
+        aid = self._forward(evidence_store)
+
+        evidence_store.complete_forwarded_fingerprint_job(
+            aid, fingerprint_job_id="fpjob-1", result=FingerprintResult(aggregate_decision="uncertain")
+        )
+
+        assert evidence_store.read_confirmed_match_events() == []
+        asset = evidence_store.list_media_assets()[0]
+        assert asset["status"] == "uncertain"
+
+    def test_wrong_fingerprint_job_id_is_rejected_as_stale(self, evidence_store: RedisMediaEvidenceStore):
+        aid = self._forward(evidence_store)
+
+        assert evidence_store.complete_forwarded_fingerprint_job(
+            aid, fingerprint_job_id="not-the-forwarded-job-id",
+            result=FingerprintResult(aggregate_decision="confirmed"),
+        ) is False
+
+        counts = evidence_store.get_status_counts()
+        assert counts["forwarded"] == 1
+        assert counts["completed"] == 0
+        assert evidence_store.list_media_assets()[0]["status"] == "forwarded"
+
+    def test_duplicate_completion_is_a_safe_noop(self, evidence_store: RedisMediaEvidenceStore):
+        aid = self._forward(evidence_store)
+
+        first = evidence_store.complete_forwarded_fingerprint_job(
+            aid, fingerprint_job_id="fpjob-1", result=FingerprintResult(aggregate_decision="confirmed")
+        )
+        second = evidence_store.complete_forwarded_fingerprint_job(
+            aid, fingerprint_job_id="fpjob-1", result=FingerprintResult(aggregate_decision="confirmed")
+        )
+        assert first is True
+        assert second is False  # already completed -- redelivered event is a no-op
+
+        # exactly one confirmed_match event, not two
+        assert len(evidence_store.read_confirmed_match_events()) == 1
+
+    def test_never_forwarded_job_cannot_be_completed(self, evidence_store: RedisMediaEvidenceStore):
+        aid = evidence_store.record_media_link(url="https://cdn.example/never-forwarded.mp4", media_type="video")
+        # still 'queued' -- no claim, no forward
+
+        assert evidence_store.complete_forwarded_fingerprint_job(
+            aid, fingerprint_job_id="anything", result=FingerprintResult(aggregate_decision="confirmed")
+        ) is False
+
+    def test_unknown_asset_id_cannot_be_completed(self, evidence_store: RedisMediaEvidenceStore):
+        assert evidence_store.complete_forwarded_fingerprint_job(
+            "does-not-exist", fingerprint_job_id="anything", result=FingerprintResult(aggregate_decision="confirmed")
+        ) is False
+
+    def test_claim_token_cannot_be_used_to_complete_a_forwarded_job(self, evidence_store: RedisMediaEvidenceStore):
+        """`complete_fingerprint_job` (the original, claim-token-gated path)
+        must still fail for a forwarded job -- the claim record is deleted
+        at forward time, so no token can legitimately complete it anymore.
+        This is the invariant `complete_forwarded_fingerprint_job` exists
+        to restore access around, without touching the token CAS itself."""
+        aid = self._forward(evidence_store)
+
+        assert evidence_store.complete_fingerprint_job(
+            aid, "any-token-at-all", result=FingerprintResult(aggregate_decision="confirmed")
+        ) is False
+
+
 class TestConfirmedMatchEvent:
     def test_confirmed_decision_emits_event(self, evidence_store: RedisMediaEvidenceStore):
         aid = evidence_store.record_media_link(
