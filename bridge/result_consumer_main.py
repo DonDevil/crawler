@@ -80,6 +80,7 @@ def main() -> None:
             )
     finally:
         logger.info(f"result-consumer: shutdown metrics={consumer.metrics}")
+        consumer.close()
         store.close()
 
 

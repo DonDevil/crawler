@@ -461,7 +461,86 @@ Modified (additive only):
 default. The original claim-token CAS (`complete_fingerprint_job`) was
 **not modified** — zero lines changed in that method.
 
-## 17. Final phase status
+## 17. Addendum — blocking-read connection timeout bug (found and fixed same day)
+
+**Symptom** (reported after running `bridge.result_consumer_main` for real):
+the process ran normally for a while, then began repeatedly logging
+`result-consumer: infrastructure failure, backing off: Timeout reading
+from ...` and backing off, over and over.
+
+**Root cause.** `FingerprintResultConsumer` originally reused `store.
+redis_conn` (§4/§8's design: "the same Redis connection the crawler's own
+evidence store already opened") for its `XREADGROUP ... BLOCK
+{block_ms}` calls. `RedisMediaEvidenceStore.__init__`
+(`storage/redis_media_evidence_store.py`) constructs that connection with
+no explicit `socket_timeout` — fine for the store's own Lua-script round
+trips, which never block, but this environment's installed redis-py
+defaults an unset `socket_timeout` to **5 seconds**
+(`redis._defaults.DEFAULT_SOCKET_TIMEOUT`). The consumer's own
+`block_ms` also defaults to **5000** (`ResultConsumerConfig.block_ms`) —
+so on every single empty poll, the server-side wait (up to 5000ms) races
+the client's 5-second socket read timeout with essentially zero margin.
+Confirmed by direct reproduction against an isolated, empty Redis DB
+(three consecutive empty `process_one()` calls): instead of ~5s each, they
+took **25s, then 41s, then 59s** — redis-py was silently retrying the same
+timed-out blocking read with growing backoff before eventually succeeding
+very late, or (as reported) eventually exhausting that retry budget and
+raising `redis.exceptions.TimeoutError: Timeout reading from ...` up into
+the consumer's own infrastructure-failure handling.
+
+This was never exercised by Phase 4's own tests/validation because
+`CrawlerFingerprinterBridge` never issues a blocking Redis read at all —
+`FingerprintResultConsumer` was the first thing in this codebase to
+issue a genuinely long blocking command over `store.redis_conn`. The
+sibling fingerprinter repo's own `worker/main.py` avoids this same trap by
+explicitly setting `socket_timeout=10.0` (`REDIS_SOCKET_TIMEOUT_S`)
+against its own `block_ms=5000` default — a convention this consumer had
+not followed.
+
+**Fix.** `bridge/fingerprint_result_consumer.py` gained
+`_blocking_read_client(store, block_ms)`: a **second, dedicated** Redis
+connection (same host/port/db as `store.redis_conn` — confirmed the same
+physical instance, §7 of `phase-3-crawler-fingerprinter-bridge.md`), used
+for every raw stream/hash operation this class performs itself
+(`XREADGROUP`, `XAUTOCLAIM`, `HGETALL`, `EXISTS`, `XACK`), with
+`socket_timeout = max(block_ms / 1000 + 10, 15)` seconds — always
+comfortably above `block_ms`, regardless of configuration.
+`complete_forwarded_fingerprint_job` still goes through `self._store`
+(the store's own connection/Lua scripts) — that call was never the
+problem and is unaffected. `FingerprintResultConsumer.close()` (new) and
+`result_consumer_main.py`'s shutdown path release this second connection
+explicitly. Nothing in `storage/redis_media_evidence_store.py` was
+touched — the fix is entirely self-contained in the one module that had
+the bug, with zero risk to `CrawlerFingerprinterBridge`, `CrawlerManager`,
+or the CLI, none of which do blocking reads.
+
+An earlier fix attempt also passed `retry_on_timeout=True` (matching the
+fingerprinter's own convention); this installed redis-py version already
+retries `TimeoutError` by default and treats that flag as deprecated
+(`DeprecationWarning`), so it was dropped rather than carried along for
+no effect.
+
+**Verified.** Re-ran the exact reproduction against the same isolated,
+empty Redis DB: three consecutive empty polls now take **5.10s, 5.01s,
+5.02s** — matching `block_ms=5000` with no growth, no retries, no
+timeouts. A new regression test,
+`tests/fingerprint_result_consumer_test.py::
+TestBlockingReadTimeoutRegression::
+test_empty_stream_poll_completes_near_block_ms_not_growing`, asserts each
+empty poll completes well under `block_ms + 2s` — it fails loudly (by
+timing, not by a mock) if this connection is ever pointed back at `store.
+redis_conn` or its `socket_timeout` shrinks back toward `block_ms`. Full
+suite re-run clean: fingerprinter 435/435, crawler 418+/418+ (both
+unchanged from §12's earlier counts, since this fix only touches a module
+Phase 5 itself introduced — no other file changed).
+
+**Files changed by this addendum:** `bridge/fingerprint_result_consumer.py`
+(`_blocking_read_client`, `FingerprintResultConsumer.close()`),
+`bridge/result_consumer_main.py` (`consumer.close()` on shutdown),
+`tests/fingerprint_result_consumer_test.py` (+1 regression test). No
+Redis key, schema, or config default changed.
+
+## 18. Final phase status
 
 **Phase 5 is complete.** A real fingerprint result — committed by a real
 `Worker.commit_result` call, through the real atomic CAS script — now

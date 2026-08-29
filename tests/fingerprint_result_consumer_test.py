@@ -320,6 +320,37 @@ class TestCrashRecovery:
         assert pending["pending"] == 0
 
 
+class TestBlockingReadTimeoutRegression:
+    """Regression coverage for a real, observed bug: `store.redis_conn`
+    (storage/redis_media_evidence_store.py) is constructed with no explicit
+    `socket_timeout`, which this environment's installed redis-py defaults
+    to 5 seconds. A `block_ms=5000` XREADGROUP against an empty stream
+    legitimately takes close to that long server-side -- sharing that
+    connection for the blocking read races the client's 5s socket timeout
+    against the server's own BLOCK timeout with ~0 margin, and loses:
+    redis-py silently retries with growing backoff (observed: 25s, 41s,
+    59s for three consecutive empty polls) before eventually raising
+    `redis.exceptions.TimeoutError: Timeout reading from ...`. Fixed by
+    giving the consumer its own dedicated connection
+    (`_blocking_read_client`) with an adequately larger `socket_timeout`.
+    This test fails loudly (by taking far longer than the assertion
+    allows) if that fix is ever reverted or the connection is pointed back
+    at `store.redis_conn`."""
+
+    def test_empty_stream_poll_completes_near_block_ms_not_growing(self, evidence_store, conn, priority):
+        consumer = _consumer(evidence_store, priority, block_ms=2000)
+        for _ in range(3):
+            started = time.monotonic()
+            assert consumer.process_one() is False  # stream stays empty throughout
+            elapsed = time.monotonic() - started
+            assert elapsed < 4.0, (
+                f"empty poll took {elapsed:.2f}s for block_ms=2000 -- expected ~2s; "
+                "a value this much larger indicates the blocking-read connection's "
+                "socket_timeout is once again too close to (or below) block_ms"
+            )
+        consumer.close()
+
+
 class TestInfrastructureFailure:
     def test_infra_failure_does_not_ack(self, evidence_store, conn, priority):
         job_id = _unique_job_id()

@@ -119,6 +119,50 @@ def _to_fingerprint_result(resolved: ResolvedResult) -> FingerprintResult:
     )
 
 
+def _blocking_read_client(store: RedisMediaEvidenceStore, block_ms: int) -> redis.Redis:
+    """A dedicated Redis client for this consumer's long blocking reads
+    (XREADGROUP/XAUTOCLAIM) -- deliberately NOT `store.redis_conn`.
+
+    `RedisMediaEvidenceStore` constructs its connection with no explicit
+    `socket_timeout` (storage/redis_media_evidence_store.py), which this
+    environment's installed redis-py defaults to 5 seconds (`redis.
+    _defaults.DEFAULT_SOCKET_TIMEOUT`). That default is fine for the
+    store's own Lua-script round trips, which never block, but a `BLOCK
+    {block_ms}` read's server-side wait can itself legitimately take up to
+    `block_ms` -- with this consumer's own `block_ms=5000` default, that
+    races the client's 5s socket read timeout with essentially zero margin
+    on every single empty poll, and loses: redis-py's retry policy then
+    silently retries the same blocked read with growing backoff (observed
+    empirically: three consecutive empty polls took 25s, then 41s, then
+    59s instead of ~5s each) before either succeeding very late or
+    eventually raising `redis.exceptions.TimeoutError: Timeout reading
+    from ...` -- exactly the "runs for a bit, then infrastructure
+    error / timeout reading from socket" symptom this connection exists to
+    eliminate.
+
+    Same host/port/db/decoding as `store.redis_conn` (confirmed the same
+    physical Redis instance, docs/architecture/
+    phase-3-crawler-fingerprinter-bridge.md §7), but with a `socket_timeout`
+    generously larger than any `block_ms` this consumer will realistically
+    be configured with, so the client never gives up on a read the server
+    was always going to answer in time. This installed redis-py version
+    already retries `TimeoutError` by default (the older `retry_on_timeout`
+    constructor flag is deprecated precisely because of that -- passing it
+    only produces a `DeprecationWarning` here, no behavior change), so it
+    is deliberately not passed.
+    """
+    kwargs = store.redis_conn.connection_pool.connection_kwargs
+    return redis.Redis(
+        host=kwargs.get("host", "localhost"),
+        port=kwargs.get("port", 6379),
+        db=kwargs.get("db", 0),
+        decode_responses=kwargs.get("decode_responses", True),
+        socket_keepalive=True,
+        health_check_interval=30,
+        socket_timeout=max(block_ms / 1000.0 + 10.0, 15.0),
+    )
+
+
 class FingerprintResultConsumer:
     """One result-consumer worker. Single-threaded, bounded-work-per-
     iteration (`process_one()` claims and fully resolves the batch one
@@ -138,7 +182,12 @@ class FingerprintResultConsumer:
         reclaim_batch_size: int = 10,
     ):
         self._store = store
-        self._redis = store.redis_conn
+        # Deliberately a separate connection from `store.redis_conn` -- see
+        # `_blocking_read_client`'s docstring. `complete_forwarded_
+        # fingerprint_job` still goes through `self._store` (the store's
+        # own connection/Lua scripts, unaffected); every raw stream/hash
+        # operation this class does itself uses this one instead.
+        self._redis = _blocking_read_client(store, block_ms)
         self._consumer_name = consumer_name
         self._consumer_group = consumer_group
         self._streams = [results_stream_key(priority) for priority in priorities]
@@ -149,6 +198,12 @@ class FingerprintResultConsumer:
         self._stop = False
         for stream in self._streams:
             self._ensure_group(stream)
+
+    def close(self) -> None:
+        """Release this consumer's dedicated blocking-read connection.
+        Does not touch `store` -- the caller owns that connection's
+        lifecycle (its own `close()`)."""
+        self._redis.close()
 
     def _ensure_group(self, stream: str) -> None:
         try:
