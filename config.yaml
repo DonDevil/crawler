@@ -87,6 +87,33 @@ crawler:
     # stream trim length.
     reclaim_batch_size: 200
     confirmed_match_stream_maxlen: 10000
+  # Crawler -> fingerprinter bridge (bridge/main.py, see
+  # docs/architecture/phase-4-crawler-fingerprinter-bridge.md). Forwards
+  # evidence:jobs:queue entries onto the fingerprinter's own
+  # fingerprint:jobs:stream:{priority} contract.
+  bridge:
+    # priority_high_max/priority_low_min band crawler priority into the
+    # fingerprinter's high/default/low streams (docs/architecture/
+    # phase-4-crawler-fingerprinter-bridge.md, "Priority propagation").
+    # Pinned here so EVERY crawler priority falls into the middle
+    # (NORMAL/"default") band: the fingerprinter's production worker
+    # entrypoint (fingerprinter/worker/main.py) only ever consumes the
+    # "default" stream today -- see that doc's §20 "known limitations" and
+    # core/config.py::ResultConsumerConfig's docstring, which independently
+    # made the same assumption for the reverse (results) direction. Without
+    # this override, the code defaults (5/15) route any crawler priority
+    # >=15 into "low" and <=5 into "high", where nothing is running to
+    # consume them -- they queue until fingerprint:jobs:stream:{high,low}'s
+    # outstanding count (lag+pending) hits max_outstanding_jobs, at which
+    # point EVERY subsequent submission at that priority is permanently
+    # rejected as backpressure (observed 2026-09-02: fingerprint:jobs:
+    # stream:low silently filled to exactly 500 with zero consumers ever
+    # attached, wedging the bridge in a claim/reject/retry loop). Only
+    # revisit these two values once a worker process is actually deployed
+    # against the "high" and/or "low" streams (fingerprinter repo currently
+    # has no priority-selection flag for worker.main to do that either).
+    priority_high_max: -1
+    priority_low_min: 1000000
 search:
   enabled_engines:
     - "duckduckgo"

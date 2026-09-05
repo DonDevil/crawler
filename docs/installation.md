@@ -109,6 +109,126 @@ failure, not a silent fallback to SQLite** — don't expect the crawler to
 keep working locally if Redis goes down mid-run; that's deliberate, see
 [system-architecture.md §22](architecture/system-architecture.md#22-failure-semantics).
 
+### Multi-machine (distributed) crawling
+
+Running the crawler on more than one machine against one shared Redis
+instance is what `frontier.type: "redis"` / `media_evidence.type: "redis"`
+are for — every machine's crawler process claims URLs from, and writes
+evidence to, the same Redis, so no config change is needed to "enable"
+distributed mode beyond pointing every machine at the same Redis host.
+Two things trip people up:
+
+**1. `redis_host` is a client setting — never set it to `0.0.0.0`.**
+`0.0.0.0` is a bind wildcard (an instruction to a *server* to listen on
+every interface); it is not a routable address a client can connect to.
+On every machine running `main.py` (including the machine that also runs
+Redis itself), `config.yaml`'s `crawler.frontier.redis_host` and
+`crawler.media_evidence.redis_host` must be the Redis host's actual
+LAN IP (e.g. `192.168.29.226`), or `localhost`/`127.0.0.1` only on the
+machine that *is* the Redis host. Both `redis_host` fields, `redis_port`,
+`redis_db`, and `redis_namespace` must match across every machine, or they
+won't share the same frontier/evidence.
+
+**2. The Redis *server* itself must be told to accept non-loopback
+connections — this is separate from anything in `config.yaml`.** Stock
+`redis-server` (Debian/Ubuntu package) ships with `/etc/redis/redis.conf`
+set to `bind 127.0.0.1 -::1`, which refuses every connection that isn't
+from the same machine — this is almost always why a second machine gets
+"connection refused" even after `config.yaml` is pointed at the right IP.
+On the machine that runs Redis:
+
+```bash
+sudo nano /etc/redis/redis.conf
+# change:
+#   bind 127.0.0.1 -::1
+# to (bind only the LAN interface actually used, not 0.0.0.0/all-interfaces,
+# unless this host has no other network exposure to worry about):
+#   bind 127.0.0.1 -::1 192.168.29.226
+
+sudo systemctl restart redis-server
+```
+
+Then open the port to the other crawler machines only (not the world):
+
+```bash
+sudo ufw allow from 192.168.29.0/24 to any port 6379
+```
+
+From each *other* machine, confirm the server is actually reachable
+before starting the crawler:
+
+```bash
+redis-cli -h 192.168.29.226 ping
+# expect: PONG
+```
+
+**No Redis AUTH support today.** Neither `FrontierConfig`/
+`MediaEvidenceConfig` (`core/config.py`) nor the `redis.Redis(...)` calls
+in `core/redis_frontier.py` / `storage/redis_media_evidence_store.py` pass
+a password — there is no `requirepass` field to set on the client side.
+Treat network placement (a private LAN/VPN, `ufw` rules scoped to known
+crawler-machine IPs) as the only access control; don't expose port 6379
+to an untrusted network.
+
+**Verify a machine actually joined the shared frontier, not just that it
+started.** `RedisURLFrontier` construction failures are caught by
+`CrawlerManager` (`core/crawler_manager.py`) and silently downgrade that
+machine to a local, single-worker SQLite frontier — logged as a warning
+(`Redis frontier unavailable ... Falling back to SQLite`), not an error,
+and the crawl still runs, just disconnected from the rest of the fleet.
+Check for `Using Redis frontier at <host>:<port>/<db>` in that machine's
+logs (or the `backend` field in the run report) to confirm it's really
+distributed. `media_evidence` has no such fallback — if
+`media_evidence.type: "redis"` and Redis is unreachable, startup fails
+outright, which is the "connection refused" a misconfigured second
+machine will actually hit first in practice.
+
+**`bridge.main` / `bridge.result_consumer_main` run once for the whole
+fleet, not per crawler machine.** Both are standalone processes
+(`python3 -m bridge.main`, `python3 -m bridge.result_consumer_main`) that
+operate purely against the shared Redis media-evidence store — forwarding
+`evidence:jobs:queue` and consuming the fingerprinter's result stream via
+a Redis consumer group — not against any per-machine local state. Every
+crawler machine's `main.py` process already writes into the same shared
+queue, so one bridge instance and one result-consumer instance (pointed
+at that same Redis via their own `--config`) service every crawler
+machine at once. Run extra copies only for redundancy, not to "cover"
+additional crawler machines.
+
+**`bridge.main` stuck permanently retrying with
+`error_class=backpressure: outstanding=N >= max_outstanding_jobs=N`?**
+Check which fingerprinter priority stream is actually stuck before
+assuming the fingerprinter is just slow:
+
+```bash
+redis-cli XINFO GROUPS fingerprint:jobs:stream:high
+redis-cli XINFO GROUPS fingerprint:jobs:stream:default
+redis-cli XINFO GROUPS fingerprint:jobs:stream:low
+```
+
+If one of `high`/`low` shows `consumers: 0` and `lag`/`pending` stuck at a
+nonzero value while `default` is fine, the fingerprinter's production
+worker (`fingerprinter/worker/main.py`) is only consuming `default` — it
+has no way to select a different priority stream yet — while
+`crawler.bridge.priority_high_max`/`priority_low_min` in `config.yaml` are
+still routing some crawler priorities into `high`/`low`. With one
+fingerprinter process running (typical single-host setup), set both
+thresholds so every crawler priority collapses onto `default`:
+
+```yaml
+crawler:
+  bridge:
+    priority_high_max: -1
+    priority_low_min: 1000000
+```
+
+See [phase-4-crawler-fingerprinter-bridge.md §8](architecture/phase-4-crawler-fingerprinter-bridge.md#8-priority-propagation)
+for the full explanation and for what to widen these back to once a
+worker is actually deployed against the `high`/`low` streams. Jobs already
+stuck in a stream nobody consumes are not deleted by this config change —
+they stay queued until either a worker is pointed at that stream or they
+are otherwise cleared.
+
 ## Configuration
 
 `config.yaml` at the repository root, structure (defaults as shipped):
@@ -248,11 +368,45 @@ python main.py --unfinished
 python main.py --seed-file seeds/my_extra_list.txt
 ```
 
-**Clear stored SQLite crawl state before starting:**
+**Clear stored crawl state before starting:**
 
 ```bash
 python main.py --clear-db
 ```
+
+**Blast radius is bigger than "this run's own state" — read before using
+it alongside other crawlers, a bridge, or a fingerprinter.**
+`--clear-db` always clears `media_database` too
+(`CrawlerManager.clear_storage()`, `core/crawler_manager.py`), and
+`RedisMediaEvidenceStore.clear()` does this by deleting **every key
+matching `evidence:*`** in the configured Redis db/namespace
+(`storage/redis_media_evidence_store.py`'s `clear()`) — not scoped to this
+run's `--target-id`, not scoped to this machine. If `media_evidence.type:
+"redis"` and other crawler machines, a `bridge.main`, or a fingerprinter
+worker share that same Redis (the normal multi-machine setup described
+above), one `--clear-db` invocation wipes their `evidence:job:*`
+bookkeeping too.
+
+Concretely (observed 2026-09-02): a `--clear-db` run wiped the shared
+`evidence:*` namespace while ~500 fingerprint jobs forwarded days earlier
+were still sitting unprocessed in the fingerprinter's queue (itself a
+separate, unrelated bug — see [phase-4-crawler-fingerprinter-bridge.md
+§8](architecture/phase-4-crawler-fingerprinter-bridge.md#8-priority-propagation)).
+The fingerprint jobs themselves survived (they live in the fingerprinter's
+own Redis keys, untouched by `clear()`), but by the time they were finally
+processed, their `evidence:job:{asset_id}` record was gone — so the
+result consumer logged `cannot resolve crawler evidence for
+media_evidence_id=... -- no evidence:job record exists; this asset can
+never be resolved, not retrying` for every one of them and discarded the
+result. This is `bridge/fingerprint_result_consumer.py`'s correct,
+by-design handling of an unresolvable result (it acks and moves on, never
+retries or crashes) — but the underlying data loss is real and
+unrecoverable once it happens.
+
+**Only run `--clear-db` when no other crawler, `bridge.main`, or
+fingerprinter worker has in-flight work in that same Redis** — e.g. after
+stopping the fleet, or on a dedicated/isolated `redis_namespace` nothing
+else touches.
 
 **Ignore the domain blacklist** (`datasets/domain_blacklist.txt`) for one run:
 

@@ -185,6 +185,41 @@ never a silent flatten-to-one-priority. **TESTED**:
 crawler's default `10` and boundary values, asserting the job lands on the
 correct stream and no other).
 
+**Operational note (added 2026-09-02) — these two values only make sense
+if a fingerprinter worker is actually consuming the `high`/`low` streams
+they route into.** §20 already flagged that `worker/main.py` only consumes
+`default`; what wasn't spelled out is the failure mode when the defaults
+above are left in place anyway with a single `default`-only worker
+deployed: any crawler priority `>= 15` (or `<= 5`) silently piles up
+in `fingerprint:jobs:stream:{low,high}` — `XLEN`/`lag` growing with zero
+consumers ever attached — until that stream's outstanding count (`lag +
+pending`) reaches `max_outstanding_jobs`, at which point `submit_job()`
+permanently rejects *every* future submission at that priority as
+backpressure (`bridge: retryable failure ... error_class=backpressure:
+outstanding=500 >= max_outstanding_jobs=500`, forever, since nothing
+drains it). This is easy to misread as a fingerprinter-capacity problem
+when it's actually a misrouted-priority problem — check
+`redis-cli XINFO GROUPS fingerprint:jobs:stream:{high,default,low}` for a
+stream with `lag`/`pending` stuck at a nonzero value and `consumers: 0`
+before assuming the fingerprinter itself is falling behind.
+
+Deployments running exactly one fingerprinter worker (the `worker/main.py`
+process, which has no priority-selection flag — §20/§21 item 3, still
+unbuilt) should set `priority_high_max`/`priority_low_min` so **every**
+crawler priority collapses onto `NORMAL`/`default`, matching
+`ResultConsumerConfig.priorities`'s own `["default"]`-only default for the
+same reason:
+
+```yaml
+crawler:
+  bridge:
+    priority_high_max: -1        # nothing is <= -1: HIGH band is unreachable
+    priority_low_min: 1000000    # nothing realistic is >= this: LOW band is unreachable
+```
+
+Only widen these again once a worker process is actually deployed against
+`fingerprint:jobs:stream:high` and/or `:low`.
+
 ## 9. Duplicate semantics
 
 **At-least-once from the source queue's point of view, effectively-once

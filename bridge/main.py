@@ -20,6 +20,7 @@ from typing import Optional
 from loguru import logger
 
 from bridge.crawler_fingerprinter_bridge import BridgeRuntimeConfig, CrawlerFingerprinterBridge
+from bridge.redis_reset import clear_fingerprint_namespace
 from core.config import load_config
 from core.crawler_manager import build_media_evidence_store
 from storage.redis_media_evidence_store import RedisMediaEvidenceStore
@@ -48,6 +49,16 @@ def main() -> None:
         help="Process at most one evidence job then exit, instead of running forever. For "
         "testing/debugging/one-shot invocations.",
     )
+    parser.add_argument(
+        "--clear-db",
+        action="store_true",
+        help="Clear all evidence-job state (this store's 'evidence:*' keys) and fingerprinter "
+        "run state ('fingerprint:*' keys -- jobs/results/retries/matches/submission markers, "
+        "never registered targets) before starting, for a fresh run with no state carried over "
+        "from a previous one. Run once, by hand, before starting the bridge fleet -- never as "
+        "part of a supervised/auto-restart command line, since that would wipe in-flight jobs "
+        "on every crash-restart.",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -60,6 +71,11 @@ def main() -> None:
             f"any job the bridge can legally forward) only exists there. Got media_evidence.type="
             f"{config.crawler.media_evidence.type!r}."
         )
+
+    if args.clear_db:
+        store.clear()
+        fp_deleted = clear_fingerprint_namespace(store.redis_conn)
+        logger.info(f"bridge: --clear-db cleared evidence state and {fp_deleted} fingerprint key(s)")
 
     bridge = CrawlerFingerprinterBridge(
         store,
