@@ -369,3 +369,49 @@ class TestInfrastructureFailure:
         assert pending["pending"] == 1
         assert consumer.metrics.matches_recorded == 0
         assert consumer.metrics.stale_skipped == 0
+
+
+class TestRuntimeLimit:
+    """result_consumer_main.py's --runtime: a process-lifetime bound passed
+    through to run_forever(deadline=...) as a time.monotonic() timestamp --
+    never a per-result timeout (see run_forever's docstring)."""
+
+    def test_run_forever_stops_immediately_when_deadline_already_elapsed(self, evidence_store, conn, priority):
+        consumer = _consumer(evidence_store, priority)
+        try:
+            consumer.run_forever(deadline=time.monotonic() - 1.0)
+            assert consumer._stop is True
+        finally:
+            consumer.close()
+
+    def test_run_forever_keeps_running_until_its_own_deadline_elapses(self, evidence_store, conn, priority):
+        """With an empty stream and no stop() call, run_forever would block
+        on XREADGROUP forever (in block_ms chunks) without a deadline --
+        this proves the deadline alone ends it, and that it doesn't hang."""
+        consumer = _consumer(evidence_store, priority, block_ms=100)
+        try:
+            started = time.monotonic()
+            consumer.run_forever(deadline=started + 0.2, idle_sleep_seconds=0.01)
+            elapsed = time.monotonic() - started
+
+            assert elapsed < 5.0
+            assert consumer._stop is True
+        finally:
+            consumer.close()
+
+    def test_run_forever_completes_an_already_available_result_before_its_deadline(
+        self, evidence_store, conn, priority
+    ):
+        """A result already available when the deadline is still in the
+        future is still consumed and recorded -- --runtime bounds process
+        lifetime, it doesn't block work already within its window."""
+        job_id = _unique_job_id()
+        aid = _forward_a_job(evidence_store, "https://cdn.example/movie.mp4", job_id)
+        _write_result(conn, priority, job_id=job_id, media_evidence_id=aid, decision="match", confidence=0.9)
+
+        consumer = _consumer(evidence_store, priority)
+        try:
+            consumer.run_forever(deadline=time.monotonic() + 0.3, idle_sleep_seconds=0.01)
+            assert consumer.metrics.matches_recorded == 1
+        finally:
+            consumer.close()

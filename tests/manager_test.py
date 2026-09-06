@@ -1,5 +1,9 @@
 """Tests for crawler manager startup modes."""
 
+import asyncio
+
+import pytest
+from aiohttp import web
 from discovery.search_engine_discovery import DiscoveryBatchReport, QueryDiscoveryReport
 
 from core.config import Config, CrawlerConfig, SearchConfig, StorageConfig, load_config
@@ -255,3 +259,135 @@ def test_manager_can_ignore_blacklist(monkeypatch, tmp_path):
     finally:
         URLUtils.set_blacklist_path(str(original_path))
         URLUtils.set_blacklist_enabled(original_enabled)
+
+
+# ---------------------------------------------------------------------------
+# --runtime: wall-clock run-duration limit (core/crawler_manager.py's
+# set_runtime_limit()/_runtime_watchdog()). See main_cli_test.py for the
+# --max-pages/--indefinite-run/--runtime precedence tests -- these exercise
+# the actual graceful-shutdown behavior at the manager/crawl-engine level.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_runtime_watchdog_sets_stop_event_and_runtime_expired_flag(monkeypatch, tmp_path):
+    """Fast, deterministic unit test of the watchdog itself: no real sleep
+    (asyncio.sleep is replaced with a no-op), no real crawl -- proves the
+    watchdog's own contract (flip runtime_expired, set the crawl engine's
+    _stop_event) independent of any particular crawl engine or timing."""
+    seed_file = tmp_path / "seeds.txt"
+    seed_file.write_text("https://seed.example.com\n", encoding="utf-8")
+    sqlite_path = tmp_path / "crawl.db"
+
+    manager = CrawlerManager(config=_make_config(str(seed_file), str(sqlite_path)))
+
+    slept_for = []
+
+    async def _fake_sleep(seconds):
+        slept_for.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+    manager.set_runtime_limit(30 * 60)
+    assert manager.runtime_expired is False
+
+    await manager._runtime_watchdog()
+
+    assert slept_for == [30 * 60]
+    assert manager.runtime_expired is True
+    assert manager._crawler._stop_event.is_set()
+
+
+async def _run_infinite_ping_pong_server():
+    """Two pages that link to each other forever -- frontier exhaustion
+    never happens on its own, so a run against this server only stops via
+    an explicit limit (max-pages or --runtime), isolating the behavior
+    under test."""
+    app = web.Application()
+
+    async def handler_root(request):
+        return web.Response(
+            text="<html><body><a href='/page'>page</a></body></html>",
+            content_type="text/html",
+        )
+
+    async def handler_page(request):
+        return web.Response(
+            text="<html><body><a href='/'>root</a></body></html>",
+            content_type="text/html",
+        )
+
+    app.router.add_get("/", handler_root)
+    app.router.add_get("/page", handler_page)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+
+    port = next(iter(site._server.sockets)).getsockname()[1]
+    return runner, f"http://127.0.0.1:{port}/"
+
+
+@pytest.mark.asyncio
+async def test_runtime_limit_lets_crawl_run_past_a_tiny_default_max_pages(tmp_path):
+    """End-to-end proof of the feature's whole point: with a --runtime
+    limit active, the crawler must NOT stop at the (tiny, here) default
+    max_pages ceiling -- it keeps going, exactly like --indefinite-run,
+    until the runtime budget (a real, short sleep here -- not a fake clock,
+    since this exercises the actual asyncio.sleep-driven watchdog
+    end-to-end) elapses. Uses a real small delay (~1s) rather than
+    mocking time -- negligible for the test suite, and the whole point is
+    to prove the *actual* asyncio watchdog task races the *actual* crawl
+    engine correctly, which a fully mocked clock can't demonstrate."""
+    runner, base_url = await _run_infinite_ping_pong_server()
+    seed_file = tmp_path / "seeds.txt"
+    seed_file.write_text(f"{base_url}\n", encoding="utf-8")
+    sqlite_path = tmp_path / "crawl.db"
+
+    config = _make_config(str(seed_file), str(sqlite_path))
+    # The default rate_limit (1 req/s/domain) would only allow ~1 fetch
+    # within this test's short runtime window regardless of the page cap --
+    # unrelated to what this test is actually proving. Disabled here so
+    # "kept crawling past max_pages=1" isn't confounded by rate limiting.
+    config.crawler.rate_limit = 0.0
+
+    try:
+        manager = CrawlerManager(config=config)
+        # Mirrors main.py's --runtime precedence: an active runtime limit
+        # disables the default max_pages ceiling, same as --indefinite-run.
+        manager.set_max_pages(None)
+        manager.set_runtime_limit(1.0)
+
+        await manager.run()
+
+        assert manager.runtime_expired is True
+        # Proves the crawl did not stop at max_pages=1 -- it kept running
+        # (bounded only by the runtime budget) against the never-exhausting
+        # ping-pong frontier.
+        assert manager._crawler._pages_crawled > 1
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_without_runtime_limit_default_max_pages_still_stops_the_crawl(tmp_path):
+    """Control case: omitting --runtime must leave existing --max-pages
+    behavior completely unchanged (the crawl still stops at the default
+    ceiling from _make_config, no runtime_expired flag)."""
+    runner, base_url = await _run_infinite_ping_pong_server()
+    seed_file = tmp_path / "seeds.txt"
+    seed_file.write_text(f"{base_url}\n", encoding="utf-8")
+    sqlite_path = tmp_path / "crawl.db"
+
+    try:
+        manager = CrawlerManager(
+            config=_make_config(str(seed_file), str(sqlite_path)),  # max_pages=1
+        )
+
+        await manager.run()
+
+        assert manager.runtime_expired is False
+        assert manager._crawler._pages_crawled == 1
+    finally:
+        await runner.cleanup()

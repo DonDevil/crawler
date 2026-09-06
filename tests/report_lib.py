@@ -801,6 +801,8 @@ def render_human_report(report: dict) -> str:
     w(f"Crawl mode:     {fmt_val(md.get('crawl_mode'))}")
     w(f"Max pages:      {fmt_val(md.get('max_pages'))}")
     w(f"Indefinite run: {fmt_val(md.get('indefinite_run'))}")
+    w(f"Runtime limit:  {fmt_val(md.get('runtime_minutes'))} min")
+    w(f"Runtime expired:{fmt_val(md.get('runtime_expired'))}")
     w(f"Rate limit:     {fmt_val(md.get('rate_limit'))}")
     local_work = report.get("local_work")
     if local_work:

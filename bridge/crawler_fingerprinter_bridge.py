@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import redis
 from loguru import logger
@@ -319,9 +319,14 @@ class CrawlerFingerprinterBridge:
         except MediaEvidenceUnavailable as exc:
             logger.error(f"bridge: recovery sweep failed: {exc}")
 
-    def run_forever(self) -> None:
-        """Blocking loop; returns once `stop()` has been called and the
-        current iteration (if any) finishes. Infrastructure failures
+    def run_forever(self, deadline: Optional[float] = None) -> None:
+        """Blocking loop; returns once `stop()` has been called, the
+        current iteration (if any) finishes, or (if given) `deadline` --a
+        `time.monotonic()` timestamp, checked once per iteration exactly
+        like `_stop` -- has passed. `deadline` is a process-lifetime bound
+        (`bridge/main.py`'s `--runtime`), never a per-job timeout: a job
+        already claimed by `process_one()` still runs to completion before
+        the next deadline check. Infrastructure failures
         (`MediaEvidenceUnavailable`, raw `redis.RedisError`) are caught here
         -- one level above every job-specific failure path -- and treated as
         rule 14's separate "Redis infrastructure failure" class: logged,
@@ -329,6 +334,10 @@ class CrawlerFingerprinterBridge:
         `core.network_health.HealthController` (that system is about this
         process's own Internet reachability, an unrelated failure domain)."""
         while not self._stop:
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.info("bridge: runtime limit elapsed, shutting down gracefully")
+                self.stop()
+                break
             self._maybe_reclaim()
             try:
                 got_job = self.process_one()

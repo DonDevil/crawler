@@ -12,6 +12,7 @@ graceful shutdown, and restart recovery.
 """
 from __future__ import annotations
 
+import time
 import uuid
 
 import pytest
@@ -404,6 +405,51 @@ class TestGracefulShutdown:
         bridge = _bridge(store)
         bridge.stop()
         bridge.run_forever()  # already stopped -- must return immediately
+
+
+class TestRuntimeLimit:
+    """bridge/main.py's --runtime: a process-lifetime bound passed through
+    to run_forever(deadline=...) as a time.monotonic() timestamp -- never a
+    per-job timeout (see run_forever's docstring). Mirrors
+    TestGracefulShutdown's style: real (tiny) monotonic deadlines, no fake
+    clock needed since these are sub-second by construction."""
+
+    def test_run_forever_stops_immediately_when_deadline_already_elapsed(self, scoped_store):
+        store, _, _ = scoped_store
+        bridge = _bridge(store)
+
+        bridge.run_forever(deadline=time.monotonic() - 1.0)
+
+        assert bridge.metrics.jobs_claimed == 0
+        assert bridge._stop is True
+
+    def test_run_forever_keeps_running_until_its_own_deadline_elapses(self, scoped_store):
+        """With an empty queue and no stop() call, run_forever would loop
+        forever without a deadline -- this proves the deadline alone (not
+        `stop()`) is what ends it, and that it doesn't hang."""
+        store, _, _ = scoped_store
+        bridge = _bridge(store)
+
+        started = time.monotonic()
+        bridge.run_forever(deadline=started + 0.1)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 5.0
+        assert bridge._stop is True
+
+    def test_run_forever_processes_a_job_before_its_deadline_elapses(self, scoped_store):
+        """A job already available when the deadline is still in the
+        future is still claimed and forwarded -- --runtime is a
+        process-lifetime limit, not something that blocks work already
+        within its window."""
+        store, target_id, target_version = scoped_store
+        aid = store.record_media_link(url="https://cdn.example/movie.mp4", media_type="video")
+        bridge = _bridge(store)
+
+        bridge.run_forever(deadline=time.monotonic() + 0.3)
+
+        assert bridge.metrics.jobs_claimed >= 1
+        assert bridge.metrics.jobs_submitted >= 1
 
 
 class TestRestartRecovery:

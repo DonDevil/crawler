@@ -37,13 +37,32 @@ def main() -> None:
     parser.add_argument(
         "--max-pages",
         type=int,
-        help="Override max pages to crawl (default from config).",
+        help="Override max pages to crawl (default from config). Ignored (the cap is disabled) if "
+        "--indefinite-run is given; still respected as an additional stop condition alongside "
+        "--runtime's time limit if given explicitly together with --runtime.",
     )
     parser.add_argument(
         "--indefinite-run",
         dest="indefinite_run",
         action="store_true",
-        help="Disable the page cap and keep crawling until all reachable URLs are visited and no new links are found.",
+        help="Disable the page cap and keep crawling until all reachable URLs are visited and no new links are found. "
+        "Unconditionally overrides --max-pages (including an explicit value) -- see --runtime for a time-bounded variant.",
+    )
+    parser.add_argument(
+        "--runtime",
+        type=int,
+        default=-1,
+        metavar="MINUTES",
+        help="Wall-clock run-duration limit, in minutes. -1 (default) disables the limit -- this crawler "
+        "then behaves exactly as if --runtime were never passed. Any other value (0 or more) gives this "
+        "run --indefinite-run's page semantics (the *default* --max-pages ceiling from config.yaml is "
+        "disabled) but only for this many minutes: the crawler still stops early on frontier exhaustion, "
+        "and if an explicit --max-pages was ALSO given, that explicit value still applies as an "
+        "additional stop condition (whichever bound -- pages or time -- is hit first stops the run). "
+        "--indefinite-run together with --runtime has the same semantics as --runtime alone (indefinite-run "
+        "already disables --max-pages unconditionally). Expiry triggers the same graceful shutdown path as "
+        "Ctrl+C/SIGTERM/frontier-exhaustion/--max-pages -- never a hard kill -- and is reported distinctly "
+        "in the run report (see --output). This is a run-lifetime limit, NOT a per-page/per-request timeout.",
     )
     parser.add_argument(
         "--crawler-engine",
@@ -173,6 +192,11 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    if args.runtime < -1:
+        parser.error("--runtime must be -1 (disabled) or a whole number of minutes >= 0")
+    runtime_active = args.runtime != -1
+    runtime_seconds = float(args.runtime * 60) if runtime_active else None
+
     if args.claim_fingerprint_job or args.complete_asset_id is not None:
         config = load_config()
         if args.media_backend:
@@ -229,9 +253,21 @@ def main() -> None:
         manager.clear_storage()
 
     if args.indefinite_run:
+        # Existing, unconditional precedent: --indefinite-run disables the
+        # page cap even if an explicit --max-pages was also given.
         manager.set_max_pages(None)
+    elif runtime_active:
+        # --runtime gives this run --indefinite-run's page semantics (the
+        # *default* --max-pages ceiling is disabled) but preserves an
+        # explicitly-given --max-pages as an additional stop condition --
+        # see --runtime's help text. `args.max_pages` is None unless the
+        # user passed it explicitly, so this is `None` (cap disabled) in
+        # the common case and the explicit value otherwise.
+        manager.set_max_pages(args.max_pages)
     elif args.max_pages is not None:
         manager.set_max_pages(args.max_pages)
+
+    manager.set_runtime_limit(runtime_seconds)
 
     if args.debug:
         # This is a quick way to bump logging level.
@@ -327,6 +363,8 @@ def main() -> None:
         "crawl_mode": crawl_mode,
         "max_pages": max_pages_effective,
         "indefinite_run": bool(args.indefinite_run),
+        "runtime_minutes": args.runtime if runtime_active else None,
+        "runtime_expired": bool(getattr(manager, "runtime_expired", False)),
         "rate_limit": manager.config.crawler.rate_limit,
         "note": (
             "backend reflects the frontier actually constructed for this run, which can differ "

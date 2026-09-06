@@ -76,6 +76,8 @@ def _build_metadata_from_config(config, backend: str, namespace_override: str | 
         "crawl_mode": None,
         "max_pages": None,
         "indefinite_run": None,
+        "runtime_minutes": None,
+        "runtime_expired": None,
         "rate_limit": None,
         "config_defaults": {
             "concurrency": config.crawler.concurrency,

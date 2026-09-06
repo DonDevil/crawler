@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import signal
+import time
 from types import FrameType
 from typing import Optional
 
@@ -46,7 +47,22 @@ def main() -> None:
         help="Process at most one result batch then exit, instead of running forever. For "
         "testing/debugging/one-shot invocations.",
     )
+    parser.add_argument(
+        "--runtime",
+        type=int,
+        default=-1,
+        metavar="MINUTES",
+        help="Wall-clock process-lifetime limit, in minutes. -1 (default) disables the limit "
+        "(runs forever, as before). Otherwise, once this many minutes have elapsed the "
+        "consumer gracefully stops consuming new fingerprint results and exits -- the same "
+        "cooperative shutdown path used by Ctrl+C/SIGTERM (see stop()), never a hard kill. A "
+        "result batch already claimed still runs to completion first. This is a "
+        "process-lifetime limit, NOT a per-result timeout. Ignored with --once.",
+    )
     args = parser.parse_args()
+
+    if args.runtime < -1:
+        parser.error("--runtime must be -1 (disabled) or a whole number of minutes >= 0")
 
     config = load_config(args.config)
     store = build_media_evidence_store(config)
@@ -77,6 +93,8 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
+    deadline = time.monotonic() + args.runtime * 60 if args.runtime != -1 else None
+
     try:
         if args.once:
             got_result = consumer.process_one()
@@ -87,6 +105,7 @@ def main() -> None:
             consumer.run_forever(
                 reclaim_interval_seconds=rc_config.reclaim_interval_seconds,
                 idle_sleep_seconds=rc_config.idle_sleep_seconds,
+                deadline=deadline,
             )
     finally:
         logger.info(f"result-consumer: shutdown metrics={consumer.metrics}")

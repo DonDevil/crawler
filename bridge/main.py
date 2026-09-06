@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import signal
+import time
 from types import FrameType
 from typing import Optional
 
@@ -58,7 +59,22 @@ def main() -> None:
         help="Process at most one evidence job then exit, instead of running forever. For "
         "testing/debugging/one-shot invocations.",
     )
+    parser.add_argument(
+        "--runtime",
+        type=int,
+        default=-1,
+        metavar="MINUTES",
+        help="Wall-clock process-lifetime limit, in minutes. -1 (default) disables the limit "
+        "(runs forever, as before). Otherwise, once this many minutes have elapsed the bridge "
+        "gracefully stops claiming new evidence jobs and exits -- the same cooperative shutdown "
+        "path used by Ctrl+C/SIGTERM (see stop()), never a hard kill. A job already claimed "
+        "still runs to completion first. This is a process-lifetime limit, NOT a per-job "
+        "timeout. Ignored with --once.",
+    )
     args = parser.parse_args()
+
+    if args.runtime < -1:
+        parser.error("--runtime must be -1 (disabled) or a whole number of minutes >= 0")
 
     config = load_config(args.config)
     store = build_media_evidence_store(config)
@@ -84,6 +100,8 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
+    deadline = time.monotonic() + args.runtime * 60 if args.runtime != -1 else None
+
     try:
         if args.once:
             got_job = bridge.process_one()
@@ -91,7 +109,7 @@ def main() -> None:
                 logger.info("bridge: --once found an empty queue, nothing to do")
         else:
             logger.info(f"bridge: starting worker_id={args.worker_name!r}")
-            bridge.run_forever()
+            bridge.run_forever(deadline=deadline)
     finally:
         logger.info(f"bridge: shutdown metrics={bridge.metrics}")
         store.close()

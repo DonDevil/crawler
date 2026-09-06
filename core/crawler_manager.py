@@ -316,6 +316,20 @@ class CrawlerManager:
         self._recovery_task: Optional[asyncio.Task] = None
         self._peak_active_domains: int = 0
 
+        # Wall-clock run-duration budget (docs: --runtime), in seconds,
+        # measured on the monotonic clock starting when run() actually
+        # begins the crawl engine's own run loop -- not during the startup
+        # work (prepare_frontier()/seed loading/query discovery, Redis
+        # startup recovery) that happens earlier in run(). `None` (the
+        # default, set via set_runtime_limit()) means no limit -- identical
+        # to omitting --runtime entirely. `runtime_expired` is this run's
+        # equivalent of the max-pages-reached/frontier-exhausted log lines
+        # already emitted by the crawl engine (crawler/*_crawler.py's
+        # worker()/scheduler()) -- read by main.py after run() returns to
+        # label the run report distinctly from those other stop conditions.
+        self._runtime_seconds: Optional[float] = None
+        self.runtime_expired: bool = False
+
         logger.info(f"Using crawler engine: {self.crawl_engine}")
 
     def clear_storage(self) -> None:
@@ -354,6 +368,37 @@ class CrawlerManager:
         """Override the active crawler page limit, or clear it for autonomous runs."""
 
         self._crawler.max_pages = max_pages
+
+    def set_runtime_limit(self, runtime_seconds: Optional[float]) -> None:
+        """Set (or, with `None`, clear) this run's wall-clock duration
+        budget in seconds -- `main.py`'s `--runtime MINUTES` maps to this
+        after unit conversion. `None` means unlimited (the default, and
+        --runtime's own disabled-sentinel value maps to this).
+
+        Only takes effect on the next `run()` call: see `run()` for exactly
+        which lifecycle boundary starts the clock and how expiry is
+        delivered (the crawl engine's own `_stop_event` -- the same
+        mechanism Ctrl+C/SIGTERM/--max-pages/frontier-exhaustion already
+        use, never a hard process kill).
+        """
+        self._runtime_seconds = runtime_seconds
+
+    async def _runtime_watchdog(self) -> None:
+        """Force the same graceful-shutdown boundary --max-pages/frontier-
+        exhaustion/Ctrl+C/SIGTERM already use, once `self._runtime_seconds`
+        elapses. `asyncio.sleep` is driven by the event loop's own
+        monotonic clock (never wall-clock timestamps -- immune to system
+        clock changes during a long benchmark run). Cancelled by run()'s
+        finally block if the crawl finishes on its own first, so this task
+        never outlives one run() call.
+        """
+        await asyncio.sleep(self._runtime_seconds)
+        logger.info(
+            f"Runtime limit of {self._runtime_seconds:.0f}s elapsed; initiating graceful "
+            "shutdown (same path as Ctrl+C/SIGTERM/--max-pages/frontier exhaustion)"
+        )
+        self.runtime_expired = True
+        self._crawler._stop_event.set()
 
     def _priority_for_seed_url(self, url: str) -> int:
         return 8 if URLUtils.is_onion_url(url) else 12
@@ -689,6 +734,15 @@ class CrawlerManager:
                 f"batch_size={frontier_config.reclaim_batch_size})"
             )
 
+        # The runtime budget starts here -- right before the crawl engine's
+        # own run loop begins -- not during prepare_frontier()/startup
+        # recovery above, which is startup work, not the crawl proper (see
+        # docs/architecture -- the same "process startup is not run
+        # lifetime" distinction --runtime's docstring makes).
+        runtime_task: Optional[asyncio.Task] = None
+        if self._runtime_seconds is not None:
+            runtime_task = asyncio.create_task(self._runtime_watchdog())
+
         try:
             await self._crawler.run()
         except asyncio.CancelledError:
@@ -696,6 +750,10 @@ class CrawlerManager:
         except Exception as exc:
             logger.exception(f"Crawler encountered an error: {exc}")
         finally:
+            if runtime_task is not None:
+                runtime_task.cancel()
+                await asyncio.gather(runtime_task, return_exceptions=True)
+
             if self._recovery_task is not None:
                 self._recovery_task.cancel()
                 await asyncio.gather(self._recovery_task, return_exceptions=True)

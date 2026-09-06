@@ -332,11 +332,24 @@ class FingerprintResultConsumer:
                 reclaimed += 1
         return reclaimed
 
-    def run_forever(self, reclaim_interval_seconds: float = 60.0, idle_sleep_seconds: float = 2.0) -> None:
-        """Blocking loop; returns once `stop()` has been called and the
-        current iteration (if any) finishes."""
+    def run_forever(
+        self,
+        reclaim_interval_seconds: float = 60.0,
+        idle_sleep_seconds: float = 2.0,
+        deadline: Optional[float] = None,
+    ) -> None:
+        """Blocking loop; returns once `stop()` has been called, the
+        current iteration (if any) finishes, or (if given) `deadline` -- a
+        `time.monotonic()` timestamp, checked once per iteration -- has
+        passed. `deadline` is a process-lifetime bound
+        (`result_consumer_main.py`'s `--runtime`), never a per-result
+        timeout."""
         last_reclaim = 0.0
         while not self._stop:
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.info("result-consumer: runtime limit elapsed, shutting down gracefully")
+                self.stop()
+                break
             now = time.monotonic()
             if now - last_reclaim >= reclaim_interval_seconds:
                 last_reclaim = now
