@@ -13,9 +13,9 @@ crawler:
     #type: "sqlite"
     # For distributed multi-worker crawling, set type to "redis" and configure Redis server:
     type: "redis"
-    redis_host: "localhost"
+    redis_host: "192.168.29.226"
     redis_port: 6379
-    redis_namespace: "crawler"
+    redis_namespace: "test_crawl"
     # Shared retry/backoff, applied uniformly by whichever frontier is active.
     max_retries: 3
     base_backoff: 5.0
@@ -64,9 +64,9 @@ crawler:
   media_evidence:
     #type: "sqlite"
     type: "redis"
-    redis_host: "localhost"
+    redis_host: "192.168.29.226"
     redis_port: 6379
-    redis_namespace: "evidence"
+    redis_namespace: "test_evidence"
     # Bounded observation/variant retention per asset (§4/§10) -- exact
     # counts are always tracked separately (HINCRBY), only the *detailed*
     # history is capped.
