@@ -10,6 +10,16 @@ of the fingerprint worker process (mirrors `bridge/main.py`'s own framing):
 
 See docs/architecture/phase-4-crawler-fingerprinter-bridge.md for the
 forward-direction design this mirrors in reverse.
+
+This process has no `--clear-db` of its own (removed -- see
+docs/architecture/history/clear-db-ownership-audit.md): every key it reads
+or writes belongs to either the crawler's own `evidence:*` schema
+(`python main.py --clear-db`, this repo) or the fingerprinter's own
+`fingerprint:*` schema (`python -m target.cli clear-db`, sibling repo) --
+never to the bridge itself. Clearing state that owner's process doesn't
+yet know is gone (e.g. wiping `fingerprint:*` while a fingerprint worker
+has it open for `XREADGROUP`/`XAUTOCLAIM`) crashes that process; reset from
+the owning component instead, with that component stopped or between runs.
 """
 from __future__ import annotations
 
@@ -21,7 +31,6 @@ from typing import Optional
 from loguru import logger
 
 from bridge.fingerprint_result_consumer import FingerprintResultConsumer
-from bridge.redis_reset import clear_fingerprint_namespace
 from core.config import load_config
 from core.crawler_manager import build_media_evidence_store
 from storage.redis_media_evidence_store import RedisMediaEvidenceStore
@@ -37,16 +46,6 @@ def main() -> None:
         help="Process at most one result batch then exit, instead of running forever. For "
         "testing/debugging/one-shot invocations.",
     )
-    parser.add_argument(
-        "--clear-db",
-        action="store_true",
-        help="Clear all evidence-job state (this store's 'evidence:*' keys) and fingerprinter "
-        "run state ('fingerprint:*' keys -- jobs/results/retries/matches/submission markers, "
-        "never registered targets) before starting, for a fresh run with no state carried over "
-        "from a previous one. Run once, by hand, before starting the consumer fleet -- never as "
-        "part of a supervised/auto-restart command line, since that would wipe in-flight jobs "
-        "on every crash-restart.",
-    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -59,11 +58,6 @@ def main() -> None:
             f"result stream it reads only exists in Redis. Got media_evidence.type="
             f"{config.crawler.media_evidence.type!r}."
         )
-
-    if args.clear_db:
-        store.clear()
-        fp_deleted = clear_fingerprint_namespace(store.redis_conn)
-        logger.info(f"result-consumer: --clear-db cleared evidence state and {fp_deleted} fingerprint key(s)")
 
     rc_config = config.crawler.result_consumer
     consumer = FingerprintResultConsumer(

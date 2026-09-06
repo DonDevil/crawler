@@ -61,6 +61,10 @@ class HTTPCrawler:
 		self._pages_crawled = 0
 		self._pages_failed = 0
 		self._active_workers = 0
+		# Process-local monitoring counters -- see async_crawler.py's
+		# identical fields for the full rationale.
+		self._pages_discovered = 0
+		self._pages_retried = 0
 
 	async def fetch(self, client: httpx.AsyncClient, url: str) -> tuple[Optional[str], Optional[str]]:
 		"""Fetch a URL and return body/error tuple."""
@@ -175,13 +179,17 @@ class HTTPCrawler:
 						except Exception as exc:
 							logger.debug(f"Skipping media evidence capture for {url}: {exc}")
 					for link in links:
-						await self.frontier.add_url(link, priority=URLUtils.get_link_priority(url, link))
+						if await self.frontier.add_url(link, priority=URLUtils.get_link_priority(url, link)):
+							self._pages_discovered += 1
 				elif failure_reason:
 					status = "failed"
 					self._pages_failed += 1
 					logger.warning(f"Failed to crawl {url}: {failure_reason}")
 
 				if status == "failed":
+					effective_max_retries = getattr(self.frontier.raw, "max_retries", self.max_retries)
+					if claim.attempt < effective_max_retries:
+						self._pages_retried += 1
 					await self.frontier.mark_failed(claim, failure_reason or "")
 				else:
 					await self.frontier.mark_visited(claim)

@@ -143,6 +143,12 @@ def main() -> None:
         help="Use only dark-web search engines for query discovery.",
     )
     parser.add_argument(
+        "--crawler-id",
+        help="Unique identity for this crawler process, used to label its LOCAL WORK section "
+        "in the run report so multiple crawler processes sharing one Redis frontier can be told "
+        "apart. Defaults to '<hostname>-<pid>' if not given.",
+    )
+    parser.add_argument(
         "--monitor-resources",
         action="store_true",
         help="Sample process CPU/RSS (and Redis INFO, if using the Redis frontier) on a "
@@ -160,8 +166,9 @@ def main() -> None:
     parser.add_argument(
         "--output",
         help="Write a machine-readable JSON run report to this path when the crawl finishes "
-        "(counts, timing, throughput, resources, Redis stats, run configuration). "
-        "See tests/report_lib.py for the schema.",
+        "(counts, timing, throughput, resources, Redis stats, run configuration, and this "
+        "process's own local_work counters -- see --crawler-id). See tests/report_lib.py for "
+        "the schema.",
     )
 
     args = parser.parse_args()
@@ -356,6 +363,10 @@ def main() -> None:
         if backend == "redis":
             redis_resources = report_lib.build_redis_resource_report(monitor.samples, args.monitor_interval)
 
+    identity = report_lib.build_identity(args.crawler_id)
+    local_counters = report_lib.local_counters_from_crawler(manager._crawler)
+    local_work = report_lib.build_local_work(local_counters, identity)
+
     report = report_lib.build_report(
         metadata=metadata,
         timing=timing,
@@ -363,6 +374,7 @@ def main() -> None:
         resources=resources,
         redis_resources=redis_resources,
         configuration=manager.config.model_dump(),
+        local_work=local_work,
         pre_run_snapshot=pre_run_snapshot,
     )
 

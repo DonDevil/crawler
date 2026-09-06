@@ -66,6 +66,19 @@ class AsyncCrawler:
         self._pages_crawled = 0
         self._pages_failed = 0
         self._active_workers = 0
+        # Process-local monitoring counters (docs/architecture/history/
+        # per-crawler-monitoring.md): incremented at the exact point this
+        # process performs the action, never derived from shared Redis
+        # frontier state. `_pages_discovered` only counts add_url() calls
+        # that this process caused to accept a genuinely new URL (return
+        # True) -- a duplicate link re-extracted from another page is not
+        # a new discovery. `_pages_retried` counts failures this process
+        # observed that the frontier will retry (claim.attempt below its
+        # own authoritative max_retries), mirroring the same
+        # attempt-vs-max_retries comparison HybridCrawler._log_completion
+        # already uses.
+        self._pages_discovered = 0
+        self._pages_retried = 0
 
     async def fetch(
         self,
@@ -212,13 +225,17 @@ class AsyncCrawler:
                             logger.debug(f"Skipping media evidence capture for {url}: {exc}")
 
                     for link in links:
-                        await self.frontier.add_url(link, priority=URLUtils.get_link_priority(url, link, source_query))
+                        if await self.frontier.add_url(link, priority=URLUtils.get_link_priority(url, link, source_query)):
+                            self._pages_discovered += 1
                 elif failure_reason:
                     status = "failed"
                     self._pages_failed += 1
                     logger.warning(f"Failed to crawl {url}: {failure_reason}")
 
                 if status == "failed":
+                    effective_max_retries = getattr(self.frontier.raw, "max_retries", self.max_retries)
+                    if claim.attempt < effective_max_retries:
+                        self._pages_retried += 1
                     await self.frontier.mark_failed(claim, failure_reason or "")
                 else:
                     await self.frontier.mark_visited(claim)

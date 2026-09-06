@@ -88,6 +88,14 @@ class HybridCrawler:
         self._pages_failed = 0
         self._active_workers = 0
         self._engine_counts: Counter[str] = Counter()
+        # Process-local monitoring counters -- see async_crawler.py's
+        # identical fields for the full rationale. `_pages_retried` is
+        # incremented in `_log_completion` below, which already computes
+        # `final_outcome == "retry_scheduled"` from `claim.attempt` vs. the
+        # frontier's own authoritative `max_retries` -- reused here rather
+        # than recomputed a second time.
+        self._pages_discovered = 0
+        self._pages_retried = 0
 
         self._direct_session: aiohttp.ClientSession | None = None
         self._tor_session: aiohttp.ClientSession | None = None
@@ -330,6 +338,9 @@ class HybridCrawler:
                 effective_max_retries = getattr(self.frontier.raw, "max_retries", self.max_retries)
                 final_outcome = "retry_scheduled" if claim.attempt < effective_max_retries else "failed_permanent"
 
+        if final_outcome == "retry_scheduled":
+            self._pages_retried += 1
+
         consumed_retry_budget = final_outcome in ("retry_scheduled", "failed_permanent")
 
         logger.info(
@@ -400,7 +411,8 @@ class HybridCrawler:
                             logger.debug(f"Skipping media evidence capture for {url}: {exc}")
 
                     for link in links:
-                        await self.frontier.add_url(link, priority=URLUtils.get_link_priority(url, link))
+                        if await self.frontier.add_url(link, priority=URLUtils.get_link_priority(url, link)):
+                            self._pages_discovered += 1
                 elif failure_reason:
                     status = "failed"
                     self._pages_failed += 1

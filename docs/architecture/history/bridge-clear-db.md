@@ -1,6 +1,16 @@
 # `bridge.main` / `bridge.result_consumer_main --clear-db`
 
-## Status: COMPLETE
+## Status: REMOVED (superseded)
+
+**This feature was removed.** `bridge.main` and `bridge.result_consumer_main`
+no longer accept `--clear-db` -- see
+`docs/architecture/history/clear-db-ownership-audit.md` for the ownership
+audit and the incident (a live fingerprinter worker crashing when a bridge
+`--clear-db` deleted the `fingerprint:*` stream key it was blocked on
+`XREADGROUP` against) that prompted it. The rest of this document is kept
+as a historical record of what existed, below, unedited.
+
+## Status (as of this feature's original addition): COMPLETE
 
 ## 1. Problem
 

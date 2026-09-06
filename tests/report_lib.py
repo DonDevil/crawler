@@ -18,6 +18,8 @@ silently coerced to `0`.
 from __future__ import annotations
 
 import datetime
+import os
+import socket
 import sqlite3
 from typing import Optional
 
@@ -504,8 +506,10 @@ def _delta_or_none(post, pre) -> Optional[int]:
 def build_this_run(
     pre_run_snapshot: Optional[dict], post_run_snapshot: dict, duration_seconds, worker_count=None
 ) -> Optional[dict]:
-    """Counts scoped to this run only, as (end-of-run snapshot - start-of-run
-    snapshot) for each monotonically-growing counter.
+    """Counts scoped to this *namespace/db's activity during this process's
+    runtime*, as (end-of-run snapshot - start-of-run snapshot) for each
+    monotonically-growing counter -- **not** this crawler process's own
+    attributed work. See `build_local_work()` below for that.
 
     The Redis namespace / SQLite db backing the frontier is intentionally
     *not* reset between runs (so a run can resume unfinished work), which
@@ -515,10 +519,19 @@ def build_this_run(
     counter here only ever grows within a run (`urls:known`/`urls:visited`/
     `urls:failed_permanent`/`urls:skipped` are SADD-only; nothing SREMs from
     them -- see core/redis_frontier.py), so a same-backend delta isolates
-    this run's activity even when the lifetime state itself already
-    contains pre-existing cross-run/cross-schema-version contamination
-    (that contamination is present in both snapshots equally and cancels
-    out in the subtraction).
+    this process's wall-clock window from the lifetime state's pre-existing
+    cross-run/cross-schema-version contamination (that contamination is
+    present in both snapshots equally and cancels out in the subtraction).
+
+    IMPORTANT: this delta reads the *shared* namespace/db, which any number
+    of other crawler processes can be writing to concurrently (the whole
+    point of the Redis-backed frontier -- docs/architecture/frontier-adr.md).
+    If two crawler processes share one namespace, both processes' reports
+    will show deltas that include *each other's* activity during the
+    overlapping window, not just their own. Never read this section as "what
+    this process did" -- use `build_local_work()` for that; this section
+    answers "how did the shared namespace/db change while this process was
+    running", which is a legitimate but different question.
 
     Returns `None` if no pre-run snapshot was captured (e.g. an older run
     report, or the backend was unavailable at startup) -- never a
@@ -565,13 +578,105 @@ def build_this_run(
             "rather than fabricated."
         ),
         "note": (
-            "Scoped to this run only: (end-of-run snapshot - start-of-run snapshot) per counter, "
-            "not the backend's lifetime-cumulative state (see counts.note). "
-            "attempted_unique/completion_pct/success_rate_pct are only populated when "
-            "visited_unique + failed_permanent_unique + skipped_unique <= discovered_unique for "
-            "this run's deltas -- see 'invariant_violation' otherwise."
+            "SHARED namespace/db delta during this process's runtime -- (end-of-run snapshot - "
+            "start-of-run snapshot) per counter, not the backend's lifetime-cumulative state (see "
+            "counts.note). If another crawler process shares this namespace/db, its activity is "
+            "included here too -- this is not this process's own attributed work; see "
+            "'local_work' for that. attempted_unique/completion_pct/success_rate_pct are only "
+            "populated when visited_unique + failed_permanent_unique + skipped_unique <= "
+            "discovered_unique for this delta -- see 'invariant_violation' otherwise."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Local work (process-attributed, never derived from shared Redis/SQLite
+# state) -- the actual per-crawler-process monitoring this module previously
+# lacked. See docs/architecture/history/per-crawler-monitoring.md.
+# ---------------------------------------------------------------------------
+
+def build_identity(crawler_id: Optional[str] = None) -> dict:
+    """Unambiguous identity for this crawler process: hostname + PID always
+    (from the OS -- never faked/omitted), plus a `crawler_id` that defaults
+    to `f"{hostname}-{pid}"` when the operator doesn't pass `--crawler-id`.
+    Attach this to every report so two processes sharing one Redis
+    namespace are always distinguishable in their output.
+    """
+    hostname = socket.gethostname()
+    pid = os.getpid()
+    return {
+        "crawler_id": crawler_id or f"{hostname}-{pid}",
+        "hostname": hostname,
+        "pid": pid,
+    }
+
+
+def local_counters_from_crawler(crawler) -> dict:
+    """Read the process-local work counters straight off the live crawl
+    engine instance (`core.crawler_manager.CrawlerManager._crawler` --
+    `AsyncCrawler`/`HTTPCrawler`/`TorCrawler`/`PlaywrightCrawler`/
+    `SeleniumCrawler`/`ScraplingCrawler`/`HybridCrawler`, all 7 of which
+    expose the same `_pages_discovered`/`_pages_crawled`/`_pages_failed`/
+    `_pages_retried` fields).
+
+    Every one of those counters is incremented in-process, at the exact
+    call site where this crawler actually performed the action (a
+    `Frontier.add_url()` call that returned `True`, a completed
+    `mark_visited()`/`mark_failed()`) -- never reconstructed after the fact
+    from shared Redis/SQLite state, and never dependent on any particular
+    frontier backend. If this process runs multiple concurrent asyncio
+    worker tasks (`concurrency > 1`, the normal case), they all increment
+    the same instance's counters, so this is already aggregated across this
+    process's workers -- not one number per asyncio task.
+
+    Uses `getattr(..., None)` rather than direct attribute access so a
+    report built against a crawl engine that does not (yet) expose these
+    fields degrades to `None` ("unavailable") per-field instead of raising --
+    e.g. a future new engine implementation that forgets to add them.
+    """
+    discovered = getattr(crawler, "_pages_discovered", None)
+    processed = getattr(crawler, "_pages_crawled", None)
+    failed = getattr(crawler, "_pages_failed", None)
+    retried = getattr(crawler, "_pages_retried", None)
+    visited = processed - failed if processed is not None and failed is not None else None
+    return {
+        "discovered": discovered,
+        "visited": visited,
+        "processed": processed,
+        "failed": failed,
+        "retries": retried,
+    }
+
+
+def build_local_work(local_counters: Optional[dict], identity: Optional[dict] = None) -> Optional[dict]:
+    """The per-crawler-process report section: everything here is
+    attributable to exactly *this* process, unlike `counts`/`this_run`
+    (both derived from shared Redis/SQLite state any number of other
+    crawler processes can also be writing to -- see `build_this_run`'s
+    docstring). Two crawler processes sharing one Redis namespace will
+    report *different* numbers here even when `counts`/`this_run` look
+    identical (both of those read the same shared state).
+
+    `local_counters` is the dict `local_counters_from_crawler()` produces.
+    Returns `None` only if no crawl engine instance was available to read
+    counters from at all (should not happen via `main.py`'s normal path).
+    """
+    if local_counters is None:
+        return None
+    out = dict(local_counters)
+    out["identity"] = identity or build_identity()
+    out["note"] = (
+        "LOCAL to this process only: every counter above was incremented at the exact call site "
+        "where this crawler process performed the action (frontier.add_url() returning True, "
+        "mark_visited()/mark_failed()) -- never derived from or reconstructed out of shared Redis/"
+        "SQLite state. Aggregates every asyncio worker task within this process. 'discovered' "
+        "counts only genuinely new URLs this process caused the frontier to accept -- a link this "
+        "process re-extracted that some other process (or this one) already knew about does not "
+        "increment it. 'visited' = processed - failed. 'retries' counts failures this process "
+        "observed that the frontier will retry (claim.attempt below the frontier's own "
+        "max_retries), not failures some other process will retry."
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -640,7 +745,8 @@ def build_redis_resource_report(samples: list[dict], interval: float) -> Optiona
 # ---------------------------------------------------------------------------
 
 def build_report(*, metadata: dict, timing: dict, snapshot: dict, resources=None,
-                  redis_resources=None, configuration=None, pre_run_snapshot: Optional[dict] = None) -> dict:
+                  redis_resources=None, configuration=None, pre_run_snapshot: Optional[dict] = None,
+                  local_work: Optional[dict] = None) -> dict:
     counts = counts_with_percentages(snapshot)
     throughput = compute_throughput(snapshot, timing.get("duration_seconds"), metadata.get("worker_count"))
     failures = build_failures(snapshot)
@@ -651,6 +757,7 @@ def build_report(*, metadata: dict, timing: dict, snapshot: dict, resources=None
         "timing": timing,
         "counts": counts,
         "this_run": this_run,
+        "local_work": local_work,
         "throughput": throughput,
         "failures": failures,
         "resources": resources,
@@ -695,6 +802,12 @@ def render_human_report(report: dict) -> str:
     w(f"Max pages:      {fmt_val(md.get('max_pages'))}")
     w(f"Indefinite run: {fmt_val(md.get('indefinite_run'))}")
     w(f"Rate limit:     {fmt_val(md.get('rate_limit'))}")
+    local_work = report.get("local_work")
+    if local_work:
+        identity = local_work.get("identity") or {}
+        w(f"Crawler ID:     {fmt_val(identity.get('crawler_id'))}")
+        w(f"Hostname:       {fmt_val(identity.get('hostname'))}")
+        w(f"PID:            {fmt_val(identity.get('pid'))}")
     w("")
     w(f"Start:          {fmt_val(timing.get('start'))}")
     w(f"End:            {fmt_val(timing.get('end'))}")
@@ -717,9 +830,23 @@ def render_human_report(report: dict) -> str:
     if counts.get("invariant_violation"):
         w(f"WARNING: {counts['invariant_violation']}")
 
+    w("")
+    w("---------------- LOCAL WORK (this crawler process only) ----------------")
+    w("")
+    if local_work:
+        w(f"Discovered: {fmt_val(local_work.get('discovered'))}")
+        w(f"Visited:    {fmt_val(local_work.get('visited'))}")
+        w(f"Processed:  {fmt_val(local_work.get('processed'))}")
+        w(f"Failed:     {fmt_val(local_work.get('failed'))}")
+        w(f"Retries:    {fmt_val(local_work.get('retries'))}")
+        w("(Attributed to this process only -- see 'local_work.note' in --output JSON for exactly "
+          "what that means and how it differs from the shared-state sections below.)")
+    else:
+        w("Unavailable (no crawl engine instance was available to read local counters from).")
+
     this_run = report.get("this_run")
     w("")
-    w("---------------- THIS RUN (run-scoped counts) ----------------")
+    w("---------------- SHARED NAMESPACE DELTA (may include other concurrent crawler processes) ----------------")
     w("")
     if this_run:
         w(f"Discovered:         {fmt_val(this_run.get('discovered_unique'))}")
